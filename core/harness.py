@@ -121,6 +121,31 @@ HARNESS_TOOLS = [
                 "required": ["skill_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_skill",
+            "description": "将一个经常使用或刚调试成功的多步工作流固化保存为一个独立的 Python 技能 (存入 skills/ 目录)，以后可供直接调用或由 Jev 快脑决策触发。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "技能唯一英文标识 (不带.py)，如 clean_project, check_port"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "技能的功能描述与触发条件，供 Jev 决策模型理解何时调用"
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "可执行 Python 代码，必须包含 execute(context: dict) -> str 入口函数"
+                    }
+                },
+                "required": ["skill_name", "description", "code"]
+            }
+        }
     }
 ]
 
@@ -314,6 +339,16 @@ class AgentHarness:
                 skill_name = args.get("skill_name", "")
                 skill_args = args.get("arguments", "")
                 return self.skill_manager.execute_skill(skill_name, {"query": skill_args})
+
+            elif name == "save_skill":
+                s_name = args.get("skill_name", "").replace(".py", "").strip()
+                s_desc = args.get("description", "").strip()
+                s_code = args.get("code", "").strip()
+                full_content = f'"""\nname: {s_name}\ndescription: {s_desc}\n"""\n{s_code}\n'
+                ok = self.skill_manager.register_new_skill(f"{s_name}.py", full_content)
+                if ok:
+                    return f"✅ 技能 [{s_name}] 固化保存成功并已完成动态热装载！以后可直接使用。"
+                return f"❌ 技能 [{s_name}] 保存失败。"
 
             else:
                 return f"未知工具: {name}"
