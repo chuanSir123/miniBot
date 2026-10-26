@@ -58,14 +58,19 @@ class SpeechBubble(QWidget):
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self.hide)
 
-    def show_message(self, text: str, duration_sec: int = 8):
+    def stream_text(self, text: str):
+        """流式追加或更新文本，保持气泡显示"""
+        self.hide_timer.stop()
         self.label.setText(text)
         self.adjustSize()
-        # 控制宽度在 160 ~ 280 像素之间
-        w = max(180, min(self.sizeHint().width(), 280))
+        w = max(180, min(self.sizeHint().width(), 320))
         self.setFixedWidth(w)
         self.adjustSize()
-        self.show()
+        if not self.isVisible():
+            self.show()
+
+    def show_message(self, text: str, duration_sec: int = 8):
+        self.stream_text(text)
         self.hide_timer.start(duration_sec * 1000)
 
 
@@ -140,12 +145,18 @@ class DesktopPetWidget(QWidget):
     """
     IKun 鸡哥桌宠主窗口
     """
+    signal_stream_text = QtCore.pyqtSignal(str)
+    signal_finish_text = QtCore.pyqtSignal(str, int)
 
     def __init__(self, pet_dir: str, on_user_input: Callable[[str], None], on_open_settings: Callable[[], None]):
         super().__init__()
         self.pet_dir = Path(pet_dir)
         self.on_user_input = on_user_input
         self.on_open_settings = on_open_settings
+
+        # 连接线程安全信号
+        self.signal_stream_text.connect(self.stream_say)
+        self.signal_finish_text.connect(self.finish_say)
 
         # 窗口属性：无边框、置顶、透明
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SubWindow)
@@ -247,6 +258,26 @@ class DesktopPetWidget(QWidget):
         self.set_action(action, duration_ms=4000)
         self._sync_subwidgets_pos()
         self.bubble.show_message(text)
+
+    def stream_say(self, text: str):
+        """流式更新桌宠气泡内容（思考与中间过程呈现）"""
+        self.set_action(6, duration_ms=1500)
+        self._sync_subwidgets_pos()
+        self.bubble.stream_text(text)
+
+    def finish_say(self, text: str, action: int = 3):
+        """最终回答完成呈现"""
+        self.set_action(action, duration_ms=5000)
+        self._sync_subwidgets_pos()
+        self.bubble.show_message(text)
+
+    def stream_say_safe(self, text: str):
+        """跨线程安全流式调用"""
+        self.signal_stream_text.emit(text)
+
+    def finish_say_safe(self, text: str, action: int = 3):
+        """跨线程安全结束调用"""
+        self.signal_finish_text.emit(text, action)
 
     def _on_input_submitted(self, text: str):
         self.set_action(6, duration_ms=6000)  # 思考状态

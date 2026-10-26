@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,7 @@ if sys.platform == "win32":
 
 from core.brain import VLMBrain
 from core.config import is_configured, load_config
+from core.harness import AgentHarness
 from core.jev import JevClient
 from core.memory import MiniMemory
 from core.perception import LocalPerception
@@ -34,6 +36,16 @@ class MiniBotApp:
         self.vlm = VLMBrain()
         self.skill_manager = SkillManager()
 
+        # 初始化智能体执行骨架 (Agent Harness)
+        self.harness = AgentHarness(
+            brain=self.vlm,
+            jev=self.jev,
+            memory=self.memory,
+            perception=self.perception,
+            skill_manager=self.skill_manager,
+            max_turns=5
+        )
+
         # 通道实例
         self.pet_widget = None
         self.napcat_mgr = None
@@ -50,7 +62,7 @@ class MiniBotApp:
         )
 
     def _handle_user_query(self, user_text: str, channel_source: str = "pet") -> str:
-        """统一处理用户交互输入 (桌宠输入框 或 QQ 消息)"""
+        """统一处理用户交互输入 (桌宠输入框 或 QQ 消息) - 接入 AgentHarness"""
         print(f"[MiniBot] 处理来自 [{channel_source}] 的用户提问: {user_text}")
         self.memory.add_event(f"用户: {user_text}", source=f"user_{channel_source}", importance=1.5)
 
@@ -59,34 +71,38 @@ class MiniBotApp:
         if extracted_facts:
             print(f"[Memory] 自动提取并持久化核心事实: {extracted_facts}")
 
-        # 1. 尝试匹配并调用 Skill
-        skill_names = self.skill_manager.list_skill_names()
-        if skill_names and self.jev.is_configured():
-            # 快脑挑选是否需要调用特定技能
-            chosen_skill = self.jev.choose_action(
-                f"用户请求: {user_text}\n可用技能: {self.skill_manager.get_skill_descriptions()}",
-                candidate_actions=skill_names + ["chat_only"]
-            )
-            if chosen_skill != "chat_only" and chosen_skill in skill_names:
-                print(f"[MiniBot] 快脑决策触发技能: {chosen_skill}")
-                res = self.skill_manager.execute_skill(chosen_skill, {"query": user_text})
-                self.memory.add_event(f"技能执行结果: {res}", source="skill")
-                return res
-
-        # 2. 结合记忆上下文调用 VLM 慢脑回复 (检索高相关度+近期的历史记忆)
+        # 1. 结合记忆上下文 (检索高相关度+近期的历史记忆)
         relevant_memories = self.memory.search_events_with_decay(user_text, limit=3)
         context = self.memory.build_context_prompt(max_events=5)
         if relevant_memories:
             rel_strs = [f"- {m['content']}" for m in relevant_memories]
             context += "\n【与提问相关的历史记忆线索】:\n" + "\n".join(rel_strs)
 
-        # 按需截屏 (若提到“看屏幕”、“看看代码”、“当前页面”)
-        img_bytes = None
-        if any(kw in user_text for kw in ["看", "屏幕", "代码", "报错", "界面"]):
-            img_bytes = self.perception.capture_screen_jpeg(quality=70)
+        # 2. 定义流式双通道回调 (输出 VLM 中间思考文本与工具状态)
+        def on_text_chunk(delta_text, accumulated_text):
+            if self.pet_widget:
+                self.pet_widget.stream_say_safe(accumulated_text)
+            if channel_source != "pet":
+                sys.stdout.write(delta_text)
+                sys.stdout.flush()
 
-        reply = self.vlm.generate_bubble_reply(user_text, context=context, image_bytes=img_bytes)
+        def on_status_change(status_text):
+            print(f"[Harness Status] {status_text}")
+            if self.pet_widget:
+                self.pet_widget.stream_say_safe(f"【{status_text}】")
+
+        # 3. 驱动 Harness 智能体执行循环 (Jev 快速裁决 + 工具调用 + 流式双通道)
+        reply = self.harness.run(
+            user_prompt=user_text,
+            context_prompt=context,
+            on_text_chunk=on_text_chunk,
+            on_status_change=on_status_change
+        )
+
         self.memory.add_event(f"助手回复: {reply}", source="bot", importance=1.2)
+        if self.pet_widget:
+            self.pet_widget.finish_say_safe(reply, action=3)
+
         return reply
 
     def _handle_proactive_notification(self, message: str, action_type: str):
@@ -132,9 +148,8 @@ class MiniBotApp:
             run_server(port=18080, open_browser=True, blocking=False)
 
         def on_input(text):
-            reply = self._handle_user_query(text, channel_source="pet")
-            if self.pet_widget:
-                self.pet_widget.say(reply, action=3)
+            # 后台线程执行 Harness，保证桌宠动画和界面流畅不卡顿
+            threading.Thread(target=self._handle_user_query, args=(text, "pet"), daemon=True).start()
 
         self.pet_widget = DesktopPetWidget(
             pet_dir=pet_dir,
