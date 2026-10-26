@@ -23,7 +23,7 @@
     "pet": {
       "enabled": true,
       "scale": 1.0,
-      "pet_dir": "C:\\Users\\admin\\.codex\\pets\\ikunchick",
+      "pet_dir": "assets/pets/ikunchick",
       "bubble_duration_sec": 8
     },
     "napcat": {

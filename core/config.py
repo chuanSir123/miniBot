@@ -28,7 +28,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "pet": {
             "enabled": True,
             "scale": 1.0,
-            "pet_dir": r"C:\Users\admin\.codex\pets\ikunchick",
+            "pet_dir": "assets/pets/ikunchick",
             "bubble_duration_sec": 8
         },
         "napcat": {

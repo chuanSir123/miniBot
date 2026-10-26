@@ -142,7 +142,10 @@ class MiniBotApp:
             return
 
         app = QApplication(sys.argv)
-        pet_dir = self.cfg.get("channels", {}).get("pet", {}).get("pet_dir", r"C:\Users\admin\.codex\pets\ikunchick")
+        pet_dir_cfg = self.cfg.get("channels", {}).get("pet", {}).get("pet_dir", "assets/pets/ikunchick")
+        pet_path = Path(pet_dir_cfg)
+        if not pet_path.is_absolute():
+            pet_path = Path(__file__).resolve().parent / pet_path
 
         def on_open_settings():
             run_server(port=18080, open_browser=True, blocking=False)
@@ -152,7 +155,7 @@ class MiniBotApp:
             threading.Thread(target=self._handle_user_query, args=(text, "pet"), daemon=True).start()
 
         self.pet_widget = DesktopPetWidget(
-            pet_dir=pet_dir,
+            pet_dir=str(pet_path),
             on_user_input=on_input,
             on_open_settings=on_open_settings
         )

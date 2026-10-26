@@ -1,0 +1,9 @@
+{
+  "id": "ikunchick",
+  "displayName": "ikunchick",
+  "description": "A tiny basketball chick digital pet based closely on the provided IKun chick reference.",
+  "spritesheetPath": "spritesheet.webp",
+  "sourceName": "Codex Pets",
+  "sourceUrl": "https://codex-pets.net/share/ikunchick",
+  "imported": true
+}

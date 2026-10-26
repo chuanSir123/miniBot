@@ -178,8 +178,8 @@
             <input type="checkbox" id="pet_enabled">
             <span>启用桌宠前端交互</span>
           </label>
-          <label>桌宠资产目录路径</label>
-          <input type="text" id="pet_dir" placeholder="C:\Users\admin\.codex\pets\ikunchick">
+          <label>桌宠资产目录路径 (支持相对路径)</label>
+          <input type="text" id="pet_dir" placeholder="assets/pets/ikunchick">
         </div>
         <div class="form-group">
           <label class="checkbox-group" style="margin-bottom:6px;">
@@ -234,7 +234,7 @@
 
         // Channels
         document.getElementById('pet_enabled').checked = currentConfig.channels?.pet?.enabled ?? true;
-        document.getElementById('pet_dir').value = currentConfig.channels?.pet?.pet_dir || 'C:\\Users\\admin\\.codex\\pets\\ikunchick';
+        document.getElementById('pet_dir').value = currentConfig.channels?.pet?.pet_dir || 'assets/pets/ikunchick';
         document.getElementById('napcat_enabled').checked = currentConfig.channels?.napcat?.enabled ?? false;
         document.getElementById('napcat_ws_url').value = currentConfig.channels?.napcat?.ws_url || 'ws://127.0.0.1:3001';
 
