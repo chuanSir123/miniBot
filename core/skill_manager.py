@@ -9,11 +9,20 @@ SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Skill:
-    def __init__(self, name: str, description: str, func: Callable[[Dict[str, Any]], str], filename: str):
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        func: Callable[[Dict[str, Any]], str],
+        filename: str,
+        parameters_schema: Optional[Dict[str, Any]] = None
+    ):
         self.name = name
         self.description = description
         self.func = func
         self.filename = filename
+        self.parameters_schema = parameters_schema or {}
+        self.has_parameters = bool(self.parameters_schema)
 
     def run(self, context: Dict[str, Any]) -> str:
         try:
@@ -25,10 +34,9 @@ class Skill:
 class SkillManager:
     """
     Skill 自动化管理与动态热加载
-    负责：
-      1. 动态扫描 skills/ 目录加载自定义工具
-      2. 导出所有可用 Skill 的名称与描述供 Jev 的 Choice 原语进行决策
-      3. 接收 LLM/VLM 提炼总结的代码，生成并热装载新 Skill
+    支持：
+      1. 无参技能 (Zero-shot Direct Run - Jev快脑毫秒级触发)
+      2. 有参技能 (Two-stage Slot Filling - Jev选意图 + VLM从聊天历史提取槽位参数)
     """
 
     def __init__(self, skills_dir: Path = SKILLS_DIR):
@@ -38,13 +46,16 @@ class SkillManager:
         self.reload_skills()
 
     def _ensure_default_skills(self):
-        """写入一个内置示例 Skill"""
+        """写入内置示例技能"""
         demo_file = self.skills_dir / "system_status.py"
         if not demo_file.exists():
             code = '''"""
 name: system_status
-description: 检查本机系统基本状态与时间
+description: 检查本机系统基本状态、本地时间与当前工作目录
 """
+# 声明参数模式 (空表示无参技能，Jev命中后直接秒级执行)
+PARAMETERS = {}
+
 import time
 import os
 
@@ -66,18 +77,42 @@ def execute(context: dict) -> str:
                     spec.loader.exec_module(mod)
                     func = getattr(mod, "execute", None)
                     if callable(func):
-                        # 读取 docstring 或模块属性
                         name = getattr(mod, "NAME", py_file.stem)
-                        desc = getattr(mod, "DESCRIPTION", (mod.__doc__ or "自定义技能").strip())
-                        self.skills[name] = Skill(name=name, description=desc, func=func, filename=py_file.name)
+                        doc = (mod.__doc__ or "").strip()
+                        desc = getattr(mod, "DESCRIPTION", None)
+                        if not desc:
+                            for line in doc.splitlines():
+                                if line.lower().startswith("description:"):
+                                    desc = line.split(":", 1)[1].strip()
+                                    break
+                        if not desc:
+                            desc = doc.splitlines()[0] if doc else "自定义技能"
+
+                        schema = getattr(mod, "PARAMETERS", getattr(mod, "SCHEMA", {}))
+                        self.skills[name] = Skill(
+                            name=name,
+                            description=desc,
+                            func=func,
+                            filename=py_file.name,
+                            parameters_schema=schema
+                        )
             except Exception as e:
                 print(f"[SkillManager] 加载技能 {py_file.name} 失败: {e}")
 
     def list_skill_names(self) -> List[str]:
         return list(self.skills.keys())
 
-    def get_skill_descriptions(self) -> Dict[str, str]:
-        return {name: skill.description for name, skill in self.skills.items()}
+    def get_skill(self, name: str) -> Optional[Skill]:
+        return self.skills.get(name)
+
+    def get_candidate_options_for_jev(self) -> List[str]:
+        """生成供 Jev Choice 原语做决策的候选选项列表"""
+        options = []
+        for name, s in self.skills.items():
+            param_tag = "有参提取" if s.has_parameters else "无参直驱"
+            options.append(f"{name} [{param_tag}: {s.description[:40]}]")
+        options.append("chat_only")
+        return options
 
     def execute_skill(self, name: str, context: Optional[Dict[str, Any]] = None) -> str:
         skill = self.skills.get(name)
@@ -86,7 +121,7 @@ def execute(context: dict) -> str:
         return skill.run(context or {})
 
     def register_new_skill(self, filename: str, code_content: str) -> bool:
-        """接收 Agent 总结生成的 Python 代码并热装载"""
+        """接收并热装载新技能"""
         if not filename.endswith(".py"):
             filename += ".py"
         target_path = self.skills_dir / filename

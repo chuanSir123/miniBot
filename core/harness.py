@@ -192,11 +192,8 @@ class AgentHarness:
         """
         # 1. 先用 Jev 决策模型评估任务复杂度 (System 1 门控)
         if self.jev.is_configured():
-            action_type = self.jev.choose_action(
-                f"任务内容: {user_prompt}",
-                candidate_actions=["pure_chat", "need_action_or_tools"]
-            )
-            # 如果 Jev 判定仅仅是简单问候，直接快速回复，避免进入沉重工具循环
+            action_type = self.jev.classify_harness_intent(user_prompt)
+            # 如果 Jev 判定仅仅是简单问候或闲聊，直接快速回复，避免进入沉重工具循环
             if action_type == "pure_chat":
                 reply = self.brain.generate_bubble_reply(user_prompt, context=context_prompt)
                 if on_text_chunk:
@@ -288,16 +285,14 @@ class AgentHarness:
                 })
 
             # 4. 利用 Jev 决策模型快速判定是否已达标终结 (无需再耗费慢脑 3 秒)
-            if self.jev.is_configured():
-                state_check = (
-                    f"用户目标: {user_prompt}\n"
-                    f"最新工具执行结果: {'; '.join(tool_outputs_summary)}"
+            if self.jev.is_configured() and turn >= 1:
+                tool_sum = "; ".join(tool_outputs_summary)
+                should_finish, prob = self.jev.evaluate_task_completion(
+                    goal=user_prompt,
+                    tool_summary=tool_sum,
+                    threshold=0.82
                 )
-                should_finish, prob = self.jev.should_intervene(
-                    f"请判断工具输出是否已经彻底解决了用户目标？{state_check}",
-                    threshold=0.85
-                )
-                if should_finish and turn >= 1:
+                if should_finish:
                     if on_status_change:
                         on_status_change("Jev 判定任务已完成，收尾中...")
                     # 做最后一次精炼收尾输出

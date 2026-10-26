@@ -78,6 +78,45 @@ class MiniBotApp:
             rel_strs = [f"- {m['content']}" for m in relevant_memories]
             context += "\n【与提问相关的历史记忆线索】:\n" + "\n".join(rel_strs)
 
+        # 1.5 技能意图路由 (Two-Stage: Jev快速意图路由 + 无参秒级直驱 / 有参VLM提取槽位)
+        skill_names = self.skill_manager.list_skill_names()
+        if skill_names and self.jev.is_configured():
+            candidates = self.skill_manager.get_candidate_options_for_jev()
+            chosen_raw = self.jev.route_skill_intent(user_text, candidates)
+            chosen_skill_name = chosen_raw.split()[0] if chosen_raw != "chat_only" else "chat_only"
+
+            if chosen_skill_name in self.skill_manager.skills:
+                skill_obj = self.skill_manager.get_skill(chosen_skill_name)
+                print(f"[MiniBot] Jev 快脑命中技能: {skill_obj.name} (需要参数: {skill_obj.has_parameters})")
+
+                if not skill_obj.has_parameters:
+                    # 无参技能：0 延迟秒级直驱
+                    res = skill_obj.run({})
+                    self.memory.add_event(f"执行技能 [{skill_obj.name}] 结果: {res}", source="skill")
+                    if self.pet_widget:
+                        self.pet_widget.finish_say_safe(res, action=3)
+                    return res
+                else:
+                    # 有参技能：利用 VLM 从聊天记录和提问中精准提取槽位参数
+                    slot_prompt = (
+                        f"用户提问: '{user_text}'\n"
+                        f"目标技能: {skill_obj.name} ({skill_obj.description})\n"
+                        f"所需参数模式: {json.dumps(skill_obj.parameters_schema, ensure_ascii=False)}\n"
+                        f"请从用户提问或历史中精准提取对应参数，仅输出合法纯 JSON 字符串，例如 {{\"port\": 8080}}。严禁输出额外文字。"
+                    )
+                    slot_res = self.vlm.chat([{"role": "user", "content": slot_prompt}])
+                    try:
+                        clean_json = slot_res.strip("` \n").replace("json\n", "")
+                        extracted_args = json.loads(clean_json)
+                    except Exception:
+                        extracted_args = {"query": user_text}
+
+                    res = skill_obj.run(extracted_args)
+                    self.memory.add_event(f"执行有参技能 [{skill_obj.name}] 结果: {res}", source="skill")
+                    if self.pet_widget:
+                        self.pet_widget.finish_say_safe(res, action=3)
+                    return res
+
         # 2. 定义流式双通道回调 (输出 VLM 中间思考文本与工具状态)
         def on_text_chunk(delta_text, accumulated_text):
             if self.pet_widget:
@@ -105,11 +144,10 @@ class MiniBotApp:
 
         return reply
 
-    def _handle_proactive_notification(self, message: str, action_type: str):
+    def _handle_proactive_notification(self, message: str, posture: str = "general", anim_action: int = 3):
         """主动协同触发通知分发"""
-        # 1. 如果桌宠处于运行态，桌宠头顶弹气泡
         if self.pet_widget:
-            self.pet_widget.say(message, action=3)
+            self.pet_widget.finish_say_safe(message, action=anim_action)
 
     def run(self):
         print("=" * 60)
