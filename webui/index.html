@@ -132,6 +132,33 @@
         <input type="password" id="vlm_api_key" placeholder="sk-..." autocomplete="off">
       </div>
 
+      <div class="grid-2">
+        <div class="form-group">
+          <label>上下文上限 (Context Window Tokens)</label>
+          <input type="number" id="vlm_context_window" placeholder="262144">
+        </div>
+        <div class="form-group">
+          <label>静默无感压缩触发阈值 (%)</label>
+          <input type="number" id="vlm_compaction_ratio" min="10" max="95" placeholder="60">
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-top:4px;">
+        <label class="checkbox-group">
+          <input type="checkbox" id="vlm_enable_thinking">
+          <span>开启深度思考 (DeepSeek/vLLM Thinking 模式)</span>
+        </label>
+        <div class="form-group">
+          <label>思考强度 (Reasoning Effort)</label>
+          <select id="vlm_reasoning_effort" style="background:#0f172a; border:1px solid var(--border); color:var(--text); padding:8px 12px; border-radius:8px; font-size:13px; outline:none;">
+            <option value="none">none (关闭 / 默认)</option>
+            <option value="low">low (低强度思考 / 快速响应)</option>
+            <option value="medium">medium (中强度思考)</option>
+            <option value="high">high (高强度思考 / 复杂推理)</option>
+          </select>
+        </div>
+      </div>
+
       <div class="action-row">
         <button class="test-btn" onclick="testVlm()">
           <span>🧠 测试 VLM 连接</span>
@@ -225,6 +252,10 @@
         document.getElementById('vlm_base_url').value = currentConfig.vlm?.base_url || 'https://api.openai.com/v1';
         document.getElementById('vlm_model').value = currentConfig.vlm?.model || 'gpt-4o';
         document.getElementById('vlm_api_key').value = currentConfig.vlm?.api_key || '';
+        document.getElementById('vlm_context_window').value = currentConfig.vlm?.context_window || 262144;
+        document.getElementById('vlm_compaction_ratio').value = Math.round((currentConfig.vlm?.compaction_threshold_ratio || 0.6) * 100);
+        document.getElementById('vlm_enable_thinking').checked = currentConfig.vlm?.enable_thinking || false;
+        document.getElementById('vlm_reasoning_effort').value = currentConfig.vlm?.reasoning_effort || 'none';
 
         // Proactive
         document.getElementById('proactive_heartbeat').value = currentConfig.proactive?.heartbeat_interval_sec ?? 30;
@@ -257,7 +288,11 @@
           ...currentConfig.vlm,
           base_url: document.getElementById('vlm_base_url').value.trim(),
           model: document.getElementById('vlm_model').value.trim(),
-          api_key: document.getElementById('vlm_api_key').value.trim()
+          api_key: document.getElementById('vlm_api_key').value.trim(),
+          context_window: parseInt(document.getElementById('vlm_context_window').value) || 262144,
+          compaction_threshold_ratio: (parseFloat(document.getElementById('vlm_compaction_ratio').value) || 60) / 100.0,
+          enable_thinking: document.getElementById('vlm_enable_thinking').checked,
+          reasoning_effort: document.getElementById('vlm_reasoning_effort').value
         },
         proactive: {
           ...currentConfig.proactive,

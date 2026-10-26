@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from core.brain import VLMBrain
+from core.compaction import ContextCompactor
 from core.jev import JevClient
 from core.memory import MiniMemory
 from core.perception import LocalPerception
@@ -174,6 +175,7 @@ class AgentHarness:
         self.perception = perception
         self.skill_manager = skill_manager
         self.max_turns = max_turns
+        self.compactor = ContextCompactor(brain=self.brain)
 
     def run(
         self,
@@ -184,77 +186,84 @@ class AgentHarness:
     ) -> str:
         """
         运行 Harness 主循环
-        :param user_prompt: 用户输入的指令或任务
-        :param context_prompt: 记忆与感知上下文
-        :param on_text_chunk: 回调 (delta_text, accumulated_text)，用于流式更新气泡或终端
-        :param on_status_change: 回调 (status_text)，用于通知当前工具动作
-        :return: 最终对用户的答复
         """
-        # 1. 先用 Jev 决策模型评估任务复杂度 (System 1 门控)
+        # 1. Jev 决策模型评估任务复杂度 (System 1 门控)
         if self.jev.is_configured():
             action_type = self.jev.classify_harness_intent(user_prompt)
-            # 如果 Jev 判定仅仅是简单问候或闲聊，直接快速回复，避免进入沉重工具循环
             if action_type == "pure_chat":
                 reply = self.brain.generate_bubble_reply(user_prompt, context=context_prompt)
                 if on_text_chunk:
                     on_text_chunk(reply, reply)
                 return reply
 
-        system_instruction = (
+        # 2. 前缀缓存对齐：System Prompt 严格保持静态，严禁注入动态时间/变动状态
+        static_system_instruction = (
             "你是一个高行动力的智能体桌宠伙伴。你有权使用工具（运行终端命令、读写文件、查看屏幕截屏、执行技能）来实际解决用户的问题。\n"
             "【原则】\n"
             "1. 当需要调用工具时，务必在调用前输出一两句简短亲和的说明（告诉用户你正打算做什么），这些文本会流式显示在桌宠气泡上。\n"
             "2. 拿到工具结果后，继续推进直到彻底完成目标。\n"
-            "3. 保持简练，避免废话。\n"
-            f"【环境记忆与状态】\n{context_prompt}\n"
-            f"当前工作目录: {os.getcwd()}"
+            "3. 保持简练，直接给重点。\n"
+            f"工作目录基准: {os.getcwd()}"
         )
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_instruction},
+        initial_history: List[Dict[str, Any]] = [
             {"role": "user", "content": user_prompt}
         ]
 
         accumulated_user_facing_text = []
 
-        # 2. ReAct 执行循环
+        # 3. ReAct 执行循环
         for turn in range(self.max_turns):
             if on_status_change:
                 on_status_change(f"思考第 {turn + 1} 步...")
 
-            generator = self.brain.stream_chat_and_tools(messages, tools=HARNESS_TOOLS)
-            current_turn_text = []
+            # 通过 Compactor 组装消息：确保前缀绝对稳定，动态易变感知注入于尾部
+            assembled_messages = self.compactor.align_and_assemble_messages(
+                static_system_prompt=static_system_instruction,
+                history_messages=initial_history,
+                volatile_tail_context=context_prompt if turn == 0 else ""
+            )
 
-            # 流式捕获并即时输出中间文本
+            generator = self.brain.stream_chat_and_tools(assembled_messages, tools=HARNESS_TOOLS)
+            current_turn_text = []
             tool_calls = []
+            usage_data = {}
+
+            # 流式捕获并即时输出中间文本与思考链
             try:
                 while True:
                     event_type, event_data = next(generator)
-                    if event_type == "text_delta":
+                    if event_type == "reasoning_delta":
+                        if on_status_change:
+                            on_status_change("💭 深度思考中...")
+                    elif event_type == "text_delta":
                         current_turn_text.append(event_data)
                         accumulated_user_facing_text.append(event_data)
                         if on_text_chunk:
                             on_text_chunk(event_data, "".join(accumulated_user_facing_text))
             except StopIteration as e:
-                # 生成器最终返回值是 (full_text, tool_calls)
                 if e.value:
-                    _, tool_calls = e.value
+                    _, tool_calls, usage_data = e.value
+
+            # 更新 Token 统计与自动触发静默压缩
+            if usage_data and "total_tokens" in usage_data:
+                self.compactor.update_usage(usage_data["total_tokens"], initial_history)
 
             turn_text_str = "".join(current_turn_text).strip()
 
-            # 将本轮 Assistant 消息记入历史
+            # 将本轮消息加入历史记录
             asst_msg: Dict[str, Any] = {"role": "assistant"}
             if turn_text_str:
                 asst_msg["content"] = turn_text_str
             if tool_calls:
                 asst_msg["tool_calls"] = tool_calls
-            messages.append(asst_msg)
+            initial_history.append(asst_msg)
 
             # 如果没有工具调用，说明智能体认为任务已完成并给出了最终回复
             if not tool_calls:
                 return turn_text_str or "".join(accumulated_user_facing_text)
 
-            # 3. 执行工具调用
+            # 4. 执行本地工具调用
             tool_outputs_summary = []
             for tc in tool_calls:
                 func_name = tc.get("function", {}).get("name", "")
@@ -269,22 +278,19 @@ class AgentHarness:
                 if on_status_change:
                     on_status_change(f"执行工具: {func_name} ...")
 
-                # 运行本地工具
                 tool_result_str = self._dispatch_tool(func_name, args)
                 tool_outputs_summary.append(f"[{func_name}] -> {tool_result_str[:120]}")
 
-                # 限制单次工具输出长度，防止打爆上下文
                 if len(tool_result_str) > 2500:
                     tool_result_str = tool_result_str[:2500] + "\n...[输出过长，已截断]"
 
-                # 加入上下文
-                messages.append({
+                initial_history.append({
                     "role": "tool",
                     "tool_call_id": call_id,
                     "content": tool_result_str
                 })
 
-            # 4. 利用 Jev 决策模型快速判定是否已达标终结 (无需再耗费慢脑 3 秒)
+            # 5. Jev 快脑快速终结判定 (100ms 省去慢脑 3 秒)
             if self.jev.is_configured() and turn >= 1:
                 tool_sum = "; ".join(tool_outputs_summary)
                 should_finish, prob = self.jev.evaluate_task_completion(
@@ -295,10 +301,11 @@ class AgentHarness:
                 if should_finish:
                     if on_status_change:
                         on_status_change("Jev 判定任务已完成，收尾中...")
-                    # 做最后一次精炼收尾输出
-                    final_summary = self.brain.chat(
-                        messages + [{"role": "user", "content": "请向用户简明汇报任务完成结果。"}]
+                    final_messages = self.compactor.align_and_assemble_messages(
+                        static_system_prompt=static_system_instruction,
+                        history_messages=initial_history + [{"role": "user", "content": "请向用户简明汇报任务完成结果。"}]
                     )
+                    final_summary = self.brain.chat(final_messages)
                     if on_text_chunk:
                         on_text_chunk(final_summary, final_summary)
                     return final_summary
