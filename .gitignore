@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Local databases & logs
+data/*.db
+data/*.sqlite3
+data/*.log
+
+# NapCat binaries
+tools/napcat/
+tools/*.zip
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

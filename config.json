@@ -1,0 +1,37 @@
+{
+  "vlm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "model": "gpt-4o",
+    "temperature": 0.7,
+    "max_tokens": 1024
+  },
+  "jev": {
+    "base_url": "https://api.bamboonode.dev/v1",
+    "api_key": "",
+    "model": "startlux-decision-27b-autothink",
+    "portal_url": "https://bamboonode.dev/tokens"
+  },
+  "proactive": {
+    "heartbeat_interval_sec": 30,
+    "idle_threshold_sec": 600,
+    "enable_window_listener": true,
+    "enable_clipboard_listener": true,
+    "interrupt_score_threshold": 0.65
+  },
+  "channels": {
+    "pet": {
+      "enabled": true,
+      "scale": 1.0,
+      "pet_dir": "C:\\Users\\admin\\.codex\\pets\\ikunchick",
+      "bubble_duration_sec": 8
+    },
+    "napcat": {
+      "enabled": false,
+      "ws_url": "ws://127.0.0.1:3001",
+      "access_token": "",
+      "auto_launch": true,
+      "qq_number": ""
+    }
+  }
+}

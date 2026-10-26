@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MiniBot 智能体配置中心</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); padding: 24px; display: flex; justify-content: center; }
+    .container { width: 100%; max-width: 860px; display: flex; flex-direction: column; gap: 20px; }
+    
+    .header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .header h1 { font-size: 22px; display: flex; align-items: center; gap: 10px; font-weight: 700; }
+    .header p { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
+    .status-tag { background: rgba(59, 130, 246, 0.15); color: #60a5fa; padding: 4px 10px; border-radius: 999px; font-size: 12px; border: 1px solid rgba(59, 130, 246, 0.3); }
+
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+    .card-title { font-size: 16px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; }
+    .badge-jev { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+    .badge-vlm { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+
+    .help-banner { background: rgba(30, 41, 59, 0.8); border: 1px dashed #3b82f6; padding: 12px 16px; border-radius: 8px; font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .help-btn { background: #2563eb; color: #fff; text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: 0.2s; white-space: nowrap; }
+    .help-btn:hover { background: #1d4ed8; }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .form-group { display: flex; flex-direction: column; gap: 6px; }
+    label { font-size: 13px; color: var(--text-muted); font-weight: 500; }
+    input[type="text"], input[type="password"], input[type="number"] {
+      background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none; transition: 0.2s;
+    }
+    input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+
+    .action-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+    .test-btn { background: #334155; color: var(--text); border: none; padding: 7px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+    .test-btn:hover { background: #475569; }
+    .test-result { font-size: 12px; font-weight: 500; }
+
+    .checkbox-group { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+    .checkbox-group input { width: 16px; height: 16px; cursor: pointer; }
+
+    .footer-bar { position: sticky; bottom: 12px; background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(8px); border: 1px solid var(--border); padding: 12px 20px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 6px 20px rgba(0,0,0,0.4); }
+    .save-btn { background: var(--primary); color: white; border: none; padding: 10px 24px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    .save-btn:hover { background: var(--primary-hover); }
+    
+    .toast { position: fixed; top: 20px; right: 20px; padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 500; z-index: 100; opacity: 0; transform: translateY(-10px); transition: 0.3s; pointer-events: none; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.success { background: #065f46; color: #a7f3d0; border: 1px solid #10b981; }
+    .toast.error { background: #991b1b; color: #fecaca; border: 1px solid #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1>🤖 MiniBot 智能体配置中心</h1>
+        <p>配置快脑 Jev、慢脑 VLM、主动协同与各交互通道</p>
+      </div>
+      <div class="status-tag" id="status-tag">配置已加载</div>
+    </div>
+
+    <!-- JEV SECTION -->
+    <div class="card">
+      <div class="card-title">
+        <span>⚡ 1. Jev 快速决策模型 (快脑 - 毫秒级门控与主动触发)</span>
+        <span class="badge-jev">System 1</span>
+      </div>
+      
+      <div class="help-banner">
+        <span>BambooNode 提供高性能 Jev 决策模型支持，请先在官网控制台创建 API Token：</span>
+        <a href="https://bamboonode.dev/tokens" target="_blank" class="help-btn">
+          🔑 注册并获取 API Key ↗
+        </a>
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Jev API Base URL</label>
+          <input type="text" id="jev_base_url" placeholder="https://api.bamboonode.dev/v1">
+        </div>
+        <div class="form-group">
+          <label>决策模型名称 (Model)</label>
+          <input type="text" id="jev_model" placeholder="startlux-decision-27b-autothink">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Jev API Key</label>
+        <input type="password" id="jev_api_key" placeholder="sk-..." autocomplete="off">
+      </div>
+
+      <div class="action-row">
+        <button class="test-btn" onclick="testJev()">
+          <span>⚡ 测试 Jev 连接</span>
+        </button>
+        <span class="test-result" id="jev_test_res"></span>
+      </div>
+    </div>
+
+    <!-- VLM SECTION -->
+    <div class="card">
+      <div class="card-title">
+        <span>🧠 2. OpenAI 兼容视觉语言模型 (慢脑 - 深度推理与回复)</span>
+        <span class="badge-vlm">System 2</span>
+      </div>
+
+      <div class="grid-2">
+        <div class="form-group">
+          <label>VLM Base URL (支持 OpenAI/DeepSeek/Qwen 等)</label>
+          <input type="text" id="vlm_base_url" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="form-group">
+          <label>VLM 模型名称 (Model)</label>
+          <input type="text" id="vlm_model" placeholder="gpt-4o">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>VLM API Key</label>
+        <input type="password" id="vlm_api_key" placeholder="sk-..." autocomplete="off">
+      </div>
+
+      <div class="action-row">
+        <button class="test-btn" onclick="testVlm()">
+          <span>🧠 测试 VLM 连接</span>
+        </button>
+        <span class="test-result" id="vlm_test_res"></span>
+      </div>
+    </div>
+
+    <!-- PROACTIVE COLLABORATION SECTION -->
+    <div class="card">
+      <div class="card-title">
+        <span>🎯 3. 主动协同与本机旁听感知</span>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>心跳脉冲频率 (秒)</label>
+          <input type="number" id="proactive_heartbeat" min="5" max="300" placeholder="30">
+        </div>
+        <div class="form-group">
+          <label>键盘鼠标空闲阈值 (秒)</label>
+          <input type="number" id="proactive_idle" min="30" max="7200" placeholder="600">
+        </div>
+      </div>
+      <div class="grid-2">
+        <label class="checkbox-group">
+          <input type="checkbox" id="proactive_window">
+          <span>启用活动窗口与进程感知 (旁听流)</span>
+        </label>
+        <label class="checkbox-group">
+          <input type="checkbox" id="proactive_clipboard">
+          <span>启用剪贴板关键代码/报错监听</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- CHANNELS SECTION -->
+    <div class="card">
+      <div class="card-title">
+        <span>🐣 4. 交互通道 (桌宠 / NapCat QQ)</span>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="checkbox-group" style="margin-bottom:6px;">
+            <input type="checkbox" id="pet_enabled">
+            <span>启用桌宠前端交互</span>
+          </label>
+          <label>桌宠资产目录路径</label>
+          <input type="text" id="pet_dir" placeholder="C:\Users\admin\.codex\pets\ikunchick">
+        </div>
+        <div class="form-group">
+          <label class="checkbox-group" style="margin-bottom:6px;">
+            <input type="checkbox" id="napcat_enabled">
+            <span>启用 NapCat QQ 交互</span>
+          </label>
+          <label>OneBot WebSocket 地址</label>
+          <input type="text" id="napcat_ws_url" placeholder="ws://127.0.0.1:3001">
+        </div>
+      </div>
+    </div>
+
+    <!-- FOOTER -->
+    <div class="footer-bar">
+      <span style="font-size: 13px; color: var(--text-muted);">配置修改后将自动同步至 <code>config.json</code></span>
+      <button class="save-btn" onclick="saveConfig()">💾 保存配置</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let currentConfig = {};
+
+    function showToast(msg, type = 'success') {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.className = `toast show ${type}`;
+      setTimeout(() => { toast.className = 'toast'; }, 3000);
+    }
+
+    async function loadConfig() {
+      try {
+        const res = await fetch('/api/config');
+        currentConfig = await res.json();
+        
+        // Jev
+        document.getElementById('jev_base_url').value = currentConfig.jev?.base_url || 'https://api.bamboonode.dev/v1';
+        document.getElementById('jev_model').value = currentConfig.jev?.model || 'startlux-decision-27b-autothink';
+        document.getElementById('jev_api_key').value = currentConfig.jev?.api_key || '';
+
+        // VLM
+        document.getElementById('vlm_base_url').value = currentConfig.vlm?.base_url || 'https://api.openai.com/v1';
+        document.getElementById('vlm_model').value = currentConfig.vlm?.model || 'gpt-4o';
+        document.getElementById('vlm_api_key').value = currentConfig.vlm?.api_key || '';
+
+        // Proactive
+        document.getElementById('proactive_heartbeat').value = currentConfig.proactive?.heartbeat_interval_sec ?? 30;
+        document.getElementById('proactive_idle').value = currentConfig.proactive?.idle_threshold_sec ?? 600;
+        document.getElementById('proactive_window').checked = currentConfig.proactive?.enable_window_listener ?? true;
+        document.getElementById('proactive_clipboard').checked = currentConfig.proactive?.enable_clipboard_listener ?? true;
+
+        // Channels
+        document.getElementById('pet_enabled').checked = currentConfig.channels?.pet?.enabled ?? true;
+        document.getElementById('pet_dir').value = currentConfig.channels?.pet?.pet_dir || 'C:\\Users\\admin\\.codex\\pets\\ikunchick';
+        document.getElementById('napcat_enabled').checked = currentConfig.channels?.napcat?.enabled ?? false;
+        document.getElementById('napcat_ws_url').value = currentConfig.channels?.napcat?.ws_url || 'ws://127.0.0.1:3001';
+
+      } catch (err) {
+        showToast('读取配置失败: ' + err.message, 'error');
+      }
+    }
+
+    async function saveConfig() {
+      const newCfg = {
+        ...currentConfig,
+        jev: {
+          ...currentConfig.jev,
+          base_url: document.getElementById('jev_base_url').value.trim(),
+          model: document.getElementById('jev_model').value.trim(),
+          api_key: document.getElementById('jev_api_key').value.trim(),
+          portal_url: "https://bamboonode.dev/tokens"
+        },
+        vlm: {
+          ...currentConfig.vlm,
+          base_url: document.getElementById('vlm_base_url').value.trim(),
+          model: document.getElementById('vlm_model').value.trim(),
+          api_key: document.getElementById('vlm_api_key').value.trim()
+        },
+        proactive: {
+          ...currentConfig.proactive,
+          heartbeat_interval_sec: parseInt(document.getElementById('proactive_heartbeat').value) || 30,
+          idle_threshold_sec: parseInt(document.getElementById('proactive_idle').value) || 600,
+          enable_window_listener: document.getElementById('proactive_window').checked,
+          enable_clipboard_listener: document.getElementById('proactive_clipboard').checked
+        },
+        channels: {
+          ...currentConfig.channels,
+          pet: {
+            ...currentConfig.channels?.pet,
+            enabled: document.getElementById('pet_enabled').checked,
+            pet_dir: document.getElementById('pet_dir').value.trim()
+          },
+          napcat: {
+            ...currentConfig.channels?.napcat,
+            enabled: document.getElementById('napcat_enabled').checked,
+            ws_url: document.getElementById('napcat_ws_url').value.trim()
+          }
+        }
+      };
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newCfg)
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('✅ 配置已成功保存！');
+          currentConfig = newCfg;
+        } else {
+          showToast('保存失败: ' + (data.error || '未知错误'), 'error');
+        }
+      } catch (err) {
+        showToast('保存异常: ' + err.message, 'error');
+      }
+    }
+
+    async function testJev() {
+      const resEl = document.getElementById('jev_test_res');
+      resEl.textContent = '⏳ 测试连接中...';
+      resEl.style.color = '#94a3b8';
+
+      const payload = {
+        base_url: document.getElementById('jev_base_url').value.trim(),
+        api_key: document.getElementById('jev_api_key').value.trim(),
+        model: document.getElementById('jev_model').value.trim()
+      };
+
+      try {
+        const res = await fetch('/api/test/jev', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.success) {
+          resEl.textContent = `✅ 连接成功 (${data.latency_ms}ms)`;
+          resEl.style.color = '#34d399';
+        } else {
+          resEl.textContent = `❌ ${data.error || '连接失败'}`;
+          resEl.style.color = '#ef4444';
+        }
+      } catch (err) {
+        resEl.textContent = '❌ 请求异常: ' + err.message;
+        resEl.style.color = '#ef4444';
+      }
+    }
+
+    async function testVlm() {
+      const resEl = document.getElementById('vlm_test_res');
+      resEl.textContent = '⏳ 测试连接中...';
+      resEl.style.color = '#94a3b8';
+
+      const payload = {
+        base_url: document.getElementById('vlm_base_url').value.trim(),
+        api_key: document.getElementById('vlm_api_key').value.trim(),
+        model: document.getElementById('vlm_model').value.trim()
+      };
+
+      try {
+        const res = await fetch('/api/test/vlm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.success) {
+          resEl.textContent = `✅ 连接成功 (${data.latency_ms}ms)`;
+          resEl.style.color = '#34d399';
+        } else {
+          resEl.textContent = `❌ ${data.error || '连接失败'}`;
+          resEl.style.color = '#ef4444';
+        }
+      } catch (err) {
+        resEl.textContent = '❌ 请求异常: ' + err.message;
+        resEl.style.color = '#ef4444';
+      }
+    }
+
+    window.onload = loadConfig;
+  </script>
+</body>
+</html>
