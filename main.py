@@ -54,6 +54,11 @@ class MiniBotApp:
         print(f"[MiniBot] 处理来自 [{channel_source}] 的用户提问: {user_text}")
         self.memory.add_event(f"用户: {user_text}", source=f"user_{channel_source}", importance=1.5)
 
+        # 0. 自动提取核心事实 (如 '记住我叫小明', '记住我喜欢玩黑神话')
+        extracted_facts = self.memory.auto_extract_facts_from_text(user_text)
+        if extracted_facts:
+            print(f"[Memory] 自动提取并持久化核心事实: {extracted_facts}")
+
         # 1. 尝试匹配并调用 Skill
         skill_names = self.skill_manager.list_skill_names()
         if skill_names and self.jev.is_configured():
@@ -68,8 +73,13 @@ class MiniBotApp:
                 self.memory.add_event(f"技能执行结果: {res}", source="skill")
                 return res
 
-        # 2. 结合记忆上下文调用 VLM 慢脑回复
+        # 2. 结合记忆上下文调用 VLM 慢脑回复 (检索高相关度+近期的历史记忆)
+        relevant_memories = self.memory.search_events_with_decay(user_text, limit=3)
         context = self.memory.build_context_prompt(max_events=5)
+        if relevant_memories:
+            rel_strs = [f"- {m['content']}" for m in relevant_memories]
+            context += "\n【与提问相关的历史记忆线索】:\n" + "\n".join(rel_strs)
+
         # 按需截屏 (若提到“看屏幕”、“看看代码”、“当前页面”)
         img_bytes = None
         if any(kw in user_text for kw in ["看", "屏幕", "代码", "报错", "界面"]):
