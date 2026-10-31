@@ -21,7 +21,7 @@ def _endpoint():
         return ENDPOINT
     endpoint = str(_image_config().get("base_url") or "").strip()
     if not endpoint:
-        raise ValueError("未配置图片服务地址（设置页 image.base_url 或 config.local.json）")
+        raise ValueError("未配置图片服务地址（config.json 的 image.base_url）")
     return endpoint
 
 
