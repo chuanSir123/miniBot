@@ -83,6 +83,41 @@ skill-name/
     └── assets/     - Files used in output (templates, icons, fonts)
 ```
 
+#### MiniBot runtime contract (this repository)
+
+This project executes skills through `execute_skill` in a plain Python subprocess.
+It is **not** Claude Code, so the following are mandatory and override the generic
+anatomy above:
+
+1. **Entry script** — executable skills must declare it in frontmatter:
+
+   ```yaml
+   ---
+   name: my-skill
+   description: what it does and when to use it
+   entry: scripts/my_skill.py
+   ---
+   ```
+
+   The file lives at `skills/<name>/scripts/<name>.py` and must expose
+   `def execute(context): ...` returning a dict or string. A skill with no `entry`
+   is instructions-only: `execute_skill(name)` just returns the SKILL.md body.
+2. **Parameters** — put the JSON Schema in `skills/<name>/parameters.json`
+   (`{"type": "object", "properties": {...}, "required": [...]}`). It is validated
+   before the script runs, so a bad argument fails fast instead of corrupting output.
+
+Runtime facts for anything you write:
+
+- Windows host: PowerShell syntax for shell work; Python may use forward slashes.
+- Scripts run in an isolated subprocess under a timeout (`skills.timeout_sec`,
+  default 15s). Long work belongs in a background task, not a blocking call.
+- **No `claude` CLI and no sub-agent spawning.** The eval sections below
+  ("Running and evaluating test cases", blind comparison) cannot run here —
+  verify by calling `execute_skill` yourself and reading the real output instead.
+- Never write a skill as a flat file (`skills/foo.py`): such files require an
+  explicit entry in `skills.trusted_python` and are otherwise loaded as untrusted.
+  Always use the `skills/<name>/` directory form.
+
 #### Progressive Disclosure
 
 Skills use a three-level loading system:

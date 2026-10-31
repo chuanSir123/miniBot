@@ -1,4 +1,4 @@
-"""Declarative workflows and opt-in, process-isolated Python skills.
+"""Opt-in, process-isolated Python skills.
 
 技能目录支持 Agent Skills 规范形态：skills/<name>/SKILL.md（必须）+ scripts/（可选）。
 渐进式披露：目录技能只把 name+description 注入提示词，完整指令由
@@ -6,7 +6,6 @@ execute_skill 无参数调用返回；带 entry 脚本的技能再以隔离子�
 """
 
 import ast
-import hashlib
 import json
 import re
 import sys
@@ -17,7 +16,6 @@ from core.process import run_bounded
 from core import agent_skills
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
-READ_ONLY = {"read_file", "capture_screen"}
 INSTRUCTIONS_ONLY = ":instructions:"
 
 
@@ -81,7 +79,7 @@ def _builtin_result_payload(output):
 
 class Skill:
     def __init__(
-        self, name, description, filename, schema=None, workflow=None, trusted=False,
+        self, name, description, filename, schema=None, trusted=False,
         directory=None, body=None,
     ):
         self.name, self.description, self.filename = name, description, filename
@@ -92,7 +90,7 @@ class Skill:
             self.parameters_schema.get("properties")
             or self.parameters_schema.get("required")
         )
-        self.workflow, self.trusted = workflow, trusted
+        self.trusted = trusted
         self.directory = Path(directory) if directory else None
         self.body = body  # SKILL.md 正文（仅目录技能）
         self.is_folder = directory is not None
@@ -159,25 +157,6 @@ class SkillManager:
                 )
             except (ValueError, SyntaxError, OSError):
                 continue
-        for path in self.skills_dir.glob("*.json"):
-            if path.name == "usage.json":
-                continue
-            try:
-                if path.stat().st_size > 131072:
-                    continue
-                obj = json.loads(path.read_text(encoding="utf-8"))
-                self._validate_workflow(obj)
-                if obj.get("status") == "active":
-                    result[path.stem] = Skill(
-                        path.stem,
-                        obj["description"],
-                        path.name,
-                        obj.get("parameters", {}),
-                        obj,
-                        True,
-                    )
-            except (ValueError, KeyError, OSError):
-                continue
         # Fixed built-ins are independent of mutable generated Python skills.
         # STT 需要可配置云端 + 本地推理，已收回内置（core/stt.py）；
         # ego_lite 仍是目录技能（skills/ego-lite），实现保留在 core/ego.py。
@@ -233,7 +212,7 @@ class SkillManager:
     def _directory_signature(self):
         files = []
         for path in self.skills_dir.iterdir():
-            if path.suffix not in (".json", ".py") or path.name == "usage.json":
+            if path.suffix != ".py":
                 continue
             try:
                 stat = path.stat()
@@ -280,31 +259,6 @@ class SkillManager:
         if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,63}", name):
             raise ValueError("技能名只能是英文、数字、下划线")
         return name
-
-    def _validate_workflow(self, obj):
-        if not isinstance(obj, dict):
-            raise ValueError("工作流必须是JSON对象")
-        if obj.get("format") != "minibot-workflow-v1" or not isinstance(
-            obj.get("description"), str
-        ):
-            raise ValueError("invalid workflow")
-        steps = obj.get("steps", [])
-        if not isinstance(steps, list) or not 1 <= len(steps) <= 12:
-            raise ValueError("技能步骤数须为1到12")
-        for step in steps:
-            if (
-                not isinstance(step, dict)
-                or step.get("tool")
-                not in {
-                    "read_file",
-                    "capture_screen",
-                    "execute_command",
-                    "write_file",
-                }
-                or not isinstance(step.get("arguments"), dict)
-            ):
-                raise ValueError("非法技能步骤")
-        validate_args({"type": "object"}, obj.get("parameters", {}))
 
     def list_skill_names(self):
         self.refresh_if_changed()
@@ -374,7 +328,11 @@ class SkillManager:
                 raise ValueError(f"技能 {name} 文件存在但加载失败，请检查execute入口及静态DESCRIPTION/PARAMETERS格式")
             raise ValueError(f"技能 {name} 不存在，请先list_skills确认，创建新技能走 skill-creator 流程（write_file 写 skills/<name>/SKILL.md）；不要猜测技能名")
         if not skill.trusted:
-            raise ValueError(f"技能 {name} 已加载但未授权；请使用activate_skill启用，移动文件不能授予执行权限")
+            raise ValueError(
+                f"技能 {name} 已加载但未授权；activate_skill 只能重新扫描，不能授予权限。"
+                f"单文件技能需把文件名加入配置 skills.trusted_python，"
+                f"或改造成目录形态 skills/{name}/SKILL.md（目录技能默认可信）"
+            )
         # Agent Skills 渐进式披露：无参调用时返回 SKILL.md 完整指令。
         # 有 SKILL.md 正文且带必填参数的技能，无参调用先披露（模型还不该知道怎么填参）；
         # 无必填参数的技能（如 system_status）无参即执行。
@@ -422,29 +380,6 @@ class SkillManager:
                             **{k: v for k, v in result.items() if k != "output"},
                             **payload,
                         }
-            elif skill.workflow:
-                if not dispatch:
-                    raise ValueError("工作流需要工具执行器")
-                outputs = []
-                for step in skill.workflow["steps"]:
-
-                    def resolve(value):
-                        if isinstance(value, str) and value.startswith("$arg."):
-                            key = value[5:]
-                            if key not in args:
-                                raise ValueError("缺少工作流参数 " + key)
-                            return args[key]
-                        if isinstance(value, dict):
-                            return {k: resolve(v) for k, v in value.items()}
-                        if isinstance(value, list):
-                            return [resolve(v) for v in value]
-                        return value
-
-                    result = dispatch(step["tool"], resolve(step["arguments"]))
-                    outputs.append(result)
-                    if not result.get("ok"):
-                        raise RuntimeError(str(result))
-                result = {"ok": True, "outputs": outputs}
             else:
                 from core.workspace import workspace_for
                 from core.media_store import MediaStore
@@ -642,7 +577,10 @@ class SkillManager:
                 legacy.with_suffix(".py.migrated.bak").write_bytes(legacy.read_bytes())
                 legacy.unlink()
         if not script.exists():
-            raise ValueError(f"找不到技能 {name} 的脚本；save_skill 保存后即已启用，无需 activate")
+            raise ValueError(
+                f"找不到技能 {name} 的脚本；正确形态是 skills/{name}/scripts/{name}.py。"
+                "新建或改造技能走 skill-creator 流程"
+            )
         self.reload_skills()
         skill = self.skills.get(name)
         if not skill or not skill.trusted:
@@ -655,64 +593,3 @@ class SkillManager:
             result = [{"name": name, "status": "untrusted", "next_action": "activate_skill"}
                       for name, skill in self.skills.items() if not skill.trusted]
             return result[:100]
-
-    def learn_from_trace(self, goal, trace):
-        if not load_config()["skills"]["auto_learn"] or not trace or len(trace) > 12:
-            return None
-        if len(list(self.skills_dir.glob("learned_*.json"))) >= 100:
-            return None
-        if any(
-            not item["result"].get("ok")
-            or item["tool"]
-            not in {"read_file", "capture_screen", "write_file", "execute_command"}
-            for item in trace
-        ):
-            return None
-        steps = [
-            {"tool": item["tool"], "arguments": item["arguments"]} for item in trace
-        ]
-        digest = hashlib.sha256(
-            json.dumps(steps, sort_keys=True, ensure_ascii=False).encode()
-        ).hexdigest()[:12]
-        name = "learned_" + digest
-        # Read-only traces can be used immediately. Side effects remain explicit candidates.
-        active = all(s["tool"] in READ_ONLY for s in steps)
-        obj = {
-            "format": "minibot-workflow-v1",
-            "version": 1,
-            "description": goal[:300],
-            "status": "active" if active else "candidate",
-            "parameters": {},
-            "steps": steps,
-            "evidence": {"successful_steps": len(trace), "goal": goal[:1000]},
-            "previous_version": None,
-        }
-        with self.lock:
-            path = self.skills_dir / (name + ".json")
-            if not path.exists():
-                self._atomic(path, obj)
-            self.reload_skills()
-        return name
-
-    def set_workflow_status(self, name, active):
-        name = self._name(name)
-        path = self.skills_dir / (name + ".json")
-        with self.lock:
-            obj = json.loads(path.read_text(encoding="utf-8"))
-            self._validate_workflow(obj)
-            backup = path.with_suffix(".json.bak")
-            backup.write_bytes(path.read_bytes())
-            obj["status"] = "active" if active else "candidate"
-            obj["version"] = obj.get("version", 1) + 1
-            self._atomic(path, obj)
-            self.reload_skills()
-
-    def rollback(self, name):
-        name = self._name(name)
-        path = self.skills_dir / (name + ".json")
-        backup = path.with_suffix(".json.bak")
-        obj = json.loads(backup.read_text(encoding="utf-8"))
-        self._validate_workflow(obj)
-        with self.lock:
-            self._atomic(path, obj)
-            self.reload_skills()

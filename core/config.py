@@ -142,7 +142,6 @@ DEFAULT_CONFIG["meme"] = {
 }
 DEFAULT_CONFIG["skills"] = {
     "timeout_sec": 15,
-    "auto_learn": True,
     "trusted_python": ["system_status.py"],
     # 内置技能黑名单：不注入提示词、不参与 Jev 候选、execute_skill 直接报不存在。
     "ignore": ["image_gen", "tts"],

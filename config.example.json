@@ -146,7 +146,6 @@
   },
   "skills": {
     "timeout_sec": 15,
-    "auto_learn": true,
     "trusted_python": [],
     "ignore": [
       "image_gen",

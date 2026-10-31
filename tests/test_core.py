@@ -526,46 +526,8 @@ class SkillTests(Fixture):
         self.assertIn("new", manager.list_skill_names())
         self.assertTrue((folder / "new" / "SKILL.md").is_file())
 
-    def test_learn_usage_version_rollback(self):
+    def test_invalid_parameters_rejected(self):
         manager = SkillManager(self.root / "skills")
-        name = manager.learn_from_trace(
-            "read config",
-            [
-                {
-                    "tool": "read_file",
-                    "arguments": {"file_path": "example"},
-                    "result": {"ok": True},
-                }
-            ],
-        )
-        self.assertIn(name, manager.list_skill_names())
-        result = manager.execute_skill(
-            name, {}, lambda *a: {"ok": True, "output": "ok"}
-        )
-        self.assertTrue(result["ok"])
-        observer = SkillManager(self.root / "skills")
-        manager.set_workflow_status(name, False)
-        self.assertNotIn(name, observer.list_skill_names())
-        self.assertNotIn(name, manager.list_skill_names())
-        manager.rollback(name)
-        self.assertIn(name, observer.list_skill_names())
-        self.assertIn(name, manager.list_skill_names())
-        data = json.loads(manager.stats_path.read_text(encoding="utf-8"))
-        self.assertEqual(data[name]["success"], 1)
-
-    def test_side_effect_workflow_candidate_and_invalid_parameters(self):
-        manager = SkillManager(self.root / "skills")
-        name = manager.learn_from_trace(
-            "write",
-            [
-                {
-                    "tool": "write_file",
-                    "arguments": {"file_path": "x", "content": "x"},
-                    "result": {"ok": True},
-                }
-            ],
-        )
-        self.assertNotIn(name, manager.list_skill_names())
         from core.skill_manager import validate_args
 
         with self.assertRaises(ValueError):

@@ -551,7 +551,6 @@ class AgentHarness:
         self.brain, self.jev, self.memory = brain, jev, memory
         self.perception, self.skill_manager = perception, skill_manager
         self.max_turns = max_turns
-        self.on_completed = None
         # 重启回调：(reason, session_id) -> bool，由宿主（main.MiniBotApp）注入。
         # 没有它时 restart_bot 工具会明确报"当前环境不支持重启"，而不是假装重启。
         self.on_restart = None
@@ -1429,12 +1428,6 @@ class AgentHarness:
                     # 已经流式推送过同一段文本就不重复补发；若最终文案被核验改写过，
                     # 仍要把定稿推给界面（前端以 full 覆盖当前段，不会拼接重复）。
                     on_text_chunk(reply, reply)
-                if all(t["result"].get("ok") for t in trace) and trace:
-                    # Fast local synthesis from observed successful tool steps, no extra cloud round trip.
-                    if self.on_completed:
-                        self.on_completed(user_prompt, trace)
-                    else:
-                        self.skill_manager.learn_from_trace(user_prompt, trace)
                 return reply
             for call in calls:
                 if self._cancelled():

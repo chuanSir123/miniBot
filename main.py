@@ -118,13 +118,6 @@ class MiniBotApp:
         self._restart_lock = threading.Lock()
         self._qt_app = None
         self.harness.on_restart = self.request_restart
-        self.harness.on_completed = lambda goal, trace: self.dispatcher.submit(
-            "local:learning",
-            self.skill_manager.learn_from_trace,
-            goal,
-            trace,
-            background=True,
-        )
         self.proactive = ProactiveEngine(
             self.memory,
             self.perception,
