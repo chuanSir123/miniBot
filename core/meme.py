@@ -739,7 +739,7 @@ def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
     }
     import urllib.request
 
-    from core.network import urlopen
+    from core.netpool import open_request
 
     request = urllib.request.Request(
         endpoint,
@@ -750,7 +750,7 @@ def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
     )
     started = time.monotonic()
     try:
-        with urlopen(request, timeout=30) as response:
+        with open_request(request, timeout=30) as response:
             body = json.loads(response.read(256 * 1024).decode("utf-8", "replace"))
     except Exception as exc:
         log("Meme", "vlm.error", error=str(exc)[:160])

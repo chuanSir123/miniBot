@@ -458,7 +458,7 @@ class ModelWireTests(Fixture):
             partial = b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write_file","arguments":"{"}}]}}]}\n'
             response.readline.side_effect = ([partial, TimeoutError("The read operation timed out")]
                                              if phase == "partial" else TimeoutError("The read operation timed out"))
-            with patch.object(brain, "_open_request") as opening, patch("core.brain.log") as logs:
+            with patch("core.brain._open_request") as opening, patch("core.brain.log") as logs:
                 if phase == "headers":
                     opening.side_effect = urllib.error.URLError(TimeoutError("timed out"))
                 else:
@@ -483,7 +483,7 @@ class ModelWireTests(Fixture):
         headers["cf-ray"] = "test-ray"
         error = urllib.error.HTTPError("http://localhost", 520, "unknown origin", headers, io.BytesIO(b'{"error":"invalid origin response"}'))
         brain = VLMBrain()
-        with patch.object(brain, "_open_request", side_effect=error), patch("core.brain.log") as logs:
+        with patch("core.brain._open_request", side_effect=error), patch("core.brain.log") as logs:
             events, result = self.consume(brain.stream_chat_and_tools([{"role": "user", "content": "hi"}]))
         self.assertEqual(result[1], [])
         self.assertIn("HTTP 520", result[0])
@@ -553,9 +553,9 @@ class ModelWireTests(Fixture):
 
     def test_connection_reset_before_response_is_retried_once(self):
         """连接在拿到任何响应字节前被重置：换一条新连接重试一次。"""
-        import core.brain as brain_module
+        import core.netpool as netpool_module
 
-        original = brain_module._pool_acquire
+        original = netpool_module._pool_acquire
         attempts = [0]
 
         class ResettingConnection:
@@ -573,7 +573,7 @@ class ModelWireTests(Fixture):
                 return ResettingConnection(), False
             return original(key, scheme, host, port, timeout)
 
-        with patch.object(brain_module, "_pool_acquire", side_effect=acquire):
+        with patch.object(netpool_module, "_pool_acquire", side_effect=acquire):
             events, result = self.consume(
                 VLMBrain().stream_chat_and_tools([{"role": "user", "content": "hi"}])
             )
@@ -585,7 +585,8 @@ class ModelWireTests(Fixture):
         """4xx 是确定性错误：不重试，直接以 HTTPError 暴露给上层。"""
         import urllib.error
         import urllib.request
-        import core.brain as brain_module
+        import core.netpool as netpool_module
+        from core.netpool import open_request
 
         class RawResponse:
             status = 401
@@ -623,10 +624,10 @@ class ModelWireTests(Fixture):
             method="POST",
         )
         with patch.object(
-            brain_module, "_pool_acquire", return_value=(UnauthorizedConnection(), False)
+            netpool_module, "_pool_acquire", return_value=(UnauthorizedConnection(), False)
         ) as acquire:
             with self.assertRaises(urllib.error.HTTPError):
-                VLMBrain._open_request(request, 1)
+                open_request(request, 1)
         self.assertEqual(acquire.call_count, 1)
 
     def test_stream_tail_without_done_or_close_does_not_hang(self):
@@ -649,7 +650,7 @@ class ModelWireTests(Fixture):
 
         response.readline.side_effect = readline
         started = time.monotonic()
-        with patch.object(brain, "_open_request", return_value=response), patch(
+        with patch("core.brain._open_request", return_value=response), patch(
             "core.brain.log"
         ) as logs:
             events, result = self.consume(
@@ -677,7 +678,7 @@ class ModelWireTests(Fixture):
             b"data:[DONE]\n\n",
         ]
         response.readline.side_effect = lambda _size=0: lines.pop(0) if lines else b""
-        with patch.object(brain, "_open_request", return_value=response):
+        with patch("core.brain._open_request", return_value=response):
             events, result = self.consume(
                 brain.stream_chat_and_tools([{"role": "user", "content": "hi"}])
             )
