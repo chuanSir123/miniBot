@@ -167,7 +167,7 @@ class IntermediateReplyTests(Fixture):
         asyncio.run(run())
         self.assertEqual(sent, ['开始调用工具。', '群聊最终结果。'])
 
-    def test_chat_mode_splits_text_into_segments_but_tool_mode_does_not(self):
+    def test_chat_and_tool_mode_both_split_text_but_code_stays_whole(self):
         channel = NapCatChannel()
         sent_chat = []
         sent_tool = []
@@ -188,12 +188,24 @@ class IntermediateReplyTests(Fixture):
             asyncio.run(channel._send_text_reply(chat_event, sample_text))
         self.assertGreater(len(sent_chat), 1)
 
-        # 2. 工具调用模式：调用过工具，整段直接发出，不拆分
+        # 2. 工具调用模式：也要拆分。早期实现在这里整条豁免，导致几百字的
+        #    搜索结果总结「一大筐」发出去；用没用工具跟内容该不该分条无关。
         tool_event = dict(self.event(), _used_tools=True)
         with patch.object(channel, '_send', side_effect=fake_send_tool):
             asyncio.run(channel._send_text_reply(tool_event, sample_text))
-        self.assertEqual(len(sent_tool), 1)
-        self.assertEqual(sent_tool[0], sample_text)
+        self.assertGreater(len(sent_tool), 1)
+
+        # 3. 代码块必须整体送达，否则会被从中间截断
+        sent_code = []
+
+        async def fake_send_code(action, target, segment):
+            sent_code.append(segment)
+            return True
+
+        code_text = "跑这个试试：\n```python\nprint('a')\nprint('b')\n```\n应该能打出两行。"
+        with patch.object(channel, '_send', side_effect=fake_send_code):
+            asyncio.run(channel._send_text_reply(dict(self.event(), _used_tools=True), code_text))
+        self.assertEqual(len(sent_code), 1)
 
     def test_media_ref_sent_only_once_per_turn_and_not_leaked_in_intermediate(self):
         from core.media_store import MediaStore

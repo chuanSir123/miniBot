@@ -15,6 +15,13 @@ from urllib.parse import urlparse
 from core.config import load_config
 from core.console import log
 from core.meme import get_meme_manager
+from channels.qq_text import TextStyle
+
+
+def load_text_style() -> TextStyle:
+    """读出站整理配置。load_config 自身带缓存与热重载通知，这里不必再缓存。"""
+    return TextStyle.from_config(load_config())
+
 
 try:
     from websockets.asyncio.client import connect
@@ -30,11 +37,18 @@ _PUNCT_RE = re.compile(r"[^\w一-龥]")
 _ROLE_TTL_SEC, _GROUP_INFO_TTL_SEC = 300.0, 1800.0
 
 
-def split_chat_text(text):
-    """Keep sentence punctuation, merging fragments with fewer than two Han chars."""
-    parts = [part.strip() for part in re.split(r"[\r\n]+|(?<=[。！？~…])(?=[^。！？~…\s])", text) if part.strip()]
+def split_chat_text(text, max_parts=3):
+    """按句末标点切成气口，短碎片并回前段，超长时按字数均衡分配而不是堆到末尾。
+
+    旧实现 `merged[:2] + ["\\n".join(merged[2:])]` 把第 3 段之后的全部用换行
+    拼成一条，结果五句话的回复变成「两条短的 + 一大坨」，这正是长回复读起来
+    像小作文的直接原因。现在改成按可见字数把尾部均匀并入前面的气口。
+    """
+    if not text or not text.strip():
+        return []
+    raw = [part.strip() for part in re.split(r"[\r\n]+|(?<=[。！？~…])(?=[^。！？~…\s])", text) if part.strip()]
     merged, prefix = [], ""
-    for part in parts:
+    for part in raw:
         if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", part)) < 2:
             if merged:
                 merged[-1] += part
@@ -45,9 +59,32 @@ def split_chat_text(text):
             prefix = ""
     if prefix:
         merged.append(prefix)
+    # 只剩一段（比如整条都是短句，或本来就是分段排布）时原样退回，
+    # 保留原始换行；合并后的字符串会把段落结构压平。
     if len(merged) <= 1:
         return [text.strip()] if text.strip() else []
-    return merged[:2] + ["\n".join(merged[2:])] if len(merged) > 3 else merged
+    if len(merged) <= max_parts:
+        return merged
+    # 超过上限时按长度均衡分组：保持原文顺序与完整文本，不产生空洞尾巴
+    sizes = [len(part) for part in merged]
+    remaining_chars = sum(sizes)
+    start, groups = 0, []
+    for remaining_groups in range(max_parts, 0, -1):
+        if remaining_groups == 1:
+            groups.append("".join(merged[start:]))
+            break
+        target = remaining_chars / remaining_groups
+        latest_end = len(merged) - remaining_groups + 1
+        accumulated, best_end, best_distance = 0, start + 1, None
+        for end in range(start + 1, latest_end + 1):
+            accumulated += sizes[end - 1]
+            distance = abs(accumulated - target)
+            if best_distance is None or distance < best_distance:
+                best_end, best_distance = end, distance
+        groups.append("".join(merged[start:best_end]))
+        remaining_chars -= sum(sizes[start:best_end])
+        start = best_end
+    return [group for group in groups if group.strip()]
 
 
 class NapCatChannel:
@@ -440,9 +477,9 @@ class NapCatChannel:
                 return 0.0
             return difflib.SequenceMatcher(None, old, new, autojunk=False).ratio()
 
-        # 顺序相似度下限。0.78 能把「我先创建文件」→「我先创建一下文件喵～」判重，
+        # 顺序相似度下限。0.78 能把「我先创建文件」→「我先创建一下文件」判重，
         # 又放过「正在读取 config.json」→「正在读取 package.json」这种换了对象的新进度。
-        # 旧实现用字符集合 Jaccard，词序无关：「本喵给你点赞」和「点赞本喵给你」会被
+        # 旧实现用字符集合 Jaccard，词序无关：「我给你点个赞」和「点个赞给你我」会被
         # 判成同一句，而改写式复述（换个说法把同一件事再讲一遍）反而能逃掉。
         _SIMILAR_RATIO = 0.78
         # 终稿与最后一条进度的比对要保守：中间进度多发一条只是吵，终稿漏发就是丢结果。
@@ -535,7 +572,9 @@ class NapCatChannel:
                     result = await result
             except Exception as exc:
                 log("QQ", "reply.error", error=str(exc))
-                result = "这条消息暂时没处理好，请稍后再试喵。"
+                # 走到这里模型通常已经不可用了，没法让人设来组织这句话，
+                # 至少别用"请稍后再试"这种客服腔。
+                result = "刚那条没处理成，你再说一遍？"
             finally:
                 # Flush thread-safe enqueue callbacks before the sentinel, then
                 # drain in order so the final reply cannot overtake progress.
@@ -666,14 +705,28 @@ class NapCatChannel:
         # 模型不再通过 [表情: xx] 下单（选择权已交给 Jev），这里只负责把历史残留的
         # 标记从正文里剥掉，免得用户看到中括号。
         clean_text, _legacy_hint = extract_meme_tag(text_reply)
-        is_error = clean_text.lstrip().startswith(("【模型接口错误", "【对话模型请求超时", "【VLM", "模型连接失败"))
+        # 报文类兜底文案也算错误：报错原样送出，不做任何「美化」。
+        is_error = clean_text.lstrip().startswith(
+            ("【模型接口错误", "【对话模型请求超时", "【VLM", "模型连接失败",
+             "【[WinError", "【[Errno", "【网络", "【连接")
+        )
 
-        # 调用工具后不拆分消息分段发送，整段直接发出；普通 chat 模式则拆分分段并模拟打字发送
+        # 工具场景曾经整条不拆，727 字的搜索结果总结就是这样变成「一大筐」的——
+        # 用了工具只说明内容是交付物，不代表它不该分条。现在只有代码块必须整体送达。
         used_tools = bool(isinstance(event, dict) and event.get("_used_tools"))
-        if is_error or used_tools or len(clean_text) > 180 or "```" in clean_text:
+        has_code = "```" in clean_text
+        if is_error:
             segments_to_send = [clean_text]
         else:
-            segments_to_send = split_chat_text(clean_text)
+            # QQ 不渲染 Markdown，模型却会从搜索结果里把 **加粗**、# 标题一起抄过来。
+            # 提示词是请求，这里是保证。规则本身来自 persona.style，不是渠道硬编码：
+            # 剥格式是通道特性，砍客套/限装饰才是人设偏好，换人设只改配置。
+            style = load_text_style()
+            clean_text = style.tidy_tool_reply(clean_text) if used_tools else style.tidy(clean_text)
+            segments_to_send = (
+                [clean_text] if has_code
+                else split_chat_text(clean_text, max_parts=style.parts_for(clean_text))
+            )
 
         all_delivered = bool(segments_to_send)
         # 挑表情要问 Jev（一次 HTTP，通常 1~2s）。让它在正文发送的同时跑，

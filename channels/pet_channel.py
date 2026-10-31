@@ -153,7 +153,9 @@ class SpeechBubble(LightPanel):
                 font-weight: 400;
             }
         """)
-        pname = (names() or ["喵喵"])[0]
+        # 角色名一律来自配置。names() 可能返回 ['']（name 留空），
+        # 这里取第一个非空值兜底，避免桌宠标题变成空白。
+        pname = next((n for n in names() if n), "助手")
         self.title = QLabel(pname, self)
         self.title.setTextFormat(Qt.PlainText)
         self.title.setStyleSheet(
@@ -755,7 +757,9 @@ class DesktopPetWidget(QWidget):
             self._load_spritesheet()
         self.scale = max(0.25, min(float(cfg.get("scale", 1)), 3))
         self.bubble_duration = max(1, int(cfg.get("bubble_duration_sec", 8)))
-        pname = (names() or ["喵喵"])[0]
+        # 角色名一律来自配置。names() 可能返回 ['']（name 留空），
+        # 这里取第一个非空值兜底，避免桌宠标题变成空白。
+        pname = next((n for n in names() if n), "助手")
         self.bubble.title.setText(pname)
         self.hud.input_edit.setPlaceholderText("输入消息或指令...")
         effective = min(

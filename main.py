@@ -21,6 +21,7 @@ from core.harness import AgentHarness
 from core.jev import JevClient
 from core.memory import MiniMemory
 from core.perception import LocalPerception
+from core.persona import voice
 from core.proactive import ProactiveEngine
 from core.runtime import Dispatcher
 from core.skill_manager import SkillManager
@@ -96,6 +97,8 @@ class MiniBotApp:
         self.qq_policy = QQPolicy(self.memory, self.jev)
         self.qq_policy.on_restart = self.request_restart
         self.vlm = VLMBrain()
+        # 指令回执（重启、拉黑）也由人设来说，先建好再挂上去
+        self.qq_policy.brain = self.vlm
         self.skill_manager = SkillManager()
         self.harness = AgentHarness(
             self.vlm, self.jev, self.memory, self.perception, self.skill_manager
@@ -215,7 +218,14 @@ class MiniBotApp:
             self.harness.cancel_session(session)
             count = self.dispatcher.cancel_pending(session)
             future = concurrent.futures.Future()
-            reply = f"已取消当前任务及{count}条排队请求。"
+            facts = (
+                f"当前任务已经停下，另外 {count} 条还在排队的请求也一起取消了"
+                if count
+                else "当前任务已经停下，本来也没有排队的请求"
+            )
+            reply = voice("对方让你停下手上的活", facts, self.vlm) or (
+                f"停下了，排队的 {count} 条也一并放掉。" if count else "停下了。"
+            )
             future.set_result(reply)
             if channel == "pet" and self.pet_widget:
                 self.pet_widget.finish_say_safe(reply, 3)
@@ -279,7 +289,12 @@ class MiniBotApp:
                 pass
 
             future = concurrent.futures.Future()
-            reply = "🧹 会话历史与上下文记忆已全部清空，我们可以开始全新话题啦喵！"
+            # 记忆已经清完了，这句回执交给当前人设说，代码不预设语气
+            reply = voice(
+                "对方让你把会话记忆全清掉，你已经清完了",
+                "聊天记录和上下文记忆都清空了，现在可以从头开始聊",
+                self.vlm,
+            ) or "都清干净了，重新开始吧。"
             future.set_result(reply)
 
             if channel == "pet" and self.pet_widget:
@@ -289,7 +304,7 @@ class MiniBotApp:
             if channel in ("pet", "qq_private") and is_owner:
                 try:
                     from webui.server import broadcast_to_web_main
-                    broadcast_to_web_main("complete", {"reply": f"[{'桌宠' if channel=='pet' else 'QQ主人'}] 执行了 /clear：会话记忆已全部清空。"})
+                    broadcast_to_web_main("complete", {"reply": f"[{'桌宠' if channel=='pet' else 'QQ所有者'}] 执行了 /clear：会话记忆已全部清空。"})
                 except Exception:
                     pass
 
@@ -299,7 +314,11 @@ class MiniBotApp:
         if cmd in ("/cc", "#cc", "compact"):
             if hasattr(self.harness, "is_session_active") and self.harness.is_session_active(session):
                 future = concurrent.futures.Future()
-                reply = "⚠️ 当前任务正在执行中，请在任务完成后再压缩上下文喵。"
+                reply = voice(
+                    "对方让你压缩上下文，但当前正有任务在跑，这会儿压不了",
+                    "要等这一轮任务结束才能压",
+                    self.vlm,
+                ) or "等这轮跑完再压。"
                 future.set_result(reply)
                 if channel == "pet" and self.pet_widget:
                     self.pet_widget.finish_say_safe(reply, 3)
@@ -309,22 +328,34 @@ class MiniBotApp:
             history, _ = self.memory.get_history(session)
             future = concurrent.futures.Future()
             if not history or len(history) < 3:
-                reply = "ℹ️ 当前会话历史过短，暂无需压缩喵。"
+                reply = voice(
+                    "对方让你压缩上下文，但历史太短，没什么可压的",
+                    "才聊了没几句，还不用压",
+                    self.vlm,
+                ) or "现在没什么可压的。"
                 future.set_result(reply)
                 if channel == "pet" and self.pet_widget:
                     self.pet_widget.finish_say_safe(reply, 3)
                 return future
 
-            compactor = ContextCompactor(brain=self.brain, memory=self.memory, session_id=session)
+            compactor = ContextCompactor(brain=self.vlm, memory=self.memory, session_id=session)
             old_cutoff = compactor.summary["covered_until_id"] if compactor.summary else 0
             ok = compactor._run_compaction_worker(history, keep=6)
             new_cutoff = compactor.summary["covered_until_id"] if compactor.summary else 0
             history_after, _ = self.memory.get_history(session)
 
             if ok or new_cutoff > old_cutoff:
-                reply = f"📦 上下文手动压缩完成！较早的消息已生成结构化摘要归档，当前活跃上下文已精简至最近 {len(history_after)} 条喵。"
+                reply = voice(
+                    "对方让你压缩上下文，你已经压完了",
+                    f"较早的消息归档成了摘要，现在手上只留最近 {len(history_after)} 条",
+                    self.vlm,
+                ) or f"压好了，现在只留最近 {len(history_after)} 条。"
             else:
-                reply = "ℹ️ 未达到压缩阈值或无多余上下文需要压缩喵。"
+                reply = voice(
+                    "对方让你压缩上下文，但没到阈值，等于没压成",
+                    "还没到需要压缩的程度",
+                    self.vlm,
+                ) or "还没到要压的程度。"
             future.set_result(reply)
 
             if channel == "pet" and self.pet_widget:

@@ -3,7 +3,7 @@ import json
 import re
 from core.config import load_config, save_config
 from core.console import log
-from core.persona import names
+from core.persona import names, voice
 from core.decision_context import qq_scope, record_qq_message
 
 
@@ -13,6 +13,8 @@ class QQPolicy:
         self.chat_compactor = None
         # 重启回调：(reason) -> bool，由宿主注入；没有它时 /重启 只提示不执行。
         self.on_restart = None
+        # 用于把指令回执说成人话：这几句本来写死在代码里，换人设就出戏。
+        self.brain = None
 
     def blocked(self, event):
         uid = str(event.get("user_id", ""))
@@ -31,9 +33,18 @@ class QQPolicy:
         text = text.strip()
         if text in ("/重启", "/restart", "/reboot"):
             if not callable(self.on_restart):
-                return "当前环境没有接入重启通道，暂时没法重启喵。"
-            self.on_restart("主人通过 QQ 指令请求重启")
-            return "好嘞，这就重启一下喵，等我回来～"
+                return voice(
+                    "对方让你重启，但这套环境没接重启通道，重启不了，只能如实说明",
+                    "", self.brain,
+                ) or "这边接不了重启，重启不了。"
+            # 先生成回执再触发：request_restart 只是挂个后台线程，等本轮回复
+            # 交给通道之后才停机，所以这句话来得及说完。
+            reply = voice(
+                "对方让你重启，你答应了，进程马上会重开一会儿，回来还是你",
+                "", self.brain,
+            ) or "好，重启一下。"
+            self.on_restart("所有者通过 QQ 指令请求重启")
+            return reply
         if text in ("/黑名单", "/blacklist", "/qq-blacklist list"):
             return "黑名单：" + json.dumps(self.memory.qq_blacklist(), ensure_ascii=False)
         match = re.fullmatch(r"(?:/拉黑|拉黑|/blacklist|/qq-blacklist add)\s*(\d{5,20})", text)
@@ -44,16 +55,25 @@ class QQPolicy:
             return None
         uid = (match or remove).group(1)
         if uid in owners:
-            return "主人账号不会加入黑名单。"
+            return voice(
+                "对方要把一个号加进黑名单，但那个号是他自己，拉黑不了",
+                "所有者账号不能拉黑", self.brain,
+            ) or "这是你自己的号，拉不了。"
         if remove:
             self.memory.qq_unblock(uid)
             current_bl = [str(x) for x in cfg.get("blacklisted_user_ids", []) if str(x) != uid]
             save_config({"channels": {"napcat": {"blacklisted_user_ids": current_bl}}})
-            return f"已解除 {uid} 的黑名单并更新配置。"
+            return voice(
+                "对方让你把某人从黑名单里放出来，你做完了", f"{uid} 已经放出来了",
+                self.brain,
+            ) or f"{uid} 放出来了。"
         self.memory.qq_block(uid, source="owner", reason="主人明确要求")
         current_bl = list(set([str(x) for x in cfg.get("blacklisted_user_ids", [])] + [uid]))
         save_config({"channels": {"napcat": {"blacklisted_user_ids": current_bl}}})
-        return f"已将 {uid} 加入黑名单并保存到配置，后续消息会前置忽略。"
+        return voice(
+            "对方让你把某人拉黑，你做完了，之后会前置忽略他的消息",
+            f"{uid} 已经拉黑", self.brain,
+        ) or f"{uid} 拉黑了，之后不搭理。"
 
     @staticmethod
     def _recent_lines(items, limit=10, chars=400):
@@ -81,7 +101,7 @@ class QQPolicy:
         parsed = event.get("_parsed", {})
         direct = parsed.get("direct_text", text)
 
-        # 检查是否叫了人设名字（如 喵喵、猫娘）
+        # 检查是否叫了配置里的人设名或别名
         all_names = names()
         called_name = any(n and n.casefold() in direct.casefold() for n in all_names)
 

@@ -13,10 +13,12 @@ from core.netpool import open_request
 _cooldowns = {}
 _cooldown_lock = threading.Lock()
 
-# 官方 limits.max_options（docs.decision.vllm-sr.ai 的 Limits 表，2026-10-30 核对）：
-# 单个 question 的选项上限 255，choice / noul / score 共用这一个额度。
-# 模型可能更严，服务端会回 400 too_many_options，调用方据此对半缩小重试。
+# 服务端两处硬上限（docs.decision.vllm-sr.ai 的 Limits 表，2026-10-30 核对）：
+#   - 单个 choice 的选项上限 255（含 none），超了回 400 too_many_options；
+#   - 单个请求的 question 总数上限 64（所有 state 加起来），超了回 400
+#     too_many_questions（实测 64 通过、120 被拒）。
 MAX_OPTIONS = 255
+MAX_QUESTIONS_PER_CALL = 64
 
 
 class JevClient:
@@ -296,108 +298,80 @@ class JevClient:
         except Exception:
             return None
 
-    def select_meme_tag(self, message, reply, tags, batch=None, max_rounds=None,
-                        min_confidence=0.35, max_options=MAX_OPTIONS,
-                        decisive_confidence=0.6):
-        """挑一个表情包标签；返回 None 表示这轮不该发。
+    def score_meme_tags(self, message, reply, tags, max_batches=4):
+        """给每个标签各自打一个 0~1 的贴切度分，外加一个 none（该不该发）。
 
-        单批内不需要额外规则：choice 就是 probabilities 的 argmax（实测 8/8 成立），
-        所以"none 概率最高就不发"是模型的默认行为，这里只负责认定 none 不是候选。
+        为什么不是"选一个标签"：一张图常带 3~6 个标签，一次 argmax 等于把其余标签
+        全丢掉。选中「可爱」之后，候选池里既有一张真的在卖萌的，也有一张贴着「可爱」
+        但主体情绪是「疑惑」的，两者在标签层面完全等价——这就是错配的来源。
+        改成每个标签独立打分后，图的分 = 它各标签得分按位置衰减求和，
+        多出来的标签才真正参与决策。
 
-        分批穷尽全部候选，必然终止：每批从 option_batch 个标签 + none 里选，
-        tag 问完为止。两个置信度管的是两件不同的事：
+        noul 是**独立概率**，不像 choice 那样是批内相对的 softmax 分布，
+        所以分批切开的分数可以直接合并比较，这也是敢按 64 个一批切的原因。
 
-        - decisive_confidence（默认 0.6）：**省请求用的**。某批给出这么确定的
-          判断，后面几批不可能更好，立即返回。实测"选标签"时 conf 从未低于 0.6
-          （最低 0.608），所以绝大多数情况第一批就结束。
-        - min_confidence（默认 0.35）：**地板**，防"全程都在凑数"。跨批时不比
-          大小（conf 是"本批选项内的把握"，不是全局量），只保留最好的一次；
-          问完仍低于地板就不发。实测该发时 conf 在 0.84~0.95，不该发时
-          none 是 argmax 且 conf 掉到 0.03~0.11，两者之间几乎没有重叠。
+        实测标定（38 个标签的真实图库）：
+          该发：「被领导骂了」  -> 抱抱 0.999 / 摸摸 0.996 / 叹气 0.993，none 0.060
+          不该发：「文件转好了」-> 点赞 0.486，none 0.918
+          不该发：「解释报错」  -> 疑惑 0.080，none 0.997
 
-        实测数据（同一 state，只换这批候选，255 选项）：
-          贴切「摸摸」 -> 摸摸 0.932（none 0.009）
-          反义「大笑/点赞/鼓掌」 -> none 0.107
-          弱沾边「流汗」 -> none 0.034
-          纯噪声 -> none 0.043
-        即模型只在真正贴切时选标签，其余一律 none，不需要靠阈值去"纠正"它。
+        返回 {tag: score, "none": score}；未配置或第一轮就失败返回 None，
+        调用方据此降级到首位标签排序。
         """
-        candidates = [tag for tag in (tags or []) if tag]
-        if not candidates or not self.is_configured():
+        items = [str(tag) for tag in (tags or []) if tag]
+        if not items or not self.is_configured():
             return None
-        # 官方上限是 options 总数（含 none），留一个位置给 none。
-        option_batch = max(2, min(int(max_options), MAX_OPTIONS) - 1) if batch is None else \
-            max(2, min(int(batch), int(max_options) - 1))
-        # 默认不额外限制轮数：候选问完就结束，天然有界。
-        round_limit = max(1, int(max_rounds)) if max_rounds is not None else None
+        # 单个请求的问题总数有硬上限，留一个位置给 none。
+        per_call = max(1, MAX_QUESTIONS_PER_CALL - 1)
         state = self._with_context({
             "incoming": (message or "")[:800],
             "reply": (reply or "")[:800],
-            "tag_count": len(candidates),
         })
-        instructions = (
-            "判断这条回复要不要配一张表情包，要的话配哪个标签。标签是图库里的图注，只能选一个。"
-            "只有表情能强化当前语气或情绪时才选；纯信息性回复、工具执行结果、报错、严肃话题、"
-            "正在致歉或解释问题时一律选 none。不要因为字面重合就选（回复里提到文件不等于要选「流汗」）。"
-            "拿不准就选 none。"
-        )
         from core.console import log
 
-        cursor = 0          # 已问过的候选位置
-        asked = 0           # 实际发出的请求数（供日志与轮数上限）
-        best_tag = None     # 跨批最好的一次（只在没有决定性答案时才用得上）
-        best_conf = 0.0
-        while cursor < len(candidates):
-            if round_limit is not None and asked >= round_limit:
-                break
-            chunk = candidates[cursor:cursor + option_batch]
+        scores: Dict[str, float] = {}
+        asked = 0
+        for index in range(max(1, int(max_batches))):
+            chunk = items[index * per_call:(index + 1) * per_call]
             if not chunk:
                 break
+            questions = {
+                f"t{i}": {
+                    "type": "noul",
+                    "instructions": f"这条回复配一张表达「{tag}」的表情包是否贴切自然",
+                }
+                for i, tag in enumerate(chunk)
+            }
+            if index == 0:
+                questions["none"] = {
+                    "type": "noul",
+                    "instructions": "这条回复不该配任何表情包",
+                }
             try:
-                result = self.decide_raw(state, {
-                    "meme_tag": {"type": "choice", "options": chunk + ["none"],
-                                 "instructions": instructions},
-                })
+                result = self.decide_raw(state, questions)
             except Exception as exc:
-                detail = str(exc)
-                # 服务端上限可能比文档更低（或者在调小）。砍半重问同一段，
-                # 不前进游标、不算一次有效轮次。
-                if "too_many_options" in detail and option_batch > 2:
-                    option_batch = max(2, option_batch // 2)
-                    log("Decision", "meme_tag.shrink_batch", size=option_batch)
-                    continue
-                # 其它失败就收手：继续撞后面几批只会把表情包再拖慢几秒，
-                # 而"这轮不发图"本身就是完全可接受的降级。
-                log("Decision", "meme_tag.error", error=detail[:160], round=asked + 1)
-                return best_tag if best_conf >= float(min_confidence) else None
+                log("Decision", "meme.score.error", error=str(exc)[:160], batch=index + 1)
+                return scores or None
             asked += 1
-            cursor += len(chunk)
-            answer = (result.get("answers") or {}).get("meme_tag") or {}
-            chosen = answer.get("choice")
-            if chosen not in chunk:      # 选了 none，这批没合适的
-                continue
-            try:
-                confidence = float(answer.get("confidence") or 0)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            if confidence > best_conf:
-                best_tag, best_conf = chosen, confidence
-            if confidence >= float(decisive_confidence):
-                # 这么确定就不用再问后面几批了（后面的候选字面相关度本来就更低）。
-                log("Decision", "meme_tag.selected", tag=chosen, confidence=round(confidence, 3),
-                    round=asked, tags_seen=cursor, tags_total=len(candidates))
-                return chosen
-            # 选中了但没把握：记下来继续找，不拿它立刻硬凑。
-            log("Decision", "meme_tag.low_confidence", tag=chosen, confidence=round(confidence, 3),
-                round=asked)
-        floor = float(min_confidence)
-        if best_tag and best_conf >= floor:
-            log("Decision", "meme_tag.selected_after_all", tag=best_tag,
-                confidence=round(best_conf, 3), asked=asked, tags_total=len(candidates))
-            return best_tag
-        return None
+            answers = result.get("answers") or {}
+            for i, tag in enumerate(chunk):
+                scores[tag] = self._noul_value(answers.get(f"t{i}"))
+            if index == 0:
+                scores["none"] = self._noul_value(answers.get("none"))
+        if not scores:
+            return None
+        log("Decision", "meme.scored",
+            tags=sum(1 for tag in scores if tag != "none"), batches=asked)
+        return scores
 
-
+    @staticmethod
+    def _noul_value(answer) -> float:
+        """noul 应答取 0~1 的分；字段缺失或格式异常一律当 0（不贴切）。"""
+        value = answer.get("noul") if isinstance(answer, dict) else None
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
 
     # ==========================================================
     # 场景 6: 同一空间第一层 Jev 意图判断 (Chat vs 引导 vs 独立并发任务)

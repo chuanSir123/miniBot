@@ -181,7 +181,7 @@ HARNESS_TOOLS = [
                 "type": "object",
                 "properties": {
                     "skill_name": {"type": "string", "description": "技能名称"},
-                    "arguments": {"type": "object", "description": "技能参数JSON对象，例如 {\"prompt\":\"猫娘\",\"width\":480}，不要序列化为字符串"},
+                    "arguments": {"type": "object", "description": "技能参数JSON对象，例如 {\"prompt\":\"日落\",\"width\":480}，不要序列化为字符串"},
                     "background": {"type": "boolean", "description": "是否在后台异步运行", "default": False},
                     "timeout_sec": {"type": "number", "description": "首阶段等待超时秒数，默认按技能配置"},
                 },

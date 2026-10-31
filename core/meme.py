@@ -4,10 +4,16 @@
   收集  —— 本地目录扫描 + 群聊静默采集（保留原图，动图不会退化成首帧）
   打标  —— 优先读图片自带元数据/文件名；拿不到再调 VLM 看图出标签
   汇总  —— meme_tags 表维护「每个标签下有几张图、被发过几次」
-  决策  —— Jev 根据当前消息与回复，从标签里挑一个，或明确不发表情
+  打分  —— Jev 一次请求给每个标签打独立的分，图分 = 各标签分按位置衰减求和
 
-旧实现用 ocr_text 存"图片所在那条群消息的文字"、靠字符 Jaccard 猜标签，
-两边都不成立：那串文字和图片内容无关，字符相似度也认不出「卖萌」和「撒娇」。
+第四步不能退化成「让模型挑一个标签」：一张图常带 3~6 个标签，选出「可爱」之后，
+候选池里既有一张真的在卖萌的，也有一张贴着「可爱」但主体情绪是「疑惑」的，
+两者在标签层面完全等价，随机抽一张就是错配。只有让每个标签各自带着分回来，
+多出来的标签才真正参与决策。
+
+用 noul 而不是 choice 也是为此：noul 是独立概率，跨批可直接合并比较，
+所以超过 64 个标签时可以按 63 个一批切开问；choice 是批内相对的 softmax 分布，
+一旦切开，不同批的分数就没有共同基准了。
 """
 
 import base64
@@ -16,6 +22,7 @@ import hashlib
 import json
 import os
 import queue
+import random
 import re
 import sqlite3
 import threading
@@ -44,6 +51,11 @@ MAX_STORED_BYTES = 8_000_000
 # 打标上限：base64 之后体积会涨 1/3，太大只会拖慢队列。
 MAX_TAGGED_BYTES = 5_000_000
 MAX_TAGS_PER_MEME = 8
+
+# 图分权重：标签在图上排第一就按它的原分算，往后依次衰减。
+# 只加到第 4 个标签为止——再往后基本都是凑数的画风词，给了权重只会让
+# "标签多但都弱"的图挤掉"只有一个标签但完全贴切"的图。
+TAG_POSITION_WEIGHTS: Sequence[float] = (1.0, 0.5, 0.3, 0.15)
 
 # 情绪桶只在「Jev 不可用」的降级路径里用来把标签归到语气大类，不再写库。
 EMOTION_KEYWORDS: Dict[str, List[str]] = {
@@ -559,20 +571,6 @@ class MemeManager:
         with self._lock:
             return set(self._recent.get(chat_key) or ())
 
-    def _tag_availability(self, cooldown: Set[str]) -> Dict[str, int]:
-        """每个标签还有几张"不在冷却中"的图。图库几千张也只是毫秒级全量扫描。"""
-        if not cooldown:
-            return {}
-        available: Counter = Counter()
-        with self._lock, self._db() as db:
-            for row in db.execute("SELECT file_path, tags FROM memes WHERE file_path IS NOT NULL"):
-                path = row["file_path"]
-                if path in cooldown or not Path(path).exists():
-                    continue
-                for tag in normalize_tags(row["tags"] or "[]"):
-                    available[tag] += 1
-        return available
-
     def _rank_tags(self, text: str, limit: int) -> List[str]:
         """按「字面相关 > 发得少 > 图多」排序，字面命中只是粗筛，最终由 Jev 定。"""
         summary = self.tag_summary()
@@ -591,100 +589,183 @@ class MemeManager:
 
         return [str(item["tag"]) for item in sorted(summary, key=score)][:limit]
 
-    def pick_by_tag(self, tag: str, exclude_paths: Sequence[str] = ()) -> Optional[str]:
+    @staticmethod
+    def _primary_rank(tags: Sequence[str], tag: str) -> int:
+        """标签在这张图的标签序列里排第几，就是它有多"主张"。
+
+        VLM 按贴切度顺序输出，第一位才是这张图真正要表达的东西。排序信息一直藏在
+        tags 数组里，只是过去被当成无序集合用掉了。分三档而不是精确位次：第二位
+        仍然算相关，第三位往后基本只是"顺带也有这个特征"，继续细分没有额外信息。
+
+        这一步是 Jev 二次选图的兜底，也是短名单的排序依据——没有它，
+        「可爱」桶里首位是「疑惑」的图和首位是「卖萌」的图完全等价。
+        """
+        if not tags:
+            return 0
+        if tags[0] == tag:
+            return 3
+        if len(tags) > 1 and tags[1] == tag:
+            return 2
+        return 1
+
+    def _candidates_for_tag(self, tag: str, exclude_paths: Sequence[str] = (),
+                            limit: Optional[int] = None) -> List[Dict[str, object]]:
+        """取该标签下的候选图，按「首位标签优先 > 发得少 > 随机」排好序。
+
+        SQL 的 `tags LIKE '%"tag"%'` 只是粗筛（它认不出位置），真正的判定在
+        normalize_tags 之后的精确成员检查与位置打分。
+        """
         excluded = set(exclude_paths or ())
         with self._lock, self._db() as db:
             rows = db.execute(
-                "SELECT id, file_path, tags FROM memes WHERE tags LIKE ? AND file_path IS NOT NULL"
-                " ORDER BY use_count ASC, RANDOM() LIMIT 40",
+                "SELECT id, file_path, tags, use_count FROM memes"
+                " WHERE tags LIKE ? AND file_path IS NOT NULL",
                 (f'%"{tag}"%',),
             ).fetchall()
-            chosen = None
-            for row in rows:
-                path = row["file_path"]
-                if path in excluded:
-                    continue
-                if tag not in normalize_tags(row["tags"] or "[]"):
-                    continue
-                if not Path(path).exists():
-                    continue
-                chosen = row
-                break
-            if chosen is None:
-                return None
-            db.execute("UPDATE memes SET use_count = use_count + 1 WHERE id = ?", (chosen["id"],))
+        items: List[Dict[str, object]] = []
+        for row in rows:
+            path = row["file_path"]
+            if path in excluded:
+                continue
+            tags = normalize_tags(row["tags"] or "[]")
+            if tag not in tags:
+                continue
+            if not Path(path).exists():
+                continue
+            items.append({
+                "id": row["id"],
+                "path": path,
+                "tags": tags,
+                "rank": self._primary_rank(tags, tag),
+                "use_count": int(row["use_count"] or 0),
+            })
+        items.sort(key=lambda item: (-int(item["rank"]), int(item["use_count"]), random.random()))
+        if limit:
+            return items[:max(1, int(limit))]
+        return items
+
+    def _take(self, candidate: Dict[str, object], tag: str) -> str:
+        """认定发这张：加使用计数、加标签热度，返回路径。"""
+        with self._lock, self._db() as db:
+            db.execute("UPDATE memes SET use_count = use_count + 1 WHERE id = ?", (candidate["id"],))
             db.execute("UPDATE meme_tags SET used = used + 1, updated_at = ? WHERE tag = ?", (time.time(), tag))
-        log("Meme", "selected", tag=tag, file=Path(chosen["file_path"]).name)
-        return chosen["file_path"]
+        log("Meme", "selected", tag=tag, file=Path(str(candidate["path"])).name,
+            rank=candidate.get("rank", "-"), used=int(candidate["use_count"]))
+        return str(candidate["path"])
+
+    def pick_by_tag(self, tag: str, exclude_paths: Sequence[str] = ()) -> Optional[str]:
+        """只按标签取一张（外部脚本/无语境场景用）。首选首位标签匹配的那批。"""
+        candidates = self._candidates_for_tag(tag, exclude_paths)
+        if not candidates:
+            return None
+        return self._take(candidates[0], tag)
 
     def choose_meme(self, message: str, reply: str, exclude_paths: Sequence[str] = (),
                     chat_key: Optional[str] = None) -> Optional[str]:
         """为一轮回复挑一张表情包；返回 None 表示这轮不该发。
 
-        chat_key（群号 / 私聊用户号）用于会话级避让：该会话最近发过的图
-        这轮不再选，标签下所有图都在冷却中时整个标签不进 Jev 的候选——
-        否则「赞同」这种只有一张图的标签每次选中都会发同一张。
+        chat_key（群号 / 私聊用户号）用于会话级避让：该会话最近发过的图这轮不再入选，
+        否则「赞同」这种只有一张图的标签每次都会发同一张，全库都在冷却这轮就歇着。
+
+        决策只有一轮：Jev 给每个标签各自打分（外加一个"这条不该发"的 none），
+        然后在全库上按「图自己的标签得分加权」排名取第一。不再有"先选一个标签、
+        再在该标签下挑图"的漏斗——那个漏斗会把标签层面等价、实际情绪不同的图混在一起。
         """
         cfg = load_config().get("meme", {})
         summary = self.tag_summary()
         if not summary:
             return None
         cooldown = self._cooldown_paths(chat_key) | set(exclude_paths or ())
-        # 官方 limits.max_options = 255（含 none），所以一批最多 254 个标签。
-        # 上限就按官方值来，没必要自己往下砍：实测 255 个选项分辨力和延迟都没退化。
-        max_options = max(2, min(255, int(cfg.get("tag_options_per_call", 255))))
-        per_batch = max_options - 1
-        # 轮数上限只是兜底，防止图库膨胀到几千个标签时一次回复连发几十个请求。
+        # 一次请求最多问 64 个 question（含 none），即一次能给 63 个标签打分。
+        # 标签多于这个数就分几批问：noul 是独立概率，跨批的分数可以直接比。
         rounds_cap = max(1, min(8, int(cfg.get("tag_max_rounds", 4))))
-        capacity = per_batch * rounds_cap
-        tags = self._rank_tags((message or "") + " " + (reply or ""), capacity * 2)
-        if cooldown:
-            available = self._tag_availability(cooldown)
-            usable = [tag for tag in tags if available.get(tag, 0) > 0]
-            cooled = len(tags) - len(usable)
-            if cooled:
-                log("Meme", "tag_cooldown", cooled=cooled, usable=len(usable))
-            tags = usable
-        tags = tags[:capacity]
+        capacity = 63 * rounds_cap
+        tags = self._rank_tags((message or "") + " " + (reply or ""), capacity)
         if not tags:
-            # 相关标签的图全在冷却：发得太频繁了，这轮本来就该歇着。
-            log("Meme", "skip", reason="all_in_cooldown", chat=chat_key)
+            log("Meme", "skip", reason="no_tags")
             return None
-        if len(summary) > capacity:
-            # 只有超过容量才会走到这：按字面相关度取前 capacity 个。
-            # 真到这个规模该做的是标签归一（同义词合并），不是继续加大穷举。
-            log("Meme", "tag_budget", total=len(summary), capacity=capacity)
 
-        chosen_tag: Optional[str] = None
+        scores = None
         if cfg.get("use_jev", True):
             try:
                 from core.jev import JevClient
 
-                chosen_tag = JevClient().select_meme_tag(
-                    message=message,
-                    reply=reply,
-                    tags=tags,
-                    batch=per_batch,
-                    max_rounds=rounds_cap,
-                    min_confidence=float(cfg.get("min_confidence", 0.35)),
-                    # 达到这个把握就不再问后面的批次（省请求）；它不决定发不发。
-                    decisive_confidence=float(cfg.get("decisive_confidence", 0.6)),
-                    max_options=max_options,
-                )
+                scores = JevClient().score_meme_tags(
+                    message=message, reply=reply, tags=tags, max_batches=rounds_cap)
             except Exception as exc:
                 log("Meme", "jev.error", error=str(exc)[:160])
-                chosen_tag = None
-        if chosen_tag is None and not cfg.get("use_jev", True):
-            # Jev 不可用时的降级：只在标签字面出现在回复里时才发，宁缺毋滥。
-            lowered = (reply or "").lower()
-            chosen_tag = next((tag for tag in tags if len(tag) >= 2 and tag.lower() in lowered), None)
-        if not chosen_tag:
+                scores = None
+        if scores:
+            return self._pick_by_scores(scores, cooldown, cfg)
+
+        # 降级（Jev 不可用）：只在标签字面出现在回复里时才发，宁缺毋滥。
+        lowered = (reply or "").lower()
+        fallback_tag = next(
+            (tag for tag in tags if len(tag) >= 2 and tag.lower() in lowered), None)
+        if not fallback_tag:
             log("Meme", "skip", reason="no_tag_chosen")
             return None
-        path = self.pick_by_tag(chosen_tag, cooldown)
+        path = self.pick_by_tag(fallback_tag, cooldown)
         if not path:
-            log("Meme", "skip", reason="tag_empty", tag=chosen_tag)
+            log("Meme", "skip", reason="tag_empty", tag=fallback_tag)
         return path
+
+    def _pick_by_scores(self, scores: Dict[str, float], exclude_paths: Sequence[str],
+                        cfg: Dict[str, object]) -> Optional[str]:
+        """按标签分数给全库每张图打分，取最高的那张。
+
+        图分 = 它自己各标签得分的加权和，位置越靠前权重越高。位置衰减是必须的：
+        纯求和会让"标签多的图"天然占便宜——一张 8 个标签、每个都弱沾边的图，
+        会盖过一张只有一个标签但完全贴切的图。首位给满权重、往后依次半衰，
+        等于「主张最重要，附带标签只做温和加分」。
+
+        `none` 是独立的"这条不该发表情"判断，比最高标签分还高就不发。
+        实测该发时 none≈0.06、最高分≈0.99；不该发时 none≈0.92~0.997、最高分≤0.49。
+        """
+        none_score = float(scores.get("none") or 0.0)
+        ranked = [(float(value), tag) for tag, value in scores.items() if tag != "none"]
+        if not ranked:
+            log("Meme", "skip", reason="no_scored_tag")
+            return None
+        top_score, top_tag = max(ranked)
+        if none_score > top_score:
+            log("Meme", "skip", reason="none_wins",
+                none=round(none_score, 3), top=round(top_score, 3))
+            return None
+        floor = float(cfg.get("min_tag_score", 0.5))
+        if top_score < floor:
+            log("Meme", "skip", reason="below_floor", top=round(top_score, 3), floor=floor)
+            return None
+
+        excluded = set(exclude_paths or ())
+        with self._lock, self._db() as db:
+            rows = db.execute(
+                "SELECT id, file_path, tags, use_count FROM memes WHERE file_path IS NOT NULL"
+            ).fetchall()
+        items: List[Dict[str, object]] = []
+        for row in rows:
+            path = row["file_path"]
+            if path in excluded:
+                continue
+            tags = normalize_tags(row["tags"] or "[]")
+            if not tags or not Path(path).exists():
+                continue
+            score = 0.0
+            for position, tag in enumerate(tags[:len(TAG_POSITION_WEIGHTS)]):
+                score += TAG_POSITION_WEIGHTS[position] * float(scores.get(tag) or 0.0)
+            if score <= 0:
+                continue
+            items.append({"id": row["id"], "path": path, "tags": tags,
+                          "score": score, "use_count": int(row["use_count"] or 0)})
+        if not items:
+            log("Meme", "skip", reason="no_matching_image", tag=top_tag)
+            return None
+        best = max(items, key=lambda item: (float(item["score"]),
+                                            -int(item["use_count"]),
+                                            random.random()))
+        log("Meme", "picked", tag=top_tag, score=round(float(best["score"]), 3),
+            tags=best["tags"])
+        return self._take(best, top_tag)
 
     def retag_all(self):
         """清空标签重新打一遍（换词表或模型后手动调用）。"""

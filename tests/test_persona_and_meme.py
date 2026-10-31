@@ -64,14 +64,16 @@ class PersonaAndMemeTests(Fixture):
 
         config.save_config({"channels": {"napcat": {"owner_ids": ["1"]}}})
         reply = policy.owner_command("/拉黑 999888", event={"user_id": 1})
-        self.assertIn("已将 999888 加入黑名单", reply)
+        # 回执由人设生成（没有 brain 时走兜底），这里只要求说到了那个号，
+        # 具体措辞不钉死——否则换个角色就要改测试。
+        self.assertIn("999888", reply)
         self.assertTrue(self.memory.qq_blocked("999888"))
         cfg = config.load_config()
         self.assertIn("999888", [str(x) for x in cfg["channels"]["napcat"]["blacklisted_user_ids"]])
 
         # 取消拉黑
         reply_unblock = policy.owner_command("/取消拉黑 999888", event={"user_id": 1})
-        self.assertIn("已解除", reply_unblock)
+        self.assertIn("999888", reply_unblock)
         self.assertFalse(self.memory.qq_blocked("999888"))
         cfg = config.load_config()
         self.assertNotIn("999888", [str(x) for x in cfg["channels"]["napcat"]["blacklisted_user_ids"]])
@@ -137,6 +139,83 @@ class MemeLibraryTests(Fixture):
             again = [item for item in manager.tag_summary() if item["tag"] == "卖萌"][0]
             self.assertEqual(again["used"], 1)
 
+    def test_image_wins_by_its_whole_tag_set_not_one_tag(self):
+        """两张图都带「可爱」，但只有一张的其余标签也在语境里 —— 该发它。
+
+        这正是老实现最典型的错配：两张图在「可爱」这个标签下完全等价，
+        靠 use_count + RANDOM 抽一张，抽到哪张全看运气。
+        """
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            self._add(manager, PNG_BYTES, ["可爱", "大笑", "开心"])
+            warm = self._add(manager, JPEG_BYTES, ["可爱", "抱抱", "委屈"])
+            # 语境是"我不开心 + 抱抱"，所以抱抱/委屈高分、大笑/开心接近 0
+            scores = {"可爱": 0.55, "抱抱": 0.92, "委屈": 0.70,
+                      "大笑": 0.02, "开心": 0.01, "none": 0.05}
+
+            with patch.object(JevClient, "score_meme_tags", return_value=scores):
+                self.assertEqual(manager.choose_meme("我不开心", "抱抱，怎么啦"), warm)
+
+    def test_position_decay_keeps_long_tag_lists_from_winning(self):
+        """标签多的图不能靠"凑数"赢：首位满权重，往后依次衰减。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            # 8 个标签、每个都弱沾边
+            self._add(manager, PNG_BYTES,
+                      ["开心", "大笑", "卖萌", "可爱", "猫", "狗", "贴贴", "抱抱"])
+            exact = self._add(manager, JPEG_BYTES, ["委屈", "叹气"])
+            scores = {"委屈": 0.95, "叹气": 0.8, "抱抱": 0.2, "开心": 0.2,
+                      "大笑": 0.2, "卖萌": 0.2, "可爱": 0.2, "猫": 0.2,
+                      "狗": 0.2, "贴贴": 0.2, "none": 0.05}
+
+            with patch.object(JevClient, "score_meme_tags", return_value=scores):
+                self.assertEqual(manager.choose_meme("好累啊", "歇会儿吧"), exact)
+
+    def test_none_score_suppresses_the_meme(self):
+        """Jev 说"这条不该发表情"时不发，哪怕某个标签分并不算低。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            self._add(manager, PNG_BYTES, ["点赞", "开心"])
+
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"点赞": 0.48, "开心": 0.42, "none": 0.92}):
+                self.assertIsNone(manager.choose_meme("转好了吗", "转好了，在 D 盘"))
+
+    def test_low_scores_stay_below_the_floor(self):
+        """全部标签都只是弱沾边 -> 不发（宁缺毋滥）。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            self._add(manager, PNG_BYTES, ["疑惑"])
+
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"疑惑": 0.30, "none": 0.10}):
+                self.assertIsNone(manager.choose_meme("这报错啥意思", "参数类型不对"))
+
+    def test_jev_failure_falls_back_to_primary_tag_order(self):
+        """Jev 抛错就退回首位标签排序，而不是不发或乱发。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            self._add(manager, PNG_BYTES, ["疑惑", "卖萌"])
+            main = self._add(manager, JPEG_BYTES, ["卖萌", "疑惑"])
+
+            with patch.object(JevClient, "score_meme_tags", side_effect=RuntimeError("boom")):
+                self.assertEqual(manager.choose_meme("在吗", "别卖萌了"), main)
+
     def test_choose_meme_respects_jev_verdict(self):
         from core.meme import MemeManager
         from core.jev import JevClient
@@ -145,9 +224,10 @@ class MemeLibraryTests(Fixture):
             manager = self._manager()
             self._add(manager, PNG_BYTES, ["卖萌", "猫"])
 
-            with patch.object(JevClient, "select_meme_tag", return_value=None):
-                self.assertIsNone(manager.choose_meme("在吗", "喵～在的"))
-            with patch.object(JevClient, "select_meme_tag", return_value="卖萌"):
+            with patch.object(JevClient, "score_meme_tags", return_value=None):
+                self.assertIsNone(manager.choose_meme("在吗", "喵～在的"))   # 无字面命中 -> 不发
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"卖萌": 0.9, "none": 0.05}):
                 self.assertTrue(manager.choose_meme("在吗", "喵～在的"))
 
     def test_session_cooldown_rotates_and_rests(self):
@@ -162,7 +242,8 @@ class MemeLibraryTests(Fixture):
 
             picks = []
             for _ in range(3):
-                with patch.object(JevClient, "select_meme_tag", return_value="卖萌"):
+                with patch.object(JevClient, "score_meme_tags",
+                              return_value={"卖萌": 0.9, "none": 0.05}):
                     picked = manager.choose_meme("在吗", "喵～在的", chat_key="group:1")
                 if picked:
                     manager.note_sent("group:1", picked)
@@ -183,14 +264,15 @@ class MemeLibraryTests(Fixture):
             path_a = self._add(manager, PNG_BYTES, ["卖萌"])
             path_b = self._add(manager, JPEG_BYTES, ["卖萌"])
 
-            with patch.object(JevClient, "select_meme_tag", return_value="卖萌"):
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"卖萌": 0.9, "none": 0.05}):
                 first = manager.choose_meme("在吗", "喵～在的", chat_key="group:1")
                 manager.note_sent("group:1", first)
                 again_other_chat = manager.choose_meme("在吗", "喵～在的", chat_key="group:2")
             self.assertIn(again_other_chat, {path_a, path_b})   # 别的会话不受冷却影响
 
-    def test_cooled_tag_never_reaches_jev(self):
-        """标签下唯一一张图在冷却 -> 这个标签整个不进 Jev 候选。"""
+    def test_cooled_image_is_skipped_even_when_it_scores_highest(self):
+        """冷却在选图这一刻生效：分再高也跳过，顺位取下一张。"""
         from core.meme import MemeManager
         from core.jev import JevClient
 
@@ -198,13 +280,12 @@ class MemeLibraryTests(Fixture):
             manager = self._manager()
             liked = self._add(manager, PNG_BYTES, ["赞同"])
             laugh = self._add(manager, JPEG_BYTES, ["大笑"])
-            manager.note_sent("group:1", liked)
+            manager.note_sent("group:1", liked)          # 这张刚发过
 
-            with patch.object(JevClient, "select_meme_tag", return_value="大笑") as sel:
-                manager.choose_meme("在吗", "喵～在的", chat_key="group:1")
-            offered = sel.call_args.kwargs["tags"]
-            self.assertNotIn("赞同", offered)     # 只有一张且在冷却，选了也发不出
-            self.assertIn("大笑", offered)
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"赞同": 0.9, "大笑": 0.6, "none": 0.05}):
+                picked = manager.choose_meme("在吗", "喵～在的", chat_key="group:1")
+            self.assertEqual(picked, laugh)               # 赞同分更高但在冷却
 
     def test_avoid_repeat_last_limits_memory(self):
         from core.meme import MemeManager
@@ -244,143 +325,109 @@ class MemeLibraryTests(Fixture):
         self.assertEqual(memes.return_value.choose_meme.call_count, 2)
 
 
-class SelectMemeTagTests(Fixture):
-    """Jev 选标签的分批穷尽：候选问完必然终止，不无限循环，也不硬凑。"""
+class SelectMemeScoreTests(Fixture):
+    """标签独立打分：一次请求覆盖一批，跨批合并，失败不拖垮已拿到的分。"""
 
     def _client(self):
         from core.jev import JevClient
 
-        # 给一个假 key，只为让 is_configured() 通过；decide_raw 全被替换掉。
         return JevClient(base_url="http://127.0.0.1:1", api_key="test-key")
 
     @staticmethod
-    def _answer(choice, confidence):
-        return {"answers": {"meme_tag": {"type": "choice", "choice": choice,
-                                         "probabilities": {}, "confidence": confidence}}}
+    def _flat(questions, value=0.5):
+        return {"answers": {name: {"type": "noul", "noul": value} for name in questions}}
 
-    def test_exhausts_every_candidate_before_giving_up(self):
+    def test_scores_every_tag_and_none_in_one_request(self):
         client = self._client()
-        calls = []
+        seen = []
 
         def fake_decide(state, questions, images=None):
-            calls.append(len(questions["meme_tag"]["options"]))
-            return self._answer("none", 0.99)
+            seen.append(questions)
+            return self._flat(questions)
 
         client.decide_raw = fake_decide
-        tags = [f"tag{i}" for i in range(600)]
-        # 全部候选都不合适 -> 返回 None，且确实每批都问过（不含无限循环）
-        self.assertIsNone(client.select_meme_tag("在吗", "在的", tags))
-        # 每批 254 个标签 + none；600 = 254 + 254 + 92
-        self.assertEqual(calls, [255, 255, 93])
+        scores = client.score_meme_tags("在吗", "在的", ["卖萌", "可爱", "猫"])
+        self.assertEqual(len(seen), 1)                      # 小图库一次问完，不拆批
+        self.assertEqual(set(scores), {"卖萌", "可爱", "猫", "none"})
+        self.assertEqual(len(seen[0]), 4)                   # 3 个标签 + none
 
-    def test_stops_as_soon_as_a_confident_tag_is_found(self):
-        client = self._client()
-        calls = []
-
-        def fake_decide(state, questions, images=None):
-            calls.append(len(questions["meme_tag"]["options"]))
-            return self._answer("摸摸", 0.91)
-
-        client.decide_raw = fake_decide
-        tags = ["摸摸"] + [f"tag{i}" for i in range(599)]
-        # 第一批就选准了，不该再去问后面几批
-        self.assertEqual(client.select_meme_tag("好累", "早点休息", tags), "摸摸")
-        self.assertEqual(len(calls), 1)
-
-    def test_low_confidence_keeps_looking(self):
-        client = self._client()
-        tags = [f"tag{i}" for i in range(300)]
-        calls = []
-
-        def fake_decide(state, questions, images=None):
-            calls.append(len(questions["meme_tag"]["options"]))
-            if len(calls) == 1:
-                # 第一批选中了但没把握 -> 继续问，不拿它硬凑
-                return self._answer("tag1", 0.10)
-            return self._answer("tag260", 0.88)
-
-        client.decide_raw = fake_decide
-        self.assertEqual(client.select_meme_tag("在吗", "在的", tags), "tag260")
-        self.assertEqual(len(calls), 2)
-
-    def test_low_confidence_everywhere_means_no_meme(self):
-        client = self._client()
-
-        def fake_decide(state, questions, images=None):
-            return self._answer("tag0", 0.10)
-
-        client.decide_raw = fake_decide
-        tags = [f"tag{i}" for i in range(300)]
-        self.assertIsNone(client.select_meme_tag("在吗", "在的", tags))
-
-    def test_medium_confidence_is_accepted_after_exhausting_all_batches(self):
-        """0.5 不到「决定性」但高于地板：问完所有批后仍然要发这一次。"""
-        client = self._client()
-        calls = []
-
-        def fake_decide(state, questions, images=None):
-            opts = questions["meme_tag"]["options"]
-            calls.append(len(opts))
-            return self._answer(opts[0], 0.5)   # 每批都只是"这批里最好的"
-
-        client.decide_raw = fake_decide
-        tags = [f"tag{i}" for i in range(300)]
-        # 不提前终止（0.5 < decisive 0.6），但也不该被丢掉（0.5 > 地板 0.35）
-        self.assertEqual(client.select_meme_tag("在吗", "在的", tags), "tag0")
-        self.assertEqual(len(calls), 2)
-
-    def test_keeps_the_best_score_not_the_last_one(self):
-        """跨批只按分数取最好的一次，不是拿最后一批的答案。"""
-        client = self._client()
-        scores = iter([0.55, 0.40])
-
-        def fake_decide(state, questions, images=None):
-            opts = questions["meme_tag"]["options"]
-            return self._answer(opts[0], next(scores))
-
-        client.decide_raw = fake_decide
-        tags = [f"tag{i}" for i in range(300)]
-        self.assertEqual(client.select_meme_tag("在吗", "在的", tags), "tag0")
-
-    def test_shrinks_batch_when_server_rejects_option_count(self):
+    def test_splits_by_the_server_question_limit(self):
+        """单请求最多 64 个 question，所以一批装 63 个标签 + none。"""
         client = self._client()
         sizes = []
 
         def fake_decide(state, questions, images=None):
-            size = len(questions["meme_tag"]["options"])
-            sizes.append(size)
-            if size > 10:
-                raise RuntimeError("400 too_many_options: options over limit")
-            return self._answer("摸摸", 0.9)
+            sizes.append(len(questions))
+            return self._flat(questions, 0.4)
 
         client.decide_raw = fake_decide
-        tags = ["摸摸"] + [f"tag{i}" for i in range(100)]
-        self.assertEqual(client.select_meme_tag("好累", "早点休息", tags), "摸摸")
-        # 首轮 254 个标签的批被拒 -> 砍到 127，但候选只剩 101 个标签，于是仍是 101
-        # -> 63 -> 31 -> 15 -> 7 个标签（+none）。全程不跳过任何候选。
-        self.assertEqual(sizes, [102, 102, 64, 32, 16, 8])
+        scores = client.score_meme_tags("在吗", "在的", [f"t{i}" for i in range(130)])
+        self.assertEqual(sizes, [64, 63, 4])                # 130 = 63 + 63 + 4
+        self.assertEqual(len(scores), 131)                  # 130 个标签 + none
 
-    def test_stops_on_unexpected_errors(self):
+    def test_respects_the_batch_cap(self):
+        client = self._client()
+        sizes = []
+
+        def fake_decide(state, questions, images=None):
+            sizes.append(len(questions))
+            return self._flat(questions, 0.4)
+
+        client.decide_raw = fake_decide
+        scores = client.score_meme_tags(
+            "在吗", "在的", [f"t{i}" for i in range(300)], max_batches=2)
+        self.assertEqual(sizes, [64, 63])                   # 不再往后问
+        self.assertEqual(len(scores), 127)                  # 126 个标签 + none
+
+    def test_keeps_the_first_batch_when_a_later_one_fails(self):
         client = self._client()
         calls = []
 
         def fake_decide(state, questions, images=None):
             calls.append(1)
+            if len(calls) > 1:
+                raise TimeoutError("network down")
+            return self._flat(questions, 0.7)
+
+        client.decide_raw = fake_decide
+        scores = client.score_meme_tags(
+            "在吗", "在的", [f"t{i}" for i in range(130)], max_batches=3)
+        self.assertIsNotNone(scores)                        # 第一批的分不白拿
+        self.assertEqual(len(scores), 64)                   # 63 个标签 + none
+        self.assertEqual(len(calls), 2)                     # 第二批失败就收手，不硬撞第三批
+
+    def test_gives_up_when_the_first_batch_fails(self):
+        client = self._client()
+
+        def fake_decide(state, questions, images=None):
             raise TimeoutError("network down")
 
         client.decide_raw = fake_decide
-        tags = [f"tag{i}" for i in range(600)]
-        # 网络挂了就收手，不去撞后面几批（否则表情包发送被拖慢好几秒）
-        self.assertIsNone(client.select_meme_tag("在吗", "在的", tags))
-        self.assertEqual(len(calls), 1)
+        self.assertIsNone(client.score_meme_tags("在吗", "在的", ["卖萌", "可爱"]))
+
+    def test_clamps_out_of_range_scores(self):
+        """noul 缺字段、越界、非数字都夹到 0~1，不能让脏值污染加权。"""
+        client = self._client()
+
+        def fake_decide(state, questions, images=None):
+            values = [None, 1.7, -0.3, "x"]
+            answers = {}
+            for i, name in enumerate(questions):
+                answers[name] = {"type": "noul", "noul": values[i % len(values)]}
+            return {"answers": answers}
+
+        client.decide_raw = fake_decide
+        scores = client.score_meme_tags("在吗", "在的", ["卖萌", "可爱", "猫", "狗"])
+        for value in scores.values():
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
 
     def test_returns_none_without_configured_key(self):
         from core.jev import JevClient
 
         client = JevClient(base_url="http://127.0.0.1:1", api_key="")
         client.decide_raw = lambda *a, **k: self.fail("没有 key 就不该发请求")
-        self.assertIsNone(client.select_meme_tag("在吗", "在的", ["卖萌"]))
-
+        self.assertIsNone(client.score_meme_tags("在吗", "在的", ["卖萌"]))
 
 if __name__ == "__main__":
     unittest.main()

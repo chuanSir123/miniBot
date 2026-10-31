@@ -39,7 +39,7 @@ class TestCommands(unittest.TestCase):
 
         self.app = BotApplication(mode="cli")
         self.app.memory = MiniMemory(self.root / "test.db")
-        self.app.brain = FakeBrain()
+        self.app.vlm = FakeBrain()
 
     def tearDown(self):
         self.cfg_patch.stop()
@@ -62,7 +62,9 @@ class TestCommands(unittest.TestCase):
         qq_event = {"message_type": "private", "user_id": 416448943, "raw_message": "/clear"}
         future = self.app.submit_query("/clear", event=qq_event)
         res = future.result()
-        self.assertIn("清空", res)
+        # 回执措辞由人设决定（core.persona.voice），这里只钉「有回执」这个行为，
+        # 不钉具体字眼，否则改一点人设测试就红。
+        self.assertTrue(res.strip(), "清空后应给一句回执")
 
         # 3. 验证 QQ 私聊会话、桌宠会话、Web 主会话均已被清空为 0
         hist_qq, _ = self.app.memory.get_history(owner_qq_session)
@@ -84,7 +86,7 @@ class TestCommands(unittest.TestCase):
         qq_event = {"message_type": "private", "user_id": 416448943, "raw_message": "/cc"}
         future = self.app.submit_query("/cc", event=qq_event)
         res = future.result()
-        self.assertIn("压缩完成", res)
+        self.assertTrue(res.strip(), "压缩后应给一句回执")
 
         hist_after, summary = self.app.memory.get_history(owner_qq_session)
         self.assertIsNotNone(summary)
