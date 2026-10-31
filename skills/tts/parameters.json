@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "design",
+        "clone"
+      ],
+      "description": "合成模式：design=设计声音(VoiceDesign)，clone=参考音色克隆"
+    },
+    "text": {
+      "type": "string",
+      "description": "要合成的文本内容"
+    },
+    "instructions": {
+      "type": "string",
+      "description": "design模式专用：声音描述，如'年轻男性，声音清亮，语速自然'"
+    },
+    "language": {
+      "type": "string",
+      "description": "design模式专用：语言，默认Chinese",
+      "default": "Chinese"
+    },
+    "reference_audio": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "clone模式专用：参考音色的media_ref数组，按顺序传当前会话的media_ref"
+    }
+  }
+}

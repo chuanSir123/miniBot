@@ -1,0 +1,2 @@
+-r requirements-core.txt
+websockets>=14,<16

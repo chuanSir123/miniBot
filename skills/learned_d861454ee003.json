@@ -1,0 +1,35 @@
+{
+  "format": "minibot-workflow-v1",
+  "version": 1,
+  "description": "但是这个点赞应该是和 发qq消息一个token和ws啊，为什么连不上呢",
+  "status": "candidate",
+  "parameters": {},
+  "steps": [
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "cd D:\\github\\miniBot; python -c \"from core.config import load_config; import json; c=load_config()['channels']['napcat']; print(json.dumps(c, ensure_ascii=False, indent=2))\"",
+        "timeout_sec": 15
+      }
+    },
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "cd D:\\github\\miniBot; python -c \"\nimport asyncio,json,uuid,time\nfrom websockets.asyncio.client import connect\nasync def run():\n    opts=dict(additional_headers={'Authorization':'Bearer yHEzeWjox24gjpAtnrb9LGHSNfsCSz2l'},open_timeout=6,close_timeout=2,compression=None)\n    import inspect\n    if 'proxy' in inspect.signature(connect).parameters: opts['proxy']=None\n    async with connect('ws://127.0.0.1:3001',**opts) as ws:\n        echo=uuid.uuid4().hex\n        await ws.send(json.dumps({'action':'get_status','params':{},'echo':echo}))\n        dl=time.monotonic()+8\n        while time.monotonic()<dl:\n            d=json.loads(await asyncio.wait_for(ws.recv(),timeout=5))\n            if d.get('echo')==echo:\n                print('STATUS:',json.dumps(d,ensure_ascii=False)[:600]); break\nasyncio.run(run())\n\"",
+        "timeout_sec": 20
+      }
+    },
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "cd D:\\github\\miniBot; python -c \"\nimport asyncio,json,uuid,time\nfrom websockets.asyncio.client import connect\nasync def run():\n    opts=dict(additional_headers={'Authorization':'Bearer yHEzeWjox24gjpAtnrb9LGHSNfsCSz2l'},open_timeout=6,close_timeout=2,compression=None)\n    import inspect\n    if 'proxy' in inspect.signature(connect).parameters: opts['proxy']=None\n    async with connect('ws://127.0.0.1:3001',**opts) as ws:\n        for act in ['get_login_info','get_version_info']:\n            echo=uuid.uuid4().hex\n            await ws.send(json.dumps({'action':act,'params':{},'echo':echo}))\n            dl=time.monotonic()+8\n            while time.monotonic()<dl:\n                d=json.loads(await asyncio.wait_for(ws.recv(),timeout=5))\n                if d.get('echo')==echo:\n                    print(act,'->',json.dumps(d,ensure_ascii=False)[:500]); break\nasyncio.run(run())\n\"",
+        "timeout_sec": 20
+      }
+    }
+  ],
+  "evidence": {
+    "successful_steps": 3,
+    "goal": "但是这个点赞应该是和 发qq消息一个token和ws啊，为什么连不上呢"
+  },
+  "previous_version": null
+}

@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "action": { "type": "string", "enum": ["tags", "pick"], "description": "tags=列出标签及库存；pick=按标签取一张图" },
+    "tag": { "type": "string", "description": "标签名（仅 pick，如：赞同/疑问/猫猫）" },
+    "limit": { "type": "integer", "description": "tags 模式返回条数，默认 30，上限 100" }
+  },
+  "required": ["action"],
+  "additionalProperties": false
+}

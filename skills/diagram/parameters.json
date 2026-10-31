@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "action": { "type": "string", "enum": ["validate", "render"], "description": "validate=校验SVG结构与规范；render=渲染为PNG" },
+    "file_path": { "type": "string", "description": "SVG 文件路径（绝对或相对当前工作空间）" },
+    "output": { "type": "string", "description": "渲染输出 PNG 路径（仅 render，默认同名 .png）" },
+    "scale": { "type": "number", "description": "渲染倍率（仅 render，默认 2）" }
+  },
+  "required": ["action", "file_path"],
+  "additionalProperties": false
+}

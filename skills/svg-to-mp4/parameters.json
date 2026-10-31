@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "file_path": {
+      "type": "string",
+      "description": "HTML/SVG动画文件路径（绝对或相对Harness工作空间）"
+    },
+    "duration_sec": {
+      "type": "number",
+      "description": "录制时长秒数，默认12",
+      "default": 12
+    },
+    "fps": {
+      "type": "integer",
+      "description": "帧率，默认30",
+      "default": 30
+    },
+    "width": {
+      "type": "integer",
+      "description": "视口宽度，默认1280",
+      "default": 1280
+    },
+    "height": {
+      "type": "integer",
+      "description": "视口高度，默认800",
+      "default": 800
+    },
+    "output": {
+      "type": "string",
+      "description": "输出MP4路径，默认输入文件名+.mp4"
+    }
+  },
+  "required": [
+    "file_path"
+  ],
+  "additionalProperties": false
+}

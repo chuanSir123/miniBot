@@ -1,134 +1,718 @@
-import importlib.util
-import inspect
+"""Declarative workflows and opt-in, process-isolated Python skills.
+
+技能目录支持 Agent Skills 规范形态：skills/<name>/SKILL.md（必须）+ scripts/（可选）。
+渐进式披露：目录技能只把 name+description 注入提示词，完整指令由
+execute_skill 无参数调用返回；带 entry 脚本的技能再以隔离子进程执行。
+"""
+
+import ast
+import hashlib
 import json
+import re
+import sys
+import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from core.config import load_config, save_config
+from core.process import run_bounded
+from core import agent_skills
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
-SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+READ_ONLY = {"read_file", "capture_screen"}
+INSTRUCTIONS_ONLY = ":instructions:"
+
+
+def validate_args(schema, args):
+    if not isinstance(schema, dict) or not isinstance(
+        schema.get("properties", {}), dict
+    ):
+        raise ValueError("技能参数模式必须是JSON Schema对象")
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(
+        not isinstance(key, str) for key in required
+    ):
+        raise ValueError("required必须是参数名列表")
+    if not isinstance(args, dict):
+        raise ValueError("技能参数必须是对象")
+    for key in schema.get("required", []):
+        if key not in args:
+            raise ValueError(f"缺少参数 {key}")
+    types = {
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "object": dict,
+        "array": list,
+    }
+    for key, value in args.items():
+        prop = schema.get("properties", {}).get(key)
+        if prop is None:
+            if schema.get("additionalProperties") is False:
+                raise ValueError(f"未知参数 {key}")
+            continue
+        if not isinstance(prop, dict):
+            raise ValueError(f"参数 {key} 的模式无效")
+        kind = prop.get("type")
+        if kind in types and (
+            not isinstance(value, types[kind])
+            or kind in ("integer", "number")
+            and isinstance(value, bool)
+        ):
+            raise ValueError(f"参数 {key} 类型错误")
+        if "enum" in prop and value not in prop["enum"]:
+            raise ValueError(f"参数 {key} 不在枚举范围")
+    return args
+
+
+def _builtin_result_payload(output):
+    """内置技能的 stdout 可能混有 console 日志，取最后一行可解析的 JSON。"""
+    for line in reversed((output or "").strip().splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 class Skill:
     def __init__(
-        self,
-        name: str,
-        description: str,
-        func: Callable[[Dict[str, Any]], str],
-        filename: str,
-        parameters_schema: Optional[Dict[str, Any]] = None
+        self, name, description, filename, schema=None, workflow=None, trusted=False,
+        directory=None, body=None,
     ):
-        self.name = name
-        self.description = description
-        self.func = func
-        self.filename = filename
-        self.parameters_schema = parameters_schema or {}
-        self.has_parameters = bool(self.parameters_schema)
-
-    def run(self, context: Dict[str, Any]) -> str:
-        try:
-            return self.func(context)
-        except Exception as e:
-            return f"执行技能 [{self.name}] 发生错误: {e}"
+        self.name, self.description, self.filename = name, description, filename
+        self.parameters_schema = schema or {}
+        if not isinstance(self.parameters_schema, dict):
+            raise ValueError("PARAMETERS必须是JSON Schema对象")
+        self.has_parameters = bool(
+            self.parameters_schema.get("properties")
+            or self.parameters_schema.get("required")
+        )
+        self.workflow, self.trusted = workflow, trusted
+        self.directory = Path(directory) if directory else None
+        self.body = body  # SKILL.md 正文（仅目录技能）
+        self.is_folder = directory is not None
+        self.instructions_only = self.is_folder and filename == INSTRUCTIONS_ONLY
 
 
 class SkillManager:
-    """
-    Skill 自动化管理与动态热加载
-    支持：
-      1. 无参技能 (Zero-shot Direct Run - Jev快脑毫秒级触发)
-      2. 有参技能 (Two-stage Slot Filling - Jev选意图 + VLM从聊天历史提取槽位参数)
-    """
-
-    def __init__(self, skills_dir: Path = SKILLS_DIR):
-        self.skills_dir = skills_dir
-        self.skills: Dict[str, Skill] = {}
-        self._ensure_default_skills()
+    def __init__(self, skills_dir=SKILLS_DIR):
+        self.skills_dir = Path(skills_dir)
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.skills = {}
+        self.stats_path = self.skills_dir / "usage.json"
         self.reload_skills()
 
-    def _ensure_default_skills(self):
-        """写入内置示例技能"""
-        demo_file = self.skills_dir / "system_status.py"
-        if not demo_file.exists():
-            code = '''"""
-name: system_status
-description: 检查本机系统基本状态、本地时间与当前工作目录
-"""
-# 声明参数模式 (空表示无参技能，Jev命中后直接秒级执行)
-PARAMETERS = {}
-
-import time
-import os
-
-def execute(context: dict) -> str:
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-    return f"【系统状态】当前本地时间: {now_str}，工作目录: {os.getcwd()}"
-'''
-            demo_file.write_text(code, encoding="utf-8")
+    def _ignored_names(self):
+        raw = load_config().get("skills", {}).get("ignore", [])
+        if not isinstance(raw, list):
+            return set()
+        return {str(name).strip() for name in raw if isinstance(name, str) and name.strip()}
 
     def reload_skills(self):
-        self.skills.clear()
-        for py_file in self.skills_dir.glob("*.py"):
-            if py_file.name.startswith("__"):
+        result = {}
+        builtin_ctx = self.skills_dir.resolve() == SKILLS_DIR.resolve()
+        # 被忽略的技能：不注入提示词、不进 Jev 候选、execute_skill 报不存在。
+        ignored = self._ignored_names() if builtin_ctx else set()
+        trusted = load_config()["skills"].get("trusted_python", [])
+        for path in self.skills_dir.glob("*.py"):
+            try:
+                if path.stat().st_size > 100000:
+                    continue
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                if not any(
+                    isinstance(n, ast.FunctionDef) and n.name == "execute"
+                    for n in tree.body
+                ):
+                    continue
+                values = {}
+                for node in tree.body:
+                    if isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and target.id in (
+                                "NAME",
+                                "DESCRIPTION",
+                                "PARAMETERS",
+                                "SCHEMA",
+                            ):
+                                values[target.id] = ast.literal_eval(node.value)
+                doc = ast.get_docstring(tree) or ""
+                desc = values.get("DESCRIPTION") or next(
+                    (
+                        line.split(":", 1)[1].strip()
+                        for line in doc.splitlines()
+                        if line.lower().startswith("description:")
+                    ),
+                    path.stem,
+                )
+                result[path.stem] = Skill(
+                    path.stem,
+                    desc,
+                    path.name,
+                    values.get("PARAMETERS", values.get("SCHEMA", {})),
+                    trusted=path.name in trusted,
+                )
+            except (ValueError, SyntaxError, OSError):
+                continue
+        for path in self.skills_dir.glob("*.json"):
+            if path.name == "usage.json":
                 continue
             try:
-                spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
-                if spec and spec.loader:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    func = getattr(mod, "execute", None)
-                    if callable(func):
-                        name = getattr(mod, "NAME", py_file.stem)
-                        doc = (mod.__doc__ or "").strip()
-                        desc = getattr(mod, "DESCRIPTION", None)
-                        if not desc:
-                            for line in doc.splitlines():
-                                if line.lower().startswith("description:"):
-                                    desc = line.split(":", 1)[1].strip()
-                                    break
-                        if not desc:
-                            desc = doc.splitlines()[0] if doc else "自定义技能"
+                if path.stat().st_size > 131072:
+                    continue
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                self._validate_workflow(obj)
+                if obj.get("status") == "active":
+                    result[path.stem] = Skill(
+                        path.stem,
+                        obj["description"],
+                        path.name,
+                        obj.get("parameters", {}),
+                        obj,
+                        True,
+                    )
+            except (ValueError, KeyError, OSError):
+                continue
+        # Fixed built-ins are independent of mutable generated Python skills.
+        # STT 需要可配置云端 + 本地推理，已收回内置（core/stt.py）；
+        # ego_lite 仍是目录技能（skills/ego-lite），实现保留在 core/ego.py。
+        if builtin_ctx:
+            from core.default_skills import REGISTRY
 
-                        schema = getattr(mod, "PARAMETERS", getattr(mod, "SCHEMA", {}))
-                        self.skills[name] = Skill(
-                            name=name,
-                            description=desc,
-                            func=func,
-                            filename=py_file.name,
-                            parameters_schema=schema
-                        )
-            except Exception as e:
-                print(f"[SkillManager] 加载技能 {py_file.name} 失败: {e}")
+            for name, spec in REGISTRY.items():
+                if name in ignored:
+                    continue
+                if name == "anysearch" and not load_config()["anysearch"]["enabled"]:
+                    continue
+                if name == "stt" and not load_config()["stt"]["enabled"]:
+                    continue
+                result[name] = Skill(
+                    name,
+                    spec["description"],
+                    ":builtin:",
+                    spec["parameters"],
+                    trusted=True,
+                    body=spec.get("instructions"),
+                )
+        # Agent Skills 目录形态：skills/<name>/SKILL.md（渐进式披露）。
+        folder_skills, folder_diagnostics = agent_skills.scan(self.skills_dir)
+        self.folder_diagnostics = folder_diagnostics
+        for name, askill in folder_skills.items():
+            if name in ignored:
+                continue
+            # 目录技能的开关联动（设置页停用即隐藏，同原内置行为）。
+            if builtin_ctx:
+                section = {"anysearch": "anysearch", "ego_lite": "ego_lite"}.get(name)
+                if section is not None and not load_config()[section]["enabled"]:
+                    continue
+            if name in result:
+                # 内置/已有技能优先；目录里的 SKILL.md 作为其指令文档，供披露时读取。
+                existing = result[name]
+                if existing.filename in (":builtin:",) and askill.body:
+                    existing.body = askill.body
+                    existing.directory = askill.directory
+                continue
+            result[name] = Skill(
+                name,
+                askill.description,
+                askill.entry if askill.has_entry else INSTRUCTIONS_ONLY,
+                askill.parameters,
+                trusted=True,
+                directory=askill.directory,
+                body=askill.body,
+            )
+        with self.lock:
+            self.skills = result
+            self._stamp = self._directory_signature()
 
-    def list_skill_names(self) -> List[str]:
-        return list(self.skills.keys())
+    def _directory_signature(self):
+        files = []
+        for path in self.skills_dir.iterdir():
+            if path.suffix not in (".json", ".py") or path.name == "usage.json":
+                continue
+            try:
+                stat = path.stat()
+                files.append((path.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+        # 目录技能（SKILL.md / parameters.json / entry 脚本）变化也要触发重载。
+        for md in self.skills_dir.glob("*/SKILL.md"):
+            try:
+                stat = md.stat()
+                files.append((md.as_posix(), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+        for extra in self.skills_dir.glob("*/parameters.json"):
+            try:
+                stat = extra.stat()
+                files.append((extra.as_posix(), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+        for script in self.skills_dir.glob("*/scripts/*"):
+            try:
+                if script.is_file():
+                    stat = script.stat()
+                    files.append((script.as_posix(), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+        cfg = load_config()
+        return (
+            tuple(sorted(files)),
+            tuple(cfg["skills"]["trusted_python"]),
+            tuple(sorted(cfg["skills"].get("ignore", []))),
+            cfg["anysearch"]["enabled"],
+            cfg["ego_lite"]["enabled"],
+            cfg["stt"]["enabled"],
+        )
 
-    def get_skill(self, name: str) -> Optional[Skill]:
-        return self.skills.get(name)
+    def refresh_if_changed(self):
+        with self.lock:
+            if self._directory_signature() != self._stamp:
+                self.reload_skills()
 
-    def get_candidate_options_for_jev(self) -> List[str]:
-        """生成供 Jev Choice 原语做决策的候选选项列表"""
-        options = []
-        for name, s in self.skills.items():
-            param_tag = "有参提取" if s.has_parameters else "无参直驱"
-            options.append(f"{name} [{param_tag}: {s.description[:40]}]")
-        options.append("chat_only")
-        return options
+    @staticmethod
+    def _name(name):
+        if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{0,63}", name):
+            raise ValueError("技能名只能是英文、数字、下划线")
+        return name
 
-    def execute_skill(self, name: str, context: Optional[Dict[str, Any]] = None) -> str:
-        skill = self.skills.get(name)
+    def _validate_workflow(self, obj):
+        if not isinstance(obj, dict):
+            raise ValueError("工作流必须是JSON对象")
+        if obj.get("format") != "minibot-workflow-v1" or not isinstance(
+            obj.get("description"), str
+        ):
+            raise ValueError("invalid workflow")
+        steps = obj.get("steps", [])
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 12:
+            raise ValueError("技能步骤数须为1到12")
+        for step in steps:
+            if (
+                not isinstance(step, dict)
+                or step.get("tool")
+                not in {
+                    "read_file",
+                    "capture_screen",
+                    "execute_command",
+                    "write_file",
+                }
+                or not isinstance(step.get("arguments"), dict)
+            ):
+                raise ValueError("非法技能步骤")
+        validate_args({"type": "object"}, obj.get("parameters", {}))
+
+    def list_skill_names(self):
+        self.refresh_if_changed()
+        with self.lock:
+            return [n for n, s in self.skills.items() if s.trusted]
+
+    def get_skill(self, name):
+        self.refresh_if_changed()
+        with self.lock:
+            return self.skills.get(name)
+
+    def get_candidate_options_for_jev(self):
+        return self.list_skill_names() + ["chat_only"]
+
+    def describe(self, query="", limit=16, stable=False):
+        """Describe trusted skills.
+
+        stable=True keeps a query-independent order so the same skill set always
+        renders byte-identical text. That is what lets the catalog live inside the
+        cached system prefix instead of being re-prefilled on every tool round.
+        """
+        from core.memory import keywords
+
+        self.refresh_if_changed()
+        terms = keywords(query)
+        with self.lock:
+            skills = [s for s in self.skills.values() if s.trusted]
+            if stable:
+                # name is the only ordering key that does not depend on the request.
+                skills.sort(key=lambda s: s.name)
+            else:
+                skills.sort(
+                    key=lambda s: sum(
+                        k in (s.description + " " + s.name).lower() for k in terms
+                    ),
+                    reverse=True,
+                )
+            return [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": s.parameters_schema,
+                }
+                for s in skills[:limit]
+            ]
+
+    def execute_skill(
+        self,
+        name,
+        context=None,
+        dispatch=None,
+        cancel_event=None,
+        media_scope="local",
+        timeout=None,
+        background=False,
+    ):
+        skill = self.get_skill(name)
         if not skill:
-            return f"未找到名为 [{name}] 的技能"
-        return skill.run(context or {})
-
-    def register_new_skill(self, filename: str, code_content: str) -> bool:
-        """接收并热装载新技能"""
-        if not filename.endswith(".py"):
-            filename += ".py"
-        target_path = self.skills_dir / filename
+            if (
+                self.skills_dir.resolve() == SKILLS_DIR.resolve()
+                and name in self._ignored_names()
+            ):
+                raise ValueError(
+                    f"技能 {name} 已被忽略（skills.ignore），如需启用请先在设置页移除该名字"
+                )
+            if (self.skills_dir / (self._name(name) + ".py")).exists():
+                raise ValueError(f"技能 {name} 文件存在但加载失败，请检查execute入口及静态DESCRIPTION/PARAMETERS格式")
+            raise ValueError(f"技能 {name} 不存在，请先list_skills确认，创建新技能走 skill-creator 流程（write_file 写 skills/<name>/SKILL.md）；不要猜测技能名")
+        if not skill.trusted:
+            raise ValueError(f"技能 {name} 已加载但未授权；请使用activate_skill启用，移动文件不能授予执行权限")
+        # Agent Skills 渐进式披露：无参调用时返回 SKILL.md 完整指令。
+        # 有 SKILL.md 正文且带必填参数的技能，无参调用先披露（模型还不该知道怎么填参）；
+        # 无必填参数的技能（如 system_status）无参即执行。
+        _ctx = context or {}
+        if (
+            skill.body
+            and not _ctx
+            and (skill.instructions_only or skill.parameters_schema.get("required"))
+        ):
+            result = {
+                "ok": True,
+                "skill": name,
+                "instructions": skill.body,
+                "skill_dir": str(skill.directory) if skill.directory else "",
+                "scripts": agent_skills.load_skill(skill.directory).scripts() if skill.directory else [],
+                "output": "以上是技能的完整说明与步骤。请按说明执行任务；带 arguments 再次调用以执行动作。",
+            }
+            self.record_usage(name, True)
+            return result
+        args = validate_args(skill.parameters_schema, context or {})
         try:
-            target_path.write_text(code_content, encoding="utf-8")
+            if skill.filename == ":builtin:":
+                # 本地 whisper 在 CPU 上转写长音频明显超过默认 45s，单独放宽。
+                builtin_timeout = 300 if name == "stt" else 45
+                result = run_bounded(
+                    [
+                        sys.executable,
+                        "-I",
+                        str(Path(__file__).with_name("default_skill_worker.py")),
+                    ],
+                    timeout=builtin_timeout,
+                    max_bytes=120000,
+                    input_text=json.dumps(
+                        {"name": name, "arguments": args}, ensure_ascii=False
+                    ),
+                    cancel_event=cancel_event,
+                )
+                # Preserve semantic failure, rather than treating printed errors as success.
+                if not result.get("timeout") and not result.get("cancelled"):
+                    payload = _builtin_result_payload(result.get("output"))
+                    if payload is None:
+                        result["ok"] = False
+                    else:
+                        result = {
+                            **{k: v for k, v in result.items() if k != "output"},
+                            **payload,
+                        }
+            elif skill.workflow:
+                if not dispatch:
+                    raise ValueError("工作流需要工具执行器")
+                outputs = []
+                for step in skill.workflow["steps"]:
+
+                    def resolve(value):
+                        if isinstance(value, str) and value.startswith("$arg."):
+                            key = value[5:]
+                            if key not in args:
+                                raise ValueError("缺少工作流参数 " + key)
+                            return args[key]
+                        if isinstance(value, dict):
+                            return {k: resolve(v) for k, v in value.items()}
+                        if isinstance(value, list):
+                            return [resolve(v) for v in value]
+                        return value
+
+                    result = dispatch(step["tool"], resolve(step["arguments"]))
+                    outputs.append(result)
+                    if not result.get("ok"):
+                        raise RuntimeError(str(result))
+                result = {"ok": True, "outputs": outputs}
+            else:
+                from core.workspace import workspace_for
+                from core.media_store import MediaStore
+                worker_args = dict(args)
+                worker_args["_minibot"] = {"media_scope": media_scope, "media_root": str(MediaStore().root),
+                                           "workspace": str(workspace_for(media_scope)),
+                                           "retention_days": load_config()["memory"]["retention_days"]}
+                from core.task_manager import TaskManager
+                script_path = (skill.directory / skill.filename) if skill.is_folder else (self.skills_dir / skill.filename)
+                cmd = [
+                    sys.executable,
+                    "-I",
+                    str(Path(__file__).with_name("skill_worker.py")),
+                    str(script_path),
+                ]
+                effective_timeout = timeout
+                if effective_timeout is None:
+                    skills_cfg = load_config().get("skills", {})
+                    effective_timeout = 120 if name == "image_gen" else skills_cfg.get("timeout_sec", 15)
+
+                tm = TaskManager.get_instance()
+                task = tm.start_task(
+                    cmd,
+                    name=f"skill:{name}",
+                    cwd=str(workspace_for(media_scope)),
+                    input_text=json.dumps(worker_args, ensure_ascii=False),
+                    metadata={"skill_name": name, "media_scope": media_scope, "arguments": args},
+                )
+
+                if background:
+                    result = {
+                        "ok": True,
+                        "status": "running",
+                        "task_id": task.task_id,
+                        "name": name,
+                        "output": f"技能 [{name}] 已在后台启动运行。\n任务ID: {task.task_id}\n你可以调用 check_task 或 wait_task 查询状态与结果。",
+                    }
+                else:
+                    if cancel_event:
+                        def _watch_cancel():
+                            cancel_event.wait()
+                            task.cancel()
+                        threading.Thread(target=_watch_cancel, daemon=True).start()
+
+                    result = tm.wait_task(task.task_id, timeout_sec=effective_timeout)
+                if not result.get("timeout") and not result.get("cancelled") and result.get("output", "").startswith("__MINIBOT_RESULT__"):
+                    payload = json.loads(result["output"][len("__MINIBOT_RESULT__"):])
+                    if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+                        raise ValueError("技能返回了无效结构化结果")
+                    transport_ok = result["ok"]
+                    result = {**{k: v for k, v in result.items() if k != "output"}, **payload}
+                    result["ok"] = transport_ok and payload["ok"]
+            self.record_usage(name, result.get("ok", False))
+            return result
+        except Exception:
+            self.record_usage(name, False)
+            raise
+
+    def record_usage(self, name, success):
+        with self.lock:
+            try:
+                stats = json.loads(self.stats_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stats = {}
+            entry = stats.setdefault(name, {"success": 0, "failure": 0})
+            entry["success" if success else "failure"] += 1
+            self._atomic(self.stats_path, stats)
+
+    @staticmethod
+    def _atomic(path, obj):
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def register_new_skill(self, filename, code_content, description=None, parameters=None, activate=False):
+        # Generated executable code is a candidate, never imported during registration.
+        name = self._name(Path(filename).stem)
+        if filename not in (name, name + ".py"):
+            raise ValueError("不允许技能目录穿越")
+        if len(code_content.encode("utf-8")) > 100000:
+            raise ValueError("技能源码超过100KB")
+        tree = ast.parse(code_content)
+        if not any(
+            isinstance(node, ast.FunctionDef) and node.name == "execute"
+            for node in tree.body
+        ):
+            raise ValueError("技能必须包含execute(context)入口")
+        metadata = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in ("PARAMETERS", "SCHEMA"):
+                        metadata[target.id] = ast.literal_eval(node.value)
+        schema = parameters if parameters is not None else metadata.get("PARAMETERS", metadata.get("SCHEMA"))
+        if schema is None:
+            # Recover common context.get()/context[key] arguments without importing code.
+            properties, required = {}, []
+            entry = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "execute")
+            positional = entry.args.posonlyargs + entry.args.args
+            if not positional:
+                raise ValueError("execute必须接收一个context参数")
+            context_name = positional[0].arg
+            for node in ast.walk(entry):
+                key, default = None, None
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == context_name and node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant):
+                    key = node.args[0].value
+                    if len(node.args) > 1:
+                        try:
+                            default = ast.literal_eval(node.args[1])
+                        except (ValueError, TypeError):
+                            pass
+                elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == context_name and isinstance(node.slice, ast.Constant):
+                    key = node.slice.value
+                    if isinstance(key, str) and not key.startswith("_") and key not in required:
+                        required.append(key)
+                # `_` 前缀是框架注入的运行时字段（如 _minibot），不是用户入参。
+                if isinstance(key, str) and not key.startswith("_"):
+                    kind = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}.get(type(default))
+                    properties[key] = {"type": kind, "default": default} if kind else {}
+            schema = {"type": "object", "properties": properties, "required": required}
+        if not isinstance(schema, dict):
+            raise ValueError("parameters必须是JSON Schema对象")
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+            raise ValueError("required必须是参数名列表")
+        # 运行时字段由框架注入，即使被误写进 required 也不能拦技能执行。
+        injected = [key for key in required if key.startswith("_")]
+        if injected:
+            schema = {**schema, "required": [key for key in required if not key.startswith("_")]}
+        validate_args({**schema, "required": []}, {})
+        if description is not None:
+            code_content += "\nDESCRIPTION = " + repr(description) + "\n"
+        if metadata.get("PARAMETERS", metadata.get("SCHEMA")) != schema:
+            code_content += "\nPARAMETERS = " + repr(schema) + "\n"
+        if len(code_content.encode("utf-8")) > 100000:
+            raise ValueError("技能源码及元数据超过100KB")
+        # 统一保存为 Agent Skills 目录形态：skills/<name>/{SKILL.md, scripts/<name>.py}
+        skill_dir = self.skills_dir / name
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script_path = scripts_dir / (name + ".py")
+        if script_path.exists():
+            script_path.with_suffix(".py.bak").write_bytes(script_path.read_bytes())
+        script_path.write_text(code_content, encoding="utf-8")
+        self._atomic(skill_dir / "parameters.json", schema)
+        self._write_skill_md(skill_dir, name, description, schema)
+        self.reload_skills()
+        return True
+
+    def _write_skill_md(self, skill_dir, name, description, schema):
+        """生成/更新 SKILL.md：保留已有正文，只刷新 frontmatter 与 parameters 说明。"""
+        import json as _json
+        existing = skill_dir / "SKILL.md"
+        body = ""
+        if existing.exists():
+            _, body = agent_skills.parse_frontmatter(existing.read_text(encoding="utf-8"))
+        if description is None:
+            description = (body.splitlines() or [""])[0][:300] or name
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        param_lines = []
+        for key, prop in props.items():
+            req = "必填" if key in schema.get("required", []) else "可选"
+            ptype = prop.get("type", "any")
+            pdesc = prop.get("description", "")
+            param_lines.append(f"- `{key}` ({ptype}, {req})：{pdesc}")
+        usage = "\n".join(param_lines) if param_lines else "无参数。直接 `execute_skill(" + name + ")` 即可。"
+        content = (
+            f"---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            f"entry: scripts/{name}.py\n"
+            f"---\n\n"
+            f"# {name}\n\n"
+            f"通过 `execute_skill` 调用，脚本为 `scripts/{name}.py`，在隔离子进程中执行。\n\n"
+            f"## 参数\n\n{usage}\n"
+        )
+        if body and body not in content:
+            content += "\n## 使用说明\n\n" + body + "\n"
+        existing.write_text(content, encoding="utf-8")
+
+    def activate_python_skill(self, name):
+        name = self._name(name)
+        if self.skills_dir.resolve() == SKILLS_DIR.resolve():
+            from core.default_skills import REGISTRY
+            if name in REGISTRY:
+                raise ValueError("不能覆盖内置技能")
+        script = self.skills_dir / name / "scripts" / (name + ".py")
+        legacy = self.skills_dir / (name + ".py")
+        if not script.exists() and legacy.exists():
+            # 旧版单文件技能迁移到目录形态（scripts 换名备份）。
+            register_new = self.register_new_skill(
+                name + ".py", legacy.read_text(encoding="utf-8")
+            )
+            if register_new:
+                legacy.with_suffix(".py.migrated.bak").write_bytes(legacy.read_bytes())
+                legacy.unlink()
+        if not script.exists():
+            raise ValueError(f"找不到技能 {name} 的脚本；save_skill 保存后即已启用，无需 activate")
+        self.reload_skills()
+        skill = self.skills.get(name)
+        if not skill or not skill.trusted:
+            raise ValueError("技能启用失败，请检查源码和元数据")
+        return {"name": name, "status": "active", "path": str(script), "parameters": skill.parameters_schema}
+
+    def unavailable_skills(self):
+        self.refresh_if_changed()
+        with self.lock:
+            result = [{"name": name, "status": "untrusted", "next_action": "activate_skill"}
+                      for name, skill in self.skills.items() if not skill.trusted]
+            return result[:100]
+
+    def learn_from_trace(self, goal, trace):
+        if not load_config()["skills"]["auto_learn"] or not trace or len(trace) > 12:
+            return None
+        if len(list(self.skills_dir.glob("learned_*.json"))) >= 100:
+            return None
+        if any(
+            not item["result"].get("ok")
+            or item["tool"]
+            not in {"read_file", "capture_screen", "write_file", "execute_command"}
+            for item in trace
+        ):
+            return None
+        steps = [
+            {"tool": item["tool"], "arguments": item["arguments"]} for item in trace
+        ]
+        digest = hashlib.sha256(
+            json.dumps(steps, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:12]
+        name = "learned_" + digest
+        # Read-only traces can be used immediately. Side effects remain explicit candidates.
+        active = all(s["tool"] in READ_ONLY for s in steps)
+        obj = {
+            "format": "minibot-workflow-v1",
+            "version": 1,
+            "description": goal[:300],
+            "status": "active" if active else "candidate",
+            "parameters": {},
+            "steps": steps,
+            "evidence": {"successful_steps": len(trace), "goal": goal[:1000]},
+            "previous_version": None,
+        }
+        with self.lock:
+            path = self.skills_dir / (name + ".json")
+            if not path.exists():
+                self._atomic(path, obj)
             self.reload_skills()
-            return True
-        except Exception as e:
-            print(f"[SkillManager] 注册新技能失败: {e}")
-            return False
+        return name
+
+    def set_workflow_status(self, name, active):
+        name = self._name(name)
+        path = self.skills_dir / (name + ".json")
+        with self.lock:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            self._validate_workflow(obj)
+            backup = path.with_suffix(".json.bak")
+            backup.write_bytes(path.read_bytes())
+            obj["status"] = "active" if active else "candidate"
+            obj["version"] = obj.get("version", 1) + 1
+            self._atomic(path, obj)
+            self.reload_skills()
+
+    def rollback(self, name):
+        name = self._name(name)
+        path = self.skills_dir / (name + ".json")
+        backup = path.with_suffix(".json.bak")
+        obj = json.loads(backup.read_text(encoding="utf-8"))
+        self._validate_workflow(obj)
+        with self.lock:
+            self._atomic(path, obj)
+            self.reload_skills()

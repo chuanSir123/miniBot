@@ -1,0 +1,33 @@
+{
+  "format": "minibot-workflow-v1",
+  "version": 1,
+  "description": "你发我看看长句标签有哪些",
+  "status": "candidate",
+  "parameters": {},
+  "steps": [
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "chcp 65001 | Out-Null; python -c \"\nimport sqlite3\nc=sqlite3.connect('D:/github/miniBot/data/memes.db')\ncur=c.cursor()\ncur.execute('select tag,length(tag) from meme_tags order by length(tag) desc')\nrows=cur.fetchall()\nfor t,l in rows:\n    if l>=4:\n        print(l, t)\n\""
+      }
+    },
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "python -c \"\nimport sqlite3, io\nc=sqlite3.connect('D:/github/miniBot/data/memes.db')\ncur=c.cursor()\ncur.execute('select tag,length(tag) from meme_tags order by length(tag) desc')\nrows=cur.fetchall()\nout=io.open('D:/github/miniBot/data/workspace/main/tag_report.txt','w',encoding='utf-8')\nout.write('长句标签（长度>=4）共 %d 个：\\n' % sum(1 for t,l in rows if l>=4))\nfor t,l in rows:\n    if l>=4:\n        out.write('  [%d字] %s\\n' % (l,t))\nout.write('\\n全部标签共 %d 个：\\n' % len(rows))\nfor t,l in rows:\n    out.write('  [%d] %s\\n' % (l,t))\nout.close()\nprint('done')\n\""
+      }
+    },
+    {
+      "tool": "read_file",
+      "arguments": {
+        "file_path": "D:/github/miniBot/data/workspace/main/tag_report.txt",
+        "max_lines": 100
+      }
+    }
+  ],
+  "evidence": {
+    "successful_steps": 3,
+    "goal": "你发我看看长句标签有哪些"
+  },
+  "previous_version": null
+}

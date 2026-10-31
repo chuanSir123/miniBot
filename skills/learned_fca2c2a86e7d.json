@@ -1,0 +1,20 @@
+{
+  "format": "minibot-workflow-v1",
+  "version": 1,
+  "description": "你把图片发我啊",
+  "status": "candidate",
+  "parameters": {},
+  "steps": [
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "Get-Item \"C:\\Users\\admin\\Desktop\\meow_selfie.png\" | Select-Object FullName, Length"
+      }
+    }
+  ],
+  "evidence": {
+    "successful_steps": 1,
+    "goal": "你把图片发我啊"
+  },
+  "previous_version": null
+}

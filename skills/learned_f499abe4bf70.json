@@ -1,0 +1,20 @@
+{
+  "format": "minibot-workflow-v1",
+  "version": 1,
+  "description": "你没有写死标签范围吧",
+  "status": "candidate",
+  "parameters": {},
+  "steps": [
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "python -c \"\nimport sys, io\nsys.path.insert(0, 'D:/github/miniBot')\nsrc=io.open('D:/github/miniBot/core/meme.py',encoding='utf-8').read()\ni=src.find('SUGGESTED_TAGS')\nprint(src[i-50:i+400])\n\""
+      }
+    }
+  ],
+  "evidence": {
+    "successful_steps": 1,
+    "goal": "你没有写死标签范围吧"
+  },
+  "previous_version": null
+}

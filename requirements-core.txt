@@ -1,0 +1,2 @@
+# Optional screenshot encoding; core scheduling/memory use only stdlib.
+Pillow>=10,<13

@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "要点赞的好友 QQ 号；不传则给当前消息发送者点赞"
+    },
+    "count": {
+      "type": "integer",
+      "description": "点赞次数，默认 1",
+      "default": 1
+    }
+  },
+  "additionalProperties": false
+}

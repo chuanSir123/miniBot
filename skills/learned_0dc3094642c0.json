@@ -1,0 +1,26 @@
+{
+  "format": "minibot-workflow-v1",
+  "version": 1,
+  "description": "删除本空间生成的本地文件吧",
+  "status": "candidate",
+  "parameters": {},
+  "steps": [
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "Get-ChildItem -Path \"D:\\github\\miniBot\\data\\workspace\\qq_private_416448943\" -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize"
+      }
+    },
+    {
+      "tool": "execute_command",
+      "arguments": {
+        "command": "Remove-Item \"D:\\github\\miniBot\\data\\workspace\\qq_private_416448943\\dynamic_preview_161926.gif\",\"D:\\github\\miniBot\\data\\workspace\\qq_private_416448943\\dynamic_preview_194628.gif\",\"D:\\github\\miniBot\\data\\workspace\\qq_private_416448943\\teddy_bike.html\" -Force; Get-ChildItem \"D:\\github\\miniBot\\data\\workspace\\qq_private_416448943\" -File -Name"
+      }
+    }
+  ],
+  "evidence": {
+    "successful_steps": 2,
+    "goal": "删除本空间生成的本地文件吧"
+  },
+  "previous_version": null
+}

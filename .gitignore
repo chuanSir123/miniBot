@@ -14,6 +14,8 @@ ENV/
 data/*.db
 data/*.sqlite3
 data/*.log
+data/media/
+data/workspace/
 
 # NapCat binaries
 tools/napcat/
@@ -23,3 +25,36 @@ tools/*.zip
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Runtime state and local secrets
+data/*.db-*
+data/*.sqlite3-*
+config.local.json
+skills/usage.json
+config*.json.tmp
+tools/ego-lite/
+data/onboarding.json
+config.json
+
+# WorkBuddy agent workspace
+.workbuddy/
+
+# Runtime data (databases, logs, media, benchmarks)
+data/
+
+# Collected memes & downloaded media
+assets/memes/
+
+# Scratch & temp files
+scratch/
+*.log
+*.bak
+
+# Local design docs & debug collections (not for distribution)
+docs/
+
+# Local backup configs
+config.local.json.bak
+
+# Local one-off debugging scripts
+audio_check.ps1

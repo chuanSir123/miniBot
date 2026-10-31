@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "properties": {
+    "prompt": {
+      "type": "string",
+      "description": "具体创作/修改要求。编辑时说明保留与修改的内容；忠实用户风格，不擅自锁定动漫风格。"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "generate",
+        "edit"
+      ],
+      "default": "auto"
+    },
+    "image_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 9,
+      "description": "按顺序填写当前会话真实media_ref。编辑必须提供；从当前上传/引用消息或list_media获取。最多9张。"
+    },
+    "width": {
+      "type": "integer",
+      "description": "可选；编辑时省略沿用首张参考图尺寸，新图默认480"
+    },
+    "height": {
+      "type": "integer",
+      "description": "可选；编辑时省略沿用首张参考图尺寸，新图默认768"
+    },
+    "n": {
+      "type": "integer",
+      "default": 1
+    },
+    "model": {
+      "type": "string",
+      "default": "sensenova-u1"
+    }
+  },
+  "required": [
+    "prompt"
+  ],
+  "additionalProperties": false
+}

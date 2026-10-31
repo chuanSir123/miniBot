@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["status", "install", "guide", "run"],
+      "description": "status检查环境 / install安装 / guide读取使用指南 / run执行网页操作脚本"
+    },
+    "script": { "type": "string", "description": "JavaScript 脚本（action=run 时）" },
+    "start_line": { "type": "integer", "description": "guide 输出的起始行" },
+    "line_count": { "type": "integer", "description": "guide 输出的行数" }
+  },
+  "required": ["action"],
+  "additionalProperties": false
+}
