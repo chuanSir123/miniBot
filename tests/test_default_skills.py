@@ -116,7 +116,11 @@ class DefaultSkillTests(Fixture):
     def test_search_secret_storage_and_request_contract(self):
         key = "as_sk_TEST_ONLY_NOT_REAL"
         config.save_config({"anysearch": {"api_key": key}})
-        self.assertNotIn(key, config.CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+        # 配置已合并成单文件：Key 与普通配置同存 config.json，不再拆出 local 文件。
+        self.assertIn(key, config.CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+        self.assertFalse(
+            config.CONFIG_FILE_PATH.with_name("config.local.json").exists()
+        )
         self.assertEqual(config.load_config()["anysearch"]["api_key"], key)
 
         class Response:

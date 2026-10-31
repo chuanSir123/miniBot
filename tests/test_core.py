@@ -788,19 +788,46 @@ class EndToEndTests(Fixture):
             app.stop()
         self.assertFalse(any(t.is_alive() for t in app.dispatcher.threads))
 
-    def test_private_secrets_are_not_written_to_public_config(self):
+    def test_secrets_live_in_single_config_file(self):
         config.save_config(
             {
                 "vlm": {"api_key": "PRIVATE_TEST"},
                 "channels": {"napcat": {"access_token": "TOKEN_TEST"}},
             }
         )
-        public = (self.root / "config.json").read_text(encoding="utf-8")
-        self.assertNotIn("PRIVATE_TEST", public)
-        self.assertNotIn("TOKEN_TEST", public)
+        stored = (self.root / "config.json").read_text(encoding="utf-8")
+        self.assertIn("PRIVATE_TEST", stored)
+        self.assertIn("TOKEN_TEST", stored)
+        self.assertFalse((self.root / "config.local.json").exists())
         config._cache = None
         config._stamp = None
         self.assertEqual(config.load_config()["vlm"]["api_key"], "PRIVATE_TEST")
+
+    def test_legacy_local_config_is_merged_once(self):
+        (self.root / "config.json").write_text(
+            json.dumps({"vlm": {"model": "m1"}}, ensure_ascii=False), encoding="utf-8"
+        )
+        (self.root / "config.local.json").write_text(
+            json.dumps(
+                {
+                    "vlm": {"api_key": "K1", "model_keys": {"m1": "K1"}},
+                    "channels": {"napcat": {"access_token": "T1"}},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        config._cache = None
+        config._stamp = None
+        cfg = config.load_config()
+        self.assertEqual(cfg["vlm"]["api_key"], "K1")
+        self.assertEqual(cfg["vlm"]["model"], "m1")
+        self.assertEqual(cfg["channels"]["napcat"]["access_token"], "T1")
+        self.assertFalse((self.root / "config.local.json").exists())
+        self.assertTrue((self.root / "config.local.json.bak").exists())
+        merged = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(merged["vlm"]["api_key"], "K1")
+        self.assertNotIn("model_keys", merged["vlm"])
 
     def test_relative_and_calendar_parser(self):
         from core.reminders import parse_reminder

@@ -130,7 +130,11 @@ class ConfigHTTPTests(Fixture):
             "/api/config", "POST", {"anysearch": {"api_key": ""}}, headers
         )
         self.assertEqual(config.load_config()["anysearch"]["api_key"], secret)
-        self.assertNotIn(secret, config.CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+        # 单文件配置：Key 落 config.json，local 文件不再生成。
+        self.assertIn(secret, config.CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+        self.assertFalse(
+            config.CONFIG_FILE_PATH.with_name("config.local.json").exists()
+        )
 
     def test_anysearch_existing_email_error_does_not_retry_or_save(self):
         cookie = self.auth()

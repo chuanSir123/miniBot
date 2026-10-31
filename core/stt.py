@@ -1,6 +1,6 @@
 """语音转写：云端 API（OpenAI 兼容 / 旧版 fileUrl）或本地 faster-whisper。
 
-配置在 config.json 的 stt 段，密钥放 config.local.json（不参与版本控制）。
+配置在 config.json 的 stt 段（含密钥，该文件不参与版本控制）。
 mode=auto：填了 base_url 就走云端，失败或没填就回退本地模型。
 """
 import base64

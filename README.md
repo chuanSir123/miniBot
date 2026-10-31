@@ -77,4 +77,4 @@ MiniBot/
 
 1. 复制 `config.example.json` 为 `config.json`；
 2. 在 Web 工作台「⚙️ 智能体设置」中填写 VLM 与 Jev 的 API Key（也可直接编辑配置文件）；
-3. API Key 与 OneBot Token 自动保存在 `config.local.json`（已被 Git 忽略，不会进仓库）。
+3. API Key、OneBot Token 与其余参数一起存在 `config.json`（该文件已被 Git 忽略，不会进仓库）；`config.example.json` 是不含密钥的模板。

@@ -74,7 +74,7 @@ DEFAULT_CONFIG["runtime"] = {
 DEFAULT_CONFIG["anysearch"] = {"enabled": True, "api_key": ""}
 DEFAULT_CONFIG["ego_lite"] = {"enabled": True, "executable": "", "auto_install": True}
 # 语音转写：mode=auto 时优先云端（已填 base_url），否则回退本地 faster-whisper。
-# 所有值都是明文配置，密钥单独存放于 config.local.json。
+# 所有值都是明文配置，统一存放在 config.json（该文件已被 Git 忽略）。
 DEFAULT_CONFIG["stt"] = {
     "enabled": True,
     "mode": "auto",  # auto | cloud | local
@@ -447,47 +447,81 @@ def _drop_legacy_encryption(raw):
     return raw
 
 
+def _legacy_private_path():
+    return CONFIG_FILE_PATH.with_name(CONFIG_FILE_PATH.stem + ".local.json")
+
+
+def _absorb_legacy_private(raw):
+    """把历史 config.local.json 并回 config.json，并把旧文件留成 .bak。
+
+    早期版本为了「config.json 可公开分享」，把密钥拆到 config.local.json。
+    现在两份文件都已不进版本库，拆分只剩心智负担，所以首次启动时自动合并：
+    写回 config.json（含密钥），原 config.local.json 改名为 .bak 保留一次。
+    """
+    private_path = _legacy_private_path()
+    if not private_path.exists():
+        return raw
+    try:
+        private = json.loads(private_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[Config] Ignoring unreadable legacy config.local.json: {exc}")
+        return raw
+    if not isinstance(private, dict) or not private:
+        return raw
+
+    merged_raw = _merge(raw, private)
+    # 旧结构用 vlm.model_keys 存各模型 Key，展开进 models 后删除该字段。
+    vlm = merged_raw.get("vlm")
+    if isinstance(vlm, dict):
+        model_keys = vlm.pop("model_keys", None)
+        if isinstance(model_keys, dict) and isinstance(vlm.get("models"), list):
+            for entry in vlm["models"]:
+                if not isinstance(entry, dict) or entry.get("api_key"):
+                    continue
+                mid = entry.get("id") or entry.get("model")
+                if mid in model_keys:
+                    entry["api_key"] = model_keys[mid]
+
+    try:
+        CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE_PATH.with_suffix(CONFIG_FILE_PATH.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(merged_raw, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, CONFIG_FILE_PATH)
+        os.replace(private_path, private_path.with_name(private_path.name + ".bak"))
+        print("[Config] Merged legacy config.local.json into config.json (backup kept)")
+    except OSError as exc:
+        print(f"[Config] Could not persist merged configuration: {exc}")
+    return merged_raw
+
+
 def load_config():
     import copy
 
     global _cache, _stamp
     with _lock:
-        private_path = CONFIG_FILE_PATH.with_name(CONFIG_FILE_PATH.stem + ".local.json")
-        public_stamp = (
-            CONFIG_FILE_PATH.stat().st_mtime_ns if CONFIG_FILE_PATH.exists() else None
-        )
-        private_stamp = (
-            private_path.stat().st_mtime_ns if private_path.exists() else None
-        )
-        stamp = (public_stamp, private_stamp)
+        stamp = CONFIG_FILE_PATH.stat().st_mtime_ns if CONFIG_FILE_PATH.exists() else None
         if _cache is not None and stamp == _stamp:
             return copy.deepcopy(_cache)
         try:
             raw = (
                 json.loads(CONFIG_FILE_PATH.read_text(encoding="utf-8"))
-                if public_stamp
+                if stamp is not None
                 else {}
             )
             if not isinstance(raw, dict):
                 raise ValueError("configuration must be an object")
-            if private_stamp:
-                private = json.loads(private_path.read_text(encoding="utf-8"))
-                if not isinstance(private, dict):
-                    raise ValueError("private configuration must be an object")
-                raw = _merge(raw, private)
-                model_keys = private.get('vlm', {}).get('model_keys', {})
-                if model_keys and isinstance(raw.get('vlm', {}).get('models'), list):
-                    for m in raw['vlm']['models']:
-                        if isinstance(m, dict):
-                            mid = m.get('id') or m.get('model')
-                            if mid in model_keys and not m.get('api_key'):
-                                m['api_key'] = model_keys[mid]
-            cfg = validate_config(_merge(DEFAULT_CONFIG, _drop_legacy_encryption(raw)))
+            raw = _drop_legacy_encryption(_absorb_legacy_private(raw))
+            cfg = validate_config(_merge(DEFAULT_CONFIG, raw))
         except (ValueError, OSError, TypeError) as exc:
             print(
                 f"[Config] Invalid configuration: {exc}; retaining last valid configuration"
             )
             return copy.deepcopy(_cache or DEFAULT_CONFIG)
+        # 迁移会重写 config.json，重新取 mtime，避免下一次读取白白解析一遍。
+        stamp = CONFIG_FILE_PATH.stat().st_mtime_ns if CONFIG_FILE_PATH.exists() else None
         _cache, _stamp = cfg, stamp
         return copy.deepcopy(cfg)
 
@@ -511,42 +545,16 @@ def save_config(cfg):
     with _lock:
         merged = validate_config(_merge(load_config(), cfg))
         CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        public = copy.deepcopy(merged)
-        anysearch_secret = public["anysearch"].pop("api_key", "")
-        model_keys = {}
-        for m in public.get("vlm", {}).get("models", []):
-            if isinstance(m, dict) and "api_key" in m:
-                mid = m.get("id") or m.get("model")
-                if mid and m.get("api_key"):
-                    model_keys[mid] = m.pop("api_key")
-                else:
-                    m.pop("api_key", None)
-
-        private = {
-            "anysearch": {"api_key": anysearch_secret},
-            "vlm": {
-                "api_key": public["vlm"].pop("api_key", ""),
-                "model_keys": model_keys,
-            },
-            "jev": {"api_key": public["jev"].pop("api_key", "")},
-            "stt": {"api_key": public["stt"].pop("api_key", "")},
-            "image": {"api_key": public["image"].pop("api_key", "")},
-            "channels": {
-                "napcat": {
-                    "access_token": public["channels"]["napcat"].pop("access_token", "")
-                }
-            },
-        }
-        private_path = CONFIG_FILE_PATH.with_name(CONFIG_FILE_PATH.stem + ".local.json")
-        for path, values in ((private_path, private), (CONFIG_FILE_PATH, public)):
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as stream:
-                json.dump(values, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(tmp, path)
+        payload = copy.deepcopy(merged)
+        payload.get("vlm", {}).pop("model_keys", None)
+        tmp = CONFIG_FILE_PATH.with_suffix(CONFIG_FILE_PATH.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, CONFIG_FILE_PATH)
         _cache = merged
-        _stamp = (CONFIG_FILE_PATH.stat().st_mtime_ns, private_path.stat().st_mtime_ns)
+        _stamp = CONFIG_FILE_PATH.stat().st_mtime_ns
         callbacks = list(_listeners)
     for callback in callbacks:
         try:

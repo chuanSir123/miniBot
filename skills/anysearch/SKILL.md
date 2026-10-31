@@ -17,7 +17,7 @@ description: AnySearch 实时联网搜索、批量检索、网页正文提取。
 
 Key 获取按[官方中文 README](https://github.com/anysearch-ai/anysearch-skill/blob/main/README_zh.md)：
 在设置页填写真实且可收信的邮箱，点击注册。程序调用官方邮箱注册接口，
-将只显示一次的 Key 保存到被 Git 忽略的 `config.local.json`。
+将只显示一次的 Key 保存到被 Git 忽略的 `config.json`。
 界面显示用户名和登录地址，不回显 Key。
 已有邮箱不要重复注册，前往 https://www.anysearch.com/login 或
 https://anysearch.com/console/api-keys 获取 Key。
