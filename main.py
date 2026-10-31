@@ -134,6 +134,7 @@ class MiniBotApp:
             self._handle_proactive_notification,
             self.dispatcher,
             self._followup,
+            self._verify_proactive,
         )
         self._unsubscribe = subscribe(self._config_changed)
 
@@ -880,20 +881,100 @@ class MiniBotApp:
 
         return delivered
 
+    # 主动提醒的核实提示词。核心是"先看再说"：工具全部放开（截图、读文件、读历史、
+    # 跑只读命令都行），但只用提示词约束"这一轮别动手"——核实是为了给建议，
+    # 不是为了替主人改东西。
+    PROACTIVE_VERIFY_PROMPT = (
+        "【主动提醒核实】你准备主动找主人说话。先核实下面这个判断是否成立，再给一句话建议。\n"
+        "准备开口的判断：{claim}\n"
+        "触发原因：{trigger}\n"
+        "桌面状态：{state}\n\n"
+        "要求：\n"
+        "1. 先核实再看结论。可以截图看屏幕、读文件、读历史，也可以跑只读命令"
+        "（git status、dir、type 这类）确认现状；看到什么就以什么为准。\n"
+        "2. 结论必须落在你实际看到的内容上，并点出具体依据（窗口标题、界面上的文字、"
+        "报错原文、文件里的片段）。\n"
+        "3. 看不到依据时，只说你看到了什么、还需要确认什么，不要下结论。"
+        "禁止使用「已解决」「已修复」「已经好了」「仍然异常」「仍检测到异常」这类判断词。\n"
+        "4. 这一轮只核实，不要主动修改文件、不要执行会改变系统状态的命令、"
+        "不要声称已经替主人做了什么。\n"
+        "5. 用你平时的口吻说话（像跟主人聊天），别写成核查报告；一到两句话，50 字以内。\n"
+        "6. 核实后如果根本不值得打扰（报错早已过去、主人正在正常输入），只回复两个字：静默。"
+    )
+
+    def _verify_proactive(self, state, posture, claim):
+        """断言型主动消息的核实入口。返回空字符串表示"没有证据，别说话"。
+
+        模型觉得该提醒，必须先用工具看一眼真实屏幕/文件/历史，能指出依据才允许出门。
+        工具是全部放开的，靠提示词约束"当轮不改东西"——所以这里把用过的工具记到日志，
+        真被改了东西能回溯到是哪一次核实。
+        """
+        from core.decision_context import build_decision_context
+
+        context = build_decision_context(self.memory, "main:pet", "main")
+        state_brief = {
+            key: state.get(key)
+            for key in (
+                "process",
+                "title",
+                "idle_sec",
+                "active_minutes",
+                "local_time",
+                "trigger",
+                "meal_period",
+                "late_night",
+                "error_signal_recent",
+                "environment_events",
+                "returned",
+            )
+        }
+        prompt = self.PROACTIVE_VERIFY_PROMPT.format(
+            claim=claim,
+            trigger=state.get("trigger", ""),
+            state=json.dumps(state_brief, ensure_ascii=False),
+        )
+        used_tools = []
+
+        def note_tool(name, args):
+            used_tools.append(name)
+
+        print("[主动核实] 开始 session=local:proactive:verify claim=" + str(claim)[:40])
+        try:
+            # 独立会话：核实过程不写进桌宠的对话历史，也不会抢占 main:pet 的活动锁。
+            # 上下文靠 decision_context 带进去，所以它仍然知道刚聊过什么。
+            reply = self.harness.run(
+                prompt,
+                "",
+                session_id="local:proactive:verify",
+                scope="local",
+                channel="pet",
+                target="",
+                allow_tools=True,
+                readonly=False,
+                decision_context=context,
+                on_tool_call=note_tool,
+            )
+        except Exception as exc:
+            print("[主动核实]", exc)
+            return ""
+        if used_tools:
+            print(
+                "[主动核实] 用过工具："
+                + "、".join(dict.fromkeys(used_tools))
+                + "（本轮要求只核实不改动，如有变更需回查）"
+            )
+        reply = (reply or "").strip()
+        if not reply or reply.startswith(("【VLM", "【提示")):
+            return ""
+        if reply.strip("。.！! ") in ("静默", "保持静默"):
+            return ""
+        return reply
+
     def _followup(self, task, state):
-        # Only explicitly enabled local followups can inspect the desktop.
+        """跟进型主动消息：和普通主动提醒走同一套只读核实。"""
         if task["scope"] != "local":
             return task["action_prompt"]
-        future = self.dispatcher.submit(
-            task["session_id"],
-            self.harness.run,
-            task["action_prompt"] + "；只读检查当前状态并汇报证据，不做修改。",
-            json.dumps(state, ensure_ascii=False),
-            session_id=task["session_id"],
-            scope="local",
-            readonly=True,
-        )
-        return future.result(100)
+        return self._verify_proactive(state, "debug_assist", task["action_prompt"])
 
     def _observe_qq(self, text, event):
         # Only allowlisted group members reach this function. No observed text gains tools.

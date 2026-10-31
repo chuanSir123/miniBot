@@ -166,6 +166,12 @@ class SpeechBubble(LightPanel):
         )
         self.layout.addWidget(self.title)
         self.layout.addWidget(self.status)
+        # 标题/状态行永不参与拉伸：气泡高度必须由内容决定，否则多余空间
+        # 会把它们撑开，出现大段空白。
+        from PyQt5.QtWidgets import QSizePolicy
+
+        for _lab in (self.title, self.status):
+            _lab.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
@@ -177,6 +183,7 @@ class SpeechBubble(LightPanel):
         self.label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.scroll.setWidget(self.label)
+        self.scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.layout.addWidget(self.scroll)
         self.available_height = 420
 
@@ -220,17 +227,29 @@ class SpeechBubble(LightPanel):
     def fit_available(self, height):
         self.available_height = max(60, int(height))
         width = max(200, self.width())
-        self.label.setFixedWidth(width - 48)
-        body_height = self.label.heightForWidth(width - 48) if self.label.text() else 0
-        self.label.setMinimumHeight(max(0, body_height))
-        self.scroll.setVisible(bool(self.label.text()))
+        content_w = width - 48
+        self.label.setFixedWidth(content_w)
+        html = self.label.text()
+        # 用独立的 QTextDocument 精确量高度：QLabel.heightForWidth 依赖布局时序，
+        # 在真实窗口里可能拿到过期文档宽度而算出虚高，导致气泡出现大片空白。
+        body_height = 0
+        if html:
+            from PyQt5.QtGui import QTextDocument
+
+            doc = QTextDocument()
+            doc.setDefaultFont(self.label.font())
+            doc.setHtml(html)
+            doc.setTextWidth(content_w)
+            body_height = int(doc.size().height()) + 4
+        self.label.setMinimumHeight(body_height)
+        self.scroll.setVisible(bool(html))
         # 用真实布局位置计算头部高度，避免 sizeHint 在高 DPI/字体差异下偏小，
         # 导致气泡被压矮后状态行和正文重叠。
         self.layout.activate()
         header = self.status.geometry().bottom() + self.layout.contentsMargins().bottom() + 2
-        body = max(0, min(body_height+4, self.available_height-header))
+        body = max(0, min(body_height, self.available_height - header))
         self.scroll.setFixedHeight(body)
-        self.setFixedHeight(min(self.available_height, header+body))
+        self.setFixedHeight(header + body)
 
 
 class HUDLineEdit(QLineEdit):
@@ -1008,7 +1027,8 @@ class DesktopPetWidget(QWidget):
         self._notice_open = True
         self.toolbar.badge.hide()
         self.toolbar.notice.setToolTip("查看最近回复（再点一次收起）")
-        html = self._render_segments()
+        # 和气泡保持一致：只显示最后一条（当前步骤或最终回复），不铺全部过程。
+        html = self._render_current()
         if html:
             self.bubble.set_html(html)
         else:

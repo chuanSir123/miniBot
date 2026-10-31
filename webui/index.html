@@ -964,6 +964,25 @@
     .steering-strip,.editing-banner { padding:8px 10px; font-size:11px; line-height:1.6; animation:none; gap:8px; }
     .steering-strip { background:#f7f5fa; border-color:#e7e0f0; color:#75618d; }
     .steering-strip span { font-weight:400; }
+    /* 待发送队列：任务运行中新发的消息先排队（默认等当前轮结束再发），可手动引导/编辑/删除 */
+    .pending-queue { display:flex; flex-direction:column; gap:6px; }
+    .pending-queue.hidden { display:none; }
+    .pending-item { display:flex; align-items:center; gap:8px; padding:9px 10px 9px 12px; background:#f4f4f4; border:1px solid #ececec; border-radius:10px; }
+    .pending-item:hover { background:#efefef; }
+    .pending-grip { flex-shrink:0; width:9px; height:14px; background-image:radial-gradient(circle,#b8b8b8 1px,transparent 1.3px); background-size:5px 5px; background-repeat:repeat; background-position:0 0; opacity:.9; }
+    .pending-text { flex:1; min-width:0; font-size:13px; font-weight:600; line-height:1.5; color:#3a3a3a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pending-actions { display:flex; align-items:center; gap:2px; flex-shrink:0; }
+    .pending-btn { position:relative; width:26px; height:26px; padding:0; display:inline-flex; align-items:center; justify-content:center; background:transparent; border:0; border-radius:7px; color:#6f6f6f; cursor:pointer; }
+    .pending-btn .icon { width:14px; height:14px; }
+    .pending-btn:hover { background:#e3e3e3; color:#1f1f1f; }
+    .pending-btn.is-steer:hover { color:#5f4b8b; }
+    .pending-btn[data-tip]::after { content:attr(data-tip); position:absolute; bottom:calc(100% + 8px); right:0; left:auto; transform:translateY(3px); padding:5px 9px; background:#2b2b2b; color:#fff; font-size:11px; font-weight:400; line-height:1.4; white-space:nowrap; border-radius:6px; opacity:0; pointer-events:none; transition:opacity .14s ease,transform .14s ease; z-index:1200; box-shadow:0 4px 12px rgba(0,0,0,.16); }
+    .pending-btn[data-tip]::before { content:""; position:absolute; bottom:calc(100% + 3px); right:8px; left:auto; border:5px solid transparent; border-top-color:#2b2b2b; opacity:0; pointer-events:none; transition:opacity .14s ease; z-index:1200; }
+    .pending-btn[data-tip]:hover::after { opacity:1; transform:translateY(0); }
+    .pending-btn[data-tip]:hover::before { opacity:1; }
+    .pending-btn:disabled { opacity:.4; cursor:default; }
+    .pending-btn:disabled:hover { background:transparent; color:#6f6f6f; }
+    .icon-arrow-up-right { --icon:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0iY3VycmVudENvbG9yIiBjbGFzcz0iYmkgYmktYXJyb3ctdXAtcmlnaHQiIHZpZXdCb3g9IjAgMCAxNiAxNiI+CiAgPHBhdGggZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNMTQgMi41YS41LjUgMCAwIDAtLjUtLjVoLTZhLjUuNSAwIDAgMCAwIDFoNC43OTNMMi4xNDYgMTMuMTQ2YS41LjUgMCAwIDAgLjcwOC43MDhMMTMgMy43MDdWOC41YS41LjUgMCAwIDAgMSAweiIvPgo8L3N2Zz4="); }
     .composer-img-preview { background:#fafafa; border-color:#e8e8e8; }
     .preview-panel { width:38%; min-width:320px; max-width:48%; background:#fff; animation:none; }
     .preview-header { background:#fff; height:48px; min-height:48px; padding:0 14px; gap:10px; }
@@ -1375,9 +1394,12 @@
                 <button class="btn-msg-action" onclick="cancelEditingMessage()">✕ 取消</button>
               </div>
           <div class="steering-strip hidden" id="steering_alert">
-            <span id="steering_alert_text"> 任务进行中 · 新消息将作为补充引导，等待下一个安全点应用</span>
+            <span id="steering_alert_text"> 任务进行中 · 新消息将排队等待，可点「引导」立即注入</span>
             <span style="font-size: 11px; opacity: 0.9; font-family: Consolas, monospace;" id="steering_alert_timer">0s</span>
           </div>
+
+          <!-- 待发送队列：运行中新发的消息先在这里排队 -->
+          <div class="pending-queue hidden" id="pending_queue" aria-live="polite" aria-label="待发送消息队列"></div>
 
           <div class="composer-img-preview hidden" id="composer_img_bar">
             <img id="composer_img_thumb" class="composer-img-thumb" src="" alt="预览">
@@ -2275,6 +2297,7 @@
       if (sseSource) { sseSource.close(); sseSource = null; }
       setTaskState(false);
       currentSessionId = sessionId;
+      loadPendingQueue(sessionId);
       currentTurn = blankTurnState();
       turnCancelled = false;
       document.getElementById('top_session_name').textContent = title || sessionId;
@@ -2332,6 +2355,7 @@
         const data = await res.json();
         if (data.success) {
           showToast('会话已删除');
+          try { localStorage.removeItem(pendingQueueKey(sid)); } catch (err) {}
           if (currentSessionId === sid) {
             currentSessionId = null;
           }
@@ -3445,13 +3469,13 @@
         headerStatus.style.background = 'rgba(245, 158, 11, 0.2)';
         headerStatus.style.color = '#99600a';
 
-        // Steering Mode activated!
+        // 运行中再次输入的消息会进入待发送队列，而不是直接注入引导
         steerAlert.classList.remove('hidden');
-        btnSubmit.textContent = ' 补充引导';
+        btnSubmit.textContent = '加入队列';
         btnSubmit.className = 'btn-send btn-steer';
         btnCancel.classList.remove('hidden');
         input.classList.add('mode-steer');
-        input.placeholder = '输入针对当前任务的方向修正与实时引导...';
+        input.placeholder = '继续补充…回车加入队列，任务结束后自动发送';
 
         startLiveTimer(statusMsg || (taskStartTime ? '' : '正在处理中…'));
       } else {
@@ -4146,6 +4170,8 @@
         currentTurn = blankTurnState();
         loadWorkspaceFiles();
         smartScrollToBottom(true);
+        // 本轮结束后，把排队中的消息接着发出去
+        flushPendingQueue();
       });
 
       listen('cancelled', e => {
@@ -4157,7 +4183,7 @@
         finalizePendingSteerings();
         setTaskState(false, '已停止');
         currentTurn = blankTurnState();
-        showToast('任务已停止');
+        showToast(pendingQueue.length ? ('任务已停止；' + pendingQueue.length + ' 条排队消息仍保留，可点「引导」发出') : '任务已停止');
       });
 
       listen('session_cleared', e => {
@@ -4276,7 +4302,184 @@
       }
     }
 
-    // Send Message / Steering
+    // ==========================================
+    // 待发送队列（运行中二次发送 → 排队等待，可手动引导/编辑/删除）
+    // ==========================================
+    let pendingQueue = [];
+    let pendingSeq = 0;
+    let pendingQueueFlushing = false;
+
+    function pendingQueueKey(sessionId) {
+      return 'minibot.pending_queue.' + (sessionId || 'default');
+    }
+
+    function loadPendingQueue(sessionId) {
+      pendingQueue = [];
+      try {
+        const raw = localStorage.getItem(pendingQueueKey(sessionId));
+        const arr = raw ? JSON.parse(raw) : [];
+        if (Array.isArray(arr)) {
+          pendingQueue = arr
+            .filter(t => typeof t === 'string' && t.trim())
+            .map(t => ({id: ++pendingSeq, text: t.trim()}));
+        }
+      } catch (err) {
+        pendingQueue = [];
+      }
+      renderPendingQueue();
+    }
+
+    function savePendingQueue() {
+      try {
+        const key = pendingQueueKey(currentSessionId);
+        if (pendingQueue.length) {
+          localStorage.setItem(key, JSON.stringify(pendingQueue.map(i => i.text)));
+        } else {
+          localStorage.removeItem(key);
+        }
+      } catch (err) {}
+    }
+
+    function renderPendingQueue() {
+      const box = document.getElementById('pending_queue');
+      if (!box) return;
+      box.innerHTML = '';
+      box.classList.toggle('hidden', pendingQueue.length === 0);
+      for (const item of pendingQueue) {
+        const row = document.createElement('div');
+        row.className = 'pending-item';
+        row.dataset.pid = String(item.id);
+        const textEl = document.createElement('span');
+        textEl.className = 'pending-text';
+        textEl.textContent = item.text;
+        textEl.title = item.text;
+        const grip = document.createElement('span');
+        grip.className = 'pending-grip';
+        grip.setAttribute('aria-hidden', 'true');
+        const actions = document.createElement('span');
+        actions.className = 'pending-actions';
+
+        const mkBtn = (cls, tip, label, icon, handler) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'pending-btn' + (cls ? ' ' + cls : '');
+          b.dataset.tip = tip;
+          b.setAttribute('aria-label', label);
+          const i = document.createElement('i');
+          i.className = 'icon ' + icon;
+          i.setAttribute('aria-hidden', 'true');
+          b.appendChild(i);
+          b.addEventListener('click', handler);
+          return b;
+        };
+
+        actions.appendChild(mkBtn('is-steer', '引导会话，消息将被发出但模型不会中断', '引导会话', 'icon-arrow-up-right', () => steerPendingMessage(item.id)));
+        actions.appendChild(mkBtn('', '编辑这条消息', '编辑', 'icon-pencil', () => editPendingMessage(item.id)));
+        actions.appendChild(mkBtn('', '删除这条消息', '删除', 'icon-trash', () => deletePendingMessage(item.id)));
+
+        row.appendChild(grip);
+        row.appendChild(textEl);
+        row.appendChild(actions);
+        box.appendChild(row);
+      }
+    }
+
+    function enqueuePendingMessage(text) {
+      const clean = (text || '').trim();
+      if (!clean) return;
+      pendingQueue.push({id: ++pendingSeq, text: clean});
+      savePendingQueue();
+      renderPendingQueue();
+      showToast('已排队 · 当前任务结束后会自动发送，也可点「引导」立即注入');
+    }
+
+    function dropPendingItem(id) {
+      const idx = pendingQueue.findIndex(i => String(i.id) === String(id));
+      if (idx < 0) return null;
+      const [item] = pendingQueue.splice(idx, 1);
+      savePendingQueue();
+      renderPendingQueue();
+      return item;
+    }
+
+    function editPendingMessage(id) {
+      const item = dropPendingItem(id);
+      if (!item) return;
+      const input = document.getElementById('prompt_input');
+      const existing = input.value.trim();
+      input.value = existing ? existing + '\n' + item.text : item.text;
+      resizeComposer();
+      input.focus();
+      try { input.setSelectionRange(input.value.length, input.value.length); } catch (err) {}
+      showToast('已取出到输入框，改完可直接发送');
+    }
+
+    function deletePendingMessage(id) {
+      const item = dropPendingItem(id);
+      if (item) showToast('已删除待发送消息');
+    }
+
+    async function steerPendingMessage(id) {
+      const item = pendingQueue.find(i => String(i.id) === String(id));
+      if (!item) return;
+      // 任务已经结束：直接当新任务发出，不必再等
+      if (!isTaskRunning) {
+        dropPendingItem(id);
+        await dispatchPrompt({text: item.text, fromQueue: true});
+        return;
+      }
+      const btn = document.querySelector('.pending-item[data-pid="' + id + '"] .is-steer');
+      if (btn) btn.disabled = true;
+      try {
+        lastAppliedSteering = null;
+        await postAction('/api/steer', {session_id: currentSessionId, text: item.text});
+        dropPendingItem(id);
+        // 本地也画一条引导块，避免 SSE 抖动时用户看不到反馈（服务端广播会去重）
+        try {
+          if (!currentTurn.blocks.some(b => b.kind === 'steering' && (b.text || '').trim() === item.text)) {
+            beginSteeringBlock(item.text, false);
+          }
+        } catch (err) {}
+        showToast('已引导当前任务，模型不会中断');
+        smartScrollToBottom(false);
+      } catch (err) {
+        // 任务可能刚好在这一瞬间结束（本地状态还没跟上）：改为直接作为新任务发出
+        const stale = /没有正在运行|no running/i.test(err.message || '');
+        if (!isTaskRunning || stale) {
+          setTaskState(false);
+          const ok = await dispatchPrompt({text: item.text, fromQueue: true});
+          if (ok) dropPendingItem(id);
+          return;
+        }
+        if (btn) btn.disabled = false;
+        showToast('引导失败：' + err.message, 'error');
+      }
+    }
+
+    // 当前轮结束后，把排队中的消息逐条发出去
+    async function flushPendingQueue() {
+      if (pendingQueueFlushing || !pendingQueue.length) return;
+      pendingQueueFlushing = true;
+      try {
+        // 给后端一点收尾缓冲，避免刚收到 complete 就发下一条被判成"仍在运行"
+        await new Promise(r => setTimeout(r, 400));
+        while (pendingQueue.length && !isTaskRunning && !submissionPending) {
+          const item = pendingQueue[0];
+          const ok = await dispatchPrompt({text: item.text, fromQueue: true});
+          if (!ok) break;
+          dropPendingItem(item.id);
+          if (isTaskRunning) break;
+          await new Promise(r => setTimeout(r, 250));
+        }
+      } finally {
+        pendingQueueFlushing = false;
+      }
+      if (pendingQueue.length && !isTaskRunning) {
+        showToast('还有 ' + pendingQueue.length + ' 条排队消息，可点「引导」手动发出', 'error');
+      }
+    }
+
+    // Send Message
     async function submitMessage() {
       if (submissionPending) return;
       const input = document.getElementById('prompt_input');
@@ -4298,13 +4501,20 @@
       }
       const attachedImg = currentAttachedImage;
       if (!text && !attachedImg) return;
-      if (isTaskRunning && attachedImg) {
-        showToast('当前任务仅支持文字引导。图片已保留，可在任务结束后发送。', 'error');
+
+      // 任务运行中：不再直接注入引导，先排队等待（可手动点「引导」立即注入）
+      if (isTaskRunning) {
+        if (attachedImg) {
+          showToast('当前任务运行中，图片请等任务结束后再发送', 'error');
+          return;
+        }
+        input.value = '';
+        hideSlashCommandsPopup();
+        resizeComposer();
+        enqueuePendingMessage(text);
         return;
       }
-      const sessionId = currentSessionId;
-      const workspace = currentWorkspace;
-      const steering = isTaskRunning;
+
       const editId = editingMessageId;
       if (editId && !(await uiConfirm({
         title: '重新执行历史消息',
@@ -4320,12 +4530,21 @@
       input.value = '';
       clearSelectedImage();
       resizeComposer();
+      await dispatchPrompt({text: savedText, img: savedImg, imgName: savedImgName, editId});
+    }
+
+    // 真正把一条消息提交给后端
+    async function dispatchPrompt({text, img = null, imgName = '', editId = null, fromQueue = false}) {
+      const sessionId = currentSessionId;
+      const workspace = currentWorkspace;
+      const input = document.getElementById('prompt_input');
+      const button = document.getElementById('btn_submit');
+      const attachBtn = document.getElementById('btn_attach_img');
 
       submissionPending = true;
-      const button = document.getElementById('btn_submit');
       button.disabled = true;
       input.readOnly = true;
-      document.getElementById('btn_attach_img').disabled = true;
+      attachBtn.disabled = true;
       try {
         if (editId) {
           await postAction('/api/session/rollback', {session_id: sessionId, message_id: editId});
@@ -4334,73 +4553,82 @@
           await loadSessionMessages(sessionId);
           await loadWorkspaceFiles();
         }
-        if (steering) {
-          lastAppliedSteering = null;
-          await postAction('/api/steer', {session_id: sessionId, text: savedText});
-          showToast(lastAppliedSteering === savedText ? '补充引导已应用到当前任务' : '引导已接收，等待任务在安全点应用');
-        } else {
-          turnCancelled = false;
-          // 乐观渲染：先在本地把自己的消息画出来，不等服务端回包和 SSE 推送。
-          // 这样即使模型端迟迟不响应、或 SSE 抖动，用户也能立刻看到"我发出去了"。
-          // 纯前端增强，任何异常都不能影响正常提交。
-          try {
-            appendMessageElement({role: 'user', content: savedText, images: savedImg ? [savedImg] : []});
-            const timelineEl = document.getElementById('chat_timeline');
-            const localBubbles = timelineEl.querySelectorAll('.msg-user-container');
-            pendingUserBubble = localBubbles.length ? localBubbles[localBubbles.length - 1] : null;
-            if (pendingUserBubble) {
-              pendingUserBubble.dataset.pending = '1';
-              pendingUserBubble.dataset.msgText = savedText.trim();
-            }
-            isUserScrolledUp = false;
-            smartScrollToBottom(true);
-          } catch (renderErr) {
-            pendingUserBubble = null;
+        turnCancelled = false;
+        // 乐观渲染：先在本地把自己的消息画出来，不等服务端回包和 SSE 推送。
+        // 这样即使模型端迟迟不响应、或 SSE 抖动，用户也能立刻看到"我发出去了"。
+        // 纯前端增强，任何异常都不能影响正常提交。
+        try {
+          appendMessageElement({role: 'user', content: text, images: img ? [img] : []});
+          const timelineEl = document.getElementById('chat_timeline');
+          const localBubbles = timelineEl.querySelectorAll('.msg-user-container');
+          pendingUserBubble = localBubbles.length ? localBubbles[localBubbles.length - 1] : null;
+          if (pendingUserBubble) {
+            pendingUserBubble.dataset.pending = '1';
+            pendingUserBubble.dataset.msgText = text.trim();
           }
-          currentTurn = blankTurnState();
-          currentTurn.startTime = Date.now();
-          setTaskState(true, '正在提交任务…');
-          const data = await postAction('/api/chat', {
-            session_id:sessionId, scope:workspace, prompt:savedText, mode:'auto',
-            input_images:savedImg ? [savedImg] : [],
-            model:document.getElementById('model_selector')?.value || '',
-            thinking_effort:document.getElementById('thinking_selector')?.value || 'none'
-          });
-          if (data.title) {
-            document.getElementById('top_session_name').textContent = data.title;
-            loadSessions(false);
+          isUserScrolledUp = false;
+          smartScrollToBottom(true);
+        } catch (renderErr) {
+          pendingUserBubble = null;
+        }
+        currentTurn = blankTurnState();
+        currentTurn.startTime = Date.now();
+        setTaskState(true, '正在提交任务…');
+        const data = await postAction('/api/chat', {
+          session_id:sessionId, scope:workspace, prompt:text, mode:'auto',
+          input_images:img ? [img] : [],
+          model:document.getElementById('model_selector')?.value || '',
+          thinking_effort:document.getElementById('thinking_selector')?.value || 'none'
+        });
+        if (data.queued) {
+          // 后端认为上一轮还没收尾（竞态）：撤掉乐观气泡，退回队列等下一次机会
+          if (pendingUserBubble && pendingUserBubble.isConnected) {
+            const g = pendingUserBubble.closest('.message-group');
+            if (g) g.remove(); else pendingUserBubble.remove();
           }
+          pendingUserBubble = null;
+          setTaskState(true, '任务仍在运行中…');
+          if (!fromQueue) enqueuePendingMessage(text);
+          return false;
+        }
+        if (data.title) {
+          document.getElementById('top_session_name').textContent = data.title;
+          loadSessions(false);
         }
         isUserScrolledUp = false;
         smartScrollToBottom(true);
+        return true;
       } catch (err) {
-        // 提交失败时，恢复输入框内容，并撤掉本地乐观渲染的那条消息
+        // 提交失败时，撤掉本地乐观渲染的那条消息
         if (pendingUserBubble && pendingUserBubble.isConnected) {
           const g = pendingUserBubble.closest('.message-group');
           if (g) g.remove(); else pendingUserBubble.remove();
         }
         pendingUserBubble = null;
-        input.value = savedText;
-        // 图片在发送时被立刻清空了，失败时要放回输入区，不能凭空丢掉
-        if (savedImg) {
-          currentAttachedImage = savedImg;
-          currentAttachedImageName = savedImgName || '待发送图片';
-          const thumb = document.getElementById('composer_img_thumb');
-          const bar = document.getElementById('composer_img_bar');
-          const nameEl = document.getElementById('composer_img_name');
-          if (thumb) thumb.src = savedImg;
-          if (nameEl) nameEl.textContent = currentAttachedImageName;
-          if (bar) bar.classList.remove('hidden');
+        if (!fromQueue) {
+          // 手动发送失败：恢复输入框内容；图片也放回输入区，不能凭空丢掉
+          input.value = text;
+          if (img) {
+            currentAttachedImage = img;
+            currentAttachedImageName = imgName || '待发送图片';
+            const thumb = document.getElementById('composer_img_thumb');
+            const bar = document.getElementById('composer_img_bar');
+            const nameEl = document.getElementById('composer_img_name');
+            if (thumb) thumb.src = img;
+            if (nameEl) nameEl.textContent = currentAttachedImageName;
+            if (bar) bar.classList.remove('hidden');
+          }
+          resizeComposer();
         }
-        resizeComposer();
-        showToast('提交失败：' + err.message, 'error');
-        if (!steering) setTaskState(false);
+        setTaskState(false);
+        showToast((fromQueue ? '排队消息发送失败：' : '提交失败：') + err.message, 'error');
+        return false;
       } finally {
         submissionPending = false;
         button.disabled = false;
         input.readOnly = false;
-        document.getElementById('btn_attach_img').disabled = false;
-        input.focus();
+        attachBtn.disabled = false;
+        if (!fromQueue) input.focus();
       }
     }
 
@@ -5510,6 +5738,7 @@
       // 表现为"发出去的消息看不到、处理流程看不到，只有全部跑完才一起出现"。
       // 所以这里无条件补一次连接（setupSSE 自身幂等，已连上会直接返回）。
       if (currentSessionId) setupSSE(currentSessionId);
+      loadPendingQueue(currentSessionId);
       await loadWorkspaceFiles();
     });
   

@@ -153,12 +153,13 @@ DEFAULT_CONFIG["proactive"].update(
         "cooldown_sec": 180,
         "error_ttl_sec": 300,
         "quiet_hours": [0, 7],
-        "daily_limit": 12,
         "clipboard_store_text": False,
         "notification_channel": "pet",
         "notification_target": "",
         "auto_followup": True,
-        "allow_readonly_followup": False,
+        # 主动提醒发言前的只读核实通道。关掉它等于允许模型凭空描述桌面状态，
+        # 所以默认开启；关掉后断言型提醒会静默丢弃，而不是退回写死文案。
+        "allow_readonly_followup": True,
         "muted": False,
     }
 )
@@ -316,7 +317,6 @@ def validate_config(cfg):
         ("proactive", "idle_threshold_sec", 15, 86400),
         ("proactive", "cooldown_sec", 1, 86400),
         ("proactive", "error_ttl_sec", 10, 3600),
-        ("proactive", "daily_limit", 0, 1000),
         ("runtime", "max_output_chars", 1000, 100000),
         ("runtime", "request_timeout_sec", 1, 600),
         ("runtime", "stream_finish_grace_sec", 0.2, 60),

@@ -10,6 +10,53 @@ from core.config import load_config
 # 桌宠对话真实所在的会话（main 空间），主动决策要读这一份上下文。
 PET_SESSION_ID = "main:pet"
 
+# 断言型主动消息的"证据闸门"。
+# 这些词是在对世界下结论（问题解决了/问题还在），必须同时给出实际看到的东西。
+# 没有依据的结论一律拦下——宁可这次不说话，也不要把"错误计时器还没到期"
+# 说成"仍然检测到异常"。
+ASSERTION_WORDS = (
+    "已解决",
+    "已修复",
+    "已恢复正常",
+    "仍然异常",
+    "仍检测到异常",
+    "已经好了",
+    "恢复正常",
+    "不再出现",
+    "没再出现",
+    "已帮你",
+    "已替你",
+    "已经帮你",
+    "已经替你",
+)
+# 证据必须指向"实际看到了什么"，而不是被断言的对象本身。
+# 注意这里刻意不收"报错"：写死文案"仍检测到异常迹象"里就带着报错语境，
+# 把它当证据等于自证，闸门就白设了。
+EVIDENCE_WORDS = (
+    "截图",
+    "屏幕",
+    "窗口",
+    "标题",
+    "界面",
+    "画面",
+    "显示",
+    "看到",
+    "读到",
+    "文件里",
+    "文件内容",
+    "日志里",
+    "剪贴板里",
+)
+
+
+def assertion_grounded(text):
+    """断言型文案是否附带了可见证据；无断言词的文案直接放行。"""
+    if not text:
+        return False
+    if not any(word in text for word in ASSERTION_WORDS):
+        return True
+    return any(word in text for word in EVIDENCE_WORDS)
+
 
 class ProactiveEngine:
     def __init__(
@@ -22,10 +69,14 @@ class ProactiveEngine:
         notify_callback=None,
         dispatcher=None,
         followup_callback=None,
+        verify_callback=None,
     ):
         self.memory, self.perception, self.jev, self.vlm = memory, perception, jev, vlm
         self.skill_manager, self.notify_callback = skill_manager, notify_callback
         self.dispatcher, self.followup_callback = dispatcher, followup_callback
+        # 断言型消息发出前的只读核实通道（harness, readonly=True）。
+        # 没有它，主动提醒就只能靠模型凭空描述状态。
+        self.verify_callback = verify_callback
         self._stop = threading.Event()
         self._thread = None
         self._last_state = None
@@ -42,6 +93,12 @@ class ProactiveEngine:
         self._last_rest = 0
         self._watch_state = {}
         self._signals_until = {}
+        # 正在核实的跟进任务：租约到期后会被重复领取，用它避免同一个判断核实两遍、
+        # 最后发两条几乎一样的消息。
+        self._followup_inflight = set()
+        # 报错协助：发现即触发，所以需要自己防并发、防同一条报错处理两遍。
+        self._error_pending = False
+        self._error_assisted = ""
 
     def _environment_signals(self, state, previous, cfg, now):
         from pathlib import Path
@@ -150,7 +207,19 @@ class ProactiveEngine:
             return condition[7:].lower() in state.get("title", "").lower()
         return False
 
-    def _deliver(self, message, posture, task=None):
+    def _deliver(self, message, posture, task=None, verified=True):
+        """主动消息的唯一出口。
+
+        verified=False 表示"这是模型自己编的、没有核实过"——直接拦下不投递。
+        转述用户原话的提醒（reminder）不需要核实，核实过的断言型消息才允许放行。
+        任何新增的主动发言路径都会经过这里，所以闸门放在出口最省事。
+        """
+        message = (message or "").strip()
+        if not message:
+            return False
+        if not verified:
+            print("[Proactive] 未核实内容已拦截：" + message[:80])
+            return False
         if not self.notify_callback:
             return False
         try:
@@ -168,6 +237,143 @@ class ProactiveEngine:
             print("[Notification]", exc)
             return False
 
+    def _submit_followup(self, task, state):
+        """把"跟进核实"挪出感知线程。
+
+        核实要跑模型、可能还要截图和读文件，一次能拖几十秒。以前这里是同步调用，
+        等于每次跟进都把久坐/报错/文件监控整条感知链冻住——这也是核实通道
+        一直被默认关掉的实际原因。交给 dispatcher 后，投递在回调里完成。
+        """
+
+        def run():
+            try:
+                try:
+                    message = self.followup_callback(task, state)
+                except Exception as exc:
+                    self.memory.finish_intent(task["id"], False, str(exc))
+                    return
+                message = (message or "").strip()
+                if not message or not assertion_grounded(message):
+                    # 拿不到证据就不发言。以前这里会拼一句"仍检测到异常迹象"，
+                    # 而那句话只反映 error_ttl_sec 计时器还没走完，与真实状态无关。
+                    # terminal：核实过一次就够了，别每 15 秒重试一遍同一个判断。
+                    self.memory.finish_intent(
+                        task["id"], False, "核实未取得证据，已静默放弃", terminal=True
+                    )
+                    return
+                ok = self._deliver(message, "intent_reminder", task, verified=True)
+                self.memory.finish_intent(
+                    task["id"], ok, "" if ok else "通道未确认投递成功"
+                )
+            finally:
+                self._followup_inflight.discard(task["id"])
+
+        self._followup_inflight.add(task["id"])
+        if not self.dispatcher:
+            run()
+            return
+        future = self.dispatcher.submit(
+            "local:proactive:followup", run, background=True
+        )
+        if future.done():
+            # 队列满/正在退出时 submit 不抛异常，而是直接返回一个已失败的 future，
+            # run() 根本不会执行。不清掉标记的话，这条跟进会被自己永久 defer。
+            self._followup_inflight.discard(task["id"])
+            self.memory.finish_intent(task["id"], False, defer_sec=60)
+
+    def _spawn_error_assist(self, state, cfg, now):
+        """剪贴板里一出现报错就立刻核实，不等 tick 攒候选、等空闲、再过 jev。
+
+        原来这条路要 trigger 先成型、再等 idle>=10 秒、再由 jev 判一次，
+        报错最该被回应的十几秒全耗在等条件上。报错本身已经是明确信号，
+        这里直接把"核实 → 建议"跑起来；节奏仍由 cooldown 和 debug_assist
+        的冷却窗口控制，同一条报错也只处理一次。
+        """
+        if self._error_pending or not self._error_hash or not self.verify_callback:
+            return
+        if self._error_hash == self._error_assisted:
+            return
+        if (
+            cfg.get("muted")
+            or self.memory.notification_preferences("local")["muted"]
+            or self._quiet(cfg)
+            or state.get("locked")
+            or state.get("meeting")
+            or state.get("fullscreen")
+        ):
+            return
+        if now - self._last_intervene_time < cfg.get("cooldown_sec", 180):
+            return
+        if now - self._posture_last.get("debug_assist", 0) < 600:
+            return
+        self._error_pending = True
+        error_hash = self._error_hash
+        snapshot = dict(state, trigger="检测到报错迹象（剪贴板里出现了报错内容）")
+
+        def run():
+            try:
+                message, verified = self._verify(snapshot, "debug_assist")
+                if not message or not verified:
+                    return
+                task = {
+                    "scope": "local",
+                    "channel": cfg.get("notification_channel", "pet"),
+                    "target": cfg.get("notification_target", ""),
+                    "session_id": PET_SESSION_ID,
+                }
+                if not self._deliver(message, "debug_assist", task, verified=True):
+                    return
+                self._error_assisted = error_hash
+                self._last_intervene_time = time.time()
+                self._posture_last["debug_assist"] = time.time()
+                # 两分钟后再看一次：那时才需要判断"到底解决了没有"。
+                if cfg.get("auto_followup", True):
+                    self.memory.add_delayed_intent(
+                        time.time() + 120,
+                        "此前报错是否已经解决",
+                        scope="local",
+                        channel=task["channel"],
+                        target=task["target"],
+                        dedupe_key="error:" + error_hash,
+                        kind="followup",
+                    )
+            except Exception as exc:
+                print("[Proactive] 报错核实失败", exc)
+            finally:
+                self._error_pending = False
+
+        if not self.dispatcher:
+            run()
+            return
+        future = self.dispatcher.submit("local:proactive:error", run, background=True)
+        if future.done():
+            # 队列满时 submit 返回已失败的 future，run() 不会执行，标记得自己清。
+            self._error_pending = False
+
+    def _verify(self, state, posture):
+        """主动开口之前先核实：有证据的文案才允许出门。
+
+        返回 (message, verified)。模型判断出来的每一条结论（你还在报错、
+        你已经连续盯了 45 分钟）都必须先看一眼真实屏幕或文件。
+        没有核实通道就拿不到证据，此时返回空——宁可这次不说话，
+        也不要退回"让模型凭空描述桌面"的老路。
+        """
+        if not self.verify_callback:
+            return "", False
+        claim = state.get("trigger") or posture
+        try:
+            message = self.verify_callback(state, posture, claim)
+        except Exception as exc:
+            print("[Proactive] 核实失败", exc)
+            return "", False
+        message = (message or "").strip()
+        if not message or message.startswith(("【VLM", "【提示")):
+            return "", False
+        if not assertion_grounded(message):
+            print("[Proactive] 断言缺少证据，已丢弃：" + message[:80])
+            return "", False
+        return message, True
+
     @staticmethod
     def _quiet(cfg):
         hour = datetime.datetime.now().hour
@@ -184,7 +390,11 @@ class ProactiveEngine:
     def _tick(self, cfg):
         now = time.time()
         state = self._snapshot(cfg)
+        # has_error 的语义是"最近 error_ttl_sec 内见过报错信号"，它是个计时器，
+        # 不是复检结果。只允许用来解释"为什么现在来打扰"（trigger），
+        # 任何面向用户的文案都不能拿它当"问题还在"的依据。
         state["has_error"] = now < self._error_until
+        state["error_signal_recent"] = state["has_error"]
         idle = state["idle_sec"]
         threshold = cfg.get("idle_threshold_sec", 600)
         previous = self._last_state
@@ -217,6 +427,9 @@ class ProactiveEngine:
                     self._error_until = now + cfg.get("error_ttl_sec", 300)
                     self._error_hash = hashlib.sha256(clip.encode()).hexdigest()[:16]
                     state["has_error"] = True
+                    state["error_signal_recent"] = True
+                    # 报错是最需要当场回应的信号：发现就核实，不等下一轮候选判定。
+                    self._spawn_error_assist(state, cfg, now)
                 # Full clipboard text is opt-in; redact likely credentials even when enabled.
                 if cfg.get("clipboard_store_text"):
                     import re
@@ -252,6 +465,10 @@ class ProactiveEngine:
                 continue
             message = task["action_prompt"]
             if task["kind"] == "followup":
+                if task["id"] in self._followup_inflight:
+                    # 租约到期被重新领取，但上一轮核实还在跑：推后，别核实两遍。
+                    self.memory.finish_intent(task["id"], False, defer_sec=30)
+                    continue
                 if (
                     cfg.get("muted")
                     or preferences["muted"]
@@ -262,24 +479,19 @@ class ProactiveEngine:
                 ):
                     self.memory.finish_intent(task["id"], False, defer_sec=60)
                     continue
-                if cfg.get("allow_readonly_followup") and self.followup_callback:
-                    try:
-                        message = self.followup_callback(task, state)
-                    except Exception as exc:
-                        self.memory.finish_intent(task["id"], False, str(exc))
-                        continue
-                else:
-                    message = (
-                        "跟进："
-                        + message
-                        + "；当前"
-                        + (
-                            "仍检测到异常迹象。"
-                            if state["has_error"]
-                            else "此前异常信号已不再出现，需要我继续检查吗？"
-                        )
+                if not self.followup_callback or not cfg.get(
+                    "allow_readonly_followup", True
+                ):
+                    # 没有核实通道就不发。以前这里的兜底是拼一句固定文案，
+                    # 既不核实也不经模型，等于替用户编造结论。
+                    self.memory.finish_intent(
+                        task["id"], False, "未启用核实通道，已静默放弃", terminal=True
                     )
-            ok = self._deliver(message, "intent_reminder", task)
+                    continue
+                self._submit_followup(task, dict(state))
+                continue
+            # 走到这里的都是转述用户原话的提醒（"10 点开会"），内容真实性无需核实。
+            ok = self._deliver(message, "intent_reminder", task, verified=True)
             self.memory.finish_intent(
                 task["id"], ok, "" if ok else "通道未确认投递成功"
             )
@@ -303,8 +515,8 @@ class ProactiveEngine:
             or self._pending
         ):
             return
-        if self.memory.notification_count_today() >= cfg.get("daily_limit", 12):
-            return
+        # 单日通知上限已移除：本地模型不产生调用成本，限制次数只会让该提醒的时候闭嘴。
+        # 真正的节奏控制交给 cooldown_sec 与各 posture 的冷却窗口。
         # Check active goals cadence
         goal_ready = False
         if hasattr(self.memory, "goals") and now - getattr(self, "_last_goal_check", 0) > 300:
@@ -332,10 +544,8 @@ class ProactiveEngine:
                             state["goal_nudge"] = f"目标《{g['title']}》推进时刻：当前步骤 #{curr['id']} [{curr['title']}]"
                             self._last_goal_check = now
                             break
-        # Model gate receives only actionable state changes or actual pending context.
-        # 报错检测放宽到空闲 10 秒：很多人复制报错后立刻继续敲键盘，
-        # 原来的 30 秒门槛会把"正在读报错"的这一刻整段滤掉。
-        error_ready = state["has_error"] and idle >= 10
+        # 报错不再走这条候选路径：剪贴板一出现报错，_spawn_error_assist 就当场核实，
+        # 这里再判一次只会导致同一件事被处理两遍。
         rest_ready = state["active_minutes"] >= 45 and now - self._last_rest > 2700
         # 饭点是一个 45 分钟的窗口：同一个窗口只提醒一次。
         # 否则窗口内每隔一分钟就会问一次模型，既烧预算又没意义。
@@ -346,8 +556,7 @@ class ProactiveEngine:
         )
         meal_ready = bool(meal_key) and meal_key != self._last_meal_key
         candidate = (
-            error_ready
-            or rest_ready
+            rest_ready
             or returned
             or state["environment_events"]
             or state["distraction_switch"]
@@ -357,18 +566,16 @@ class ProactiveEngine:
         )
         if not candidate:
             return
-        # 久坐提醒和报错协助本来就发生在"人正坐在电脑前"的时候，
-        # 用 idle>=15 当门槛等于把这两类永久挡在门外（人越专注越不可能有 15 秒空白）。
+        # 久坐提醒本来就发生在"人正坐在电脑前"的时候，
+        # 用 idle>=15 当门槛等于把它永久挡在门外（人越专注越不可能有 15 秒空白）。
         # 只对"环境变化 / 饭点 / 深夜"这类需要人不在打字的场景保留空闲门槛。
-        if idle < 15 and not returned and not (rest_ready or error_ready):
+        if idle < 15 and not returned and not rest_ready:
             return
         if meal_ready:
             self._last_meal_key = meal_key
         # 把"这次为什么会来打扰"写进状态里。不写这一句，模型只能从一堆原始字段
         # 里自己猜，往往判定"没有明确收益"而保持静默——主动提醒就永远发不出来。
         reasons = []
-        if error_ready:
-            reasons.append("检测到报错迹象（剪贴板里出现了报错内容）")
         if rest_ready:
             reasons.append(
                 f"已连续专注 {state['active_minutes']} 分钟，达到 45 分钟久坐提醒阈值"
@@ -387,7 +594,6 @@ class ProactiveEngine:
             reasons.append("已经是深夜时段")
         state["trigger"] = "；".join(reasons)
         fingerprint = (
-            self._error_hash if error_ready else "",
             state["active_minutes"] // 45 if rest_ready else 0,
             returned,
             json.dumps(state["environment_events"], sort_keys=True),
@@ -427,6 +633,10 @@ class ProactiveEngine:
     def _decide(self, state, cfg):
         from core.decision_context import build_decision_context
 
+        # 没有核实通道，断言型主动提醒就只剩"凭状态编话"这一条路，干脆什么都不做。
+        if not cfg.get("allow_readonly_followup", True):
+            return
+
         # 桌宠的对话真实落在 main:pet（main 空间）。以前这里读的是 local:pet，
         # 那条会话基本是空的，于是主动提醒永远只看得到桌面活动、看不到刚聊过什么。
         context = build_decision_context(self.memory, PET_SESSION_ID, "main")
@@ -448,8 +658,10 @@ class ProactiveEngine:
                         "仅在异常停顿、45分钟疲劳、离开后归来有待办、用户指定监控文件有变化、"
                         "长程目标推进时刻、明确专注目标下切到娱乐、或已启用饭点/深夜关怀时考虑提醒。"
                         "状态里的 trigger 字段说明了这次为什么会来打扰你：trigger 非空即表示"
-                        "已经出现具体信号（例如连续专注满 45 分钟、检测到报错、刚回到电脑前），"
+                        "已经出现具体信号（例如连续专注满 45 分钟、刚回到电脑前），"
                         "这时 intervene 应判为真；没有具体信号、也没有明确收益时才保持静默。"
+                        "注意 trigger 只是线索，不是已核实的结论：报错是否仍在、人是否真的"
+                        "专注了 45 分钟，都由后续只读核实确认，你不要在判断里把它当成事实。"
                     ),
                 },
                 "posture": {
@@ -505,11 +717,10 @@ class ProactiveEngine:
             # 决策期间人回到了电脑前（决策时是空闲的，现在在敲键盘）——提醒已经过时，丢掉。
             # 久坐/报错这类本来就是冲着"正在用电脑的人"去的，不能只因为 idle 低就丢。
             return
-        message = self.vlm.generate_bubble_reply(
-            "根据以下状态给出一句具体、克制的协助建议，不要声称已操作：" + snapshot,
-            context=posture,
-        )
-        if not message or message.startswith(("【VLM", "【提示")):
+        # 断言型消息：模型判断出"你还在报错""你该休息了"，必须先只读核实真实屏幕/文件，
+        # 拿不出证据就不开口。这里也顺带吸收掉原来的 VLM 气泡生成。
+        message, verified = self._verify(state, posture)
+        if not message:
             return
         live = load_config()["proactive"]
         latest = self._snapshot(live)
@@ -536,7 +747,7 @@ class ProactiveEngine:
             "target": target,
             "session_id": PET_SESSION_ID,
         }
-        if self._deliver(message, posture, task):
+        if self._deliver(message, posture, task, verified=verified):
             self._last_intervene_time = time.time()
             self._posture_last[posture] = time.time()
             if posture == "sedentary_rest_reminder":

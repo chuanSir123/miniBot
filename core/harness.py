@@ -1687,7 +1687,7 @@ class AgentHarness:
             return {"ok": False, "error": "当前来源没有此工具权限"}
         from core.qq_authority import tool_access
         if getattr(self._local, "readonly", False) and name not in {"read_file", "capture_screen", "list_media", "get_media", "list_skills", "read_history", "read_chat_history"} and not (name == "manage_permissions" and args.get("action") == "list"):
-            return {"ok": False, "error_code": "READ_ONLY", "error": "本次任务只读，不能执行该操作；请根据真实情况整理回复"}
+            return {"ok": False, "error_code": "READ_ONLY", "retryable": False, "error": "本次任务只读，命令和技能都不能执行。改用 capture_screen 看屏幕、read_file 读文件、read_history 读历史来核实，并说明你实际看到的依据；看不到就说看不到，不要猜。"}
         is_web = (channel == "web" or session_id.startswith("web:"))
         if not is_web and not tool_access(scope, name, args, actor=actor):
             return {"ok": False, "error_code": "PERMISSION_DENIED", "tool": name, "retryable": False,

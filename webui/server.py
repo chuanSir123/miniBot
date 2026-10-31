@@ -1286,16 +1286,37 @@ class ConfigServerHandler(BaseHTTPRequestHandler):
 
             app = self._get_app()
             is_running = app.harness.is_session_active(session_id)
+            is_web_channel = session_id.startswith("web:")
 
-            # Explicit steer or mid-run steering
-            if mode == "steer" or is_running:
-                # 检查第一层 Jev 判定
+            # 显式引导：只有用户手动点「引导」才注入，模型不会中断
+            if mode == "steer" and is_running:
+                ok = app.harness.inject_steering(session_id, prompt)
+                broadcast_sse(session_id, "steering", {"text": prompt, "success": ok})
+                self._set_headers(200)
+                self.wfile.write(json.dumps({
+                    "success": ok,
+                    "steered": True,
+                    "message": "实时引导已注入活动任务，正在调整方向！" if ok else "引导注入失败"
+                }, ensure_ascii=False).encode("utf-8"))
+                return
+
+            # Web 端运行中二次发送：不自动判定为引导，交给前端排队等待
+            # （用户可以在队列里手动点「引导」立即注入，或编辑/删除）
+            if is_running and is_web_channel:
+                self._set_headers(200)
+                self.wfile.write(json.dumps({
+                    "success": True,
+                    "queued": True,
+                    "message": "当前任务正在运行，消息已排队等待任务结束后发送"
+                }, ensure_ascii=False).encode("utf-8"))
+                return
+
+            # 非 Web 渠道（pet / QQ）保留 Jev 自动判定意图的兜底路径
+            if is_running:
                 task_state = app.memory.get_task_state(session_id) or {}
                 task_state["is_running"] = is_running
-                intent = "steering" if mode == "steer" else app.jev.classify_steering_intent(prompt, task_state=task_state)
-
-                if intent == "steering" and is_running:
-                    # Inject steering mid-run into active Harness!
+                intent = app.jev.classify_steering_intent(prompt, task_state=task_state)
+                if intent == "steering":
                     ok = app.harness.inject_steering(session_id, prompt)
                     broadcast_sse(session_id, "steering", {"text": prompt, "success": ok})
                     self._set_headers(200)

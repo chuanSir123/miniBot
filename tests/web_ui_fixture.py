@@ -120,6 +120,17 @@ class Handler(BaseHTTPRequestHandler):
             for events in list(EVENTS):
                 events.put(("cancelled", {"count": 0}))
             self.reply({"success": True})
+        elif path == "/api/chat":
+            # 仅用于本地 QA：模拟任务被接受并进入运行态
+            STATE["running"] = True
+            self.reply({"success": True, "session_id": SESSION,
+                        "title": (body.get("prompt") or TITLE)[:24], "status": "running"})
+        elif path == "/api/qa/complete":
+            # 仅用于本地 QA：让前端收到一次 complete，验证排队消息自动发出
+            STATE["running"] = False
+            for events in list(EVENTS):
+                events.put(("complete", {"reply": "本轮结束"}))
+            self.reply({"success": True})
         else:
             self.reply({"success": False, "error": "fixture only supports steering/cancel"}, 400)
 

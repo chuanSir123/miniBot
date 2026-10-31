@@ -41,12 +41,11 @@
       0,
       7
     ],
-    "daily_limit": 12,
     "clipboard_store_text": false,
     "notification_channel": "pet",
     "notification_target": "",
     "auto_followup": true,
-    "allow_readonly_followup": false,
+    "allow_readonly_followup": true,
     "muted": false,
     "enable_time_reminders": false,
     "enable_focus_nudge": false,

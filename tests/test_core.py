@@ -455,7 +455,8 @@ class ProactiveTests(Fixture):
         engine._tick(config.load_config()["proactive"])
         self.assertEqual(self.memory.list_intents()[0]["status"], "pending")
 
-    def test_idle_no_cloud_and_error_persists(self):
+    def test_idle_no_cloud_and_error_triggers_assist(self):
+        """闲时不惊动模型；剪贴板一出现报错就立刻核实，不等候选判定。"""
         class Jev:
             def is_configured(self):
                 return True
@@ -465,18 +466,35 @@ class ProactiveTests(Fixture):
                 return {"intervene": 0}
 
         calls = []
+        sent = []
         perception = FakePerception()
-        engine = ProactiveEngine(self.memory, perception, Jev(), None, None)
+        # 正在打字：旧路径的 idle>=10 门槛会把这条报错整个滤掉。
+        perception.state["idle_sec"] = 0
+        engine = ProactiveEngine(
+            self.memory,
+            perception,
+            Jev(),
+            None,
+            None,
+            lambda *a, **k: sent.append(a[0]) or True,
+            None,
+            None,
+            lambda state, posture, claim: "屏幕上还开着一堆 Traceback，要一起看吗？",
+        )
         cfg = config.load_config()["proactive"]
         cfg["quiet_hours"] = [0, 0]
         engine._tick(cfg)
         self.assertEqual(calls, [])
+        self.assertEqual(sent, [])
         perception.clip = "Error: broken"
         engine._tick(cfg)
         self.assertTrue(engine._last_state["has_error"])
+        # 直接核实并投递：既不等空闲，也不额外占一次 jev 判定。
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(calls, [])
+        perception.clip = "Error: broken"
         engine._tick(cfg)
-        self.assertTrue(engine._last_state["has_error"])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(sent), 1)
 
     def test_return_transition(self):
         p = FakePerception()
@@ -932,6 +950,9 @@ class EnvironmentTests(Fixture):
             Brain(),
             None,
             lambda *a, **k: sent.append(a) or True,
+            None,
+            None,
+            lambda state, posture, claim: "看到 build.log 里显示 completed build，要看结果吗？",
         )
         engine._tick(cfg)
         self.assertFalse(calls)
@@ -961,6 +982,45 @@ class EnvironmentTests(Fixture):
             {"reminder": "delivered", "followup": "pending"},
         )
 
+    def test_followup_without_evidence_is_dropped(self):
+        """跟进必须靠证据说话：写死的那句"仍检测到异常迹象"不能再发出去。"""
+        cfg = config.load_config()["proactive"]
+        cfg["quiet_hours"] = [0, 0]
+        sent = []
+        self.memory.add_delayed_intent(0, "此前报错是否已经解决", kind="followup")
+        engine = ProactiveEngine(
+            self.memory,
+            FakePerception(),
+            FakeJev(),
+            None,
+            None,
+            lambda *a, **k: sent.append(a[0]) or True,
+            None,
+            lambda task, state: "跟进：此前报错是否已经解决；当前仍检测到异常迹象。",
+        )
+        engine._tick(cfg)
+        self.assertEqual(sent, [])
+        self.assertEqual(self.memory.list_intents()[0]["status"], "failed")
+
+    def test_followup_with_evidence_is_delivered(self):
+        cfg = config.load_config()["proactive"]
+        cfg["quiet_hours"] = [0, 0]
+        sent = []
+        self.memory.add_delayed_intent(0, "此前报错是否已经解决", kind="followup")
+        engine = ProactiveEngine(
+            self.memory,
+            FakePerception(),
+            FakeJev(),
+            None,
+            None,
+            lambda *a, **k: sent.append(a[0]) or True,
+            None,
+            lambda task, state: "屏幕上那个 Traceback 还开着，需要我一起看吗？",
+        )
+        engine._tick(cfg)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Traceback", sent[0])
+
     def test_final_recheck_suppresses_late_notification(self):
         config.save_config({"proactive": {"quiet_hours": [0, 0]}})
         cfg = config.load_config()["proactive"]
@@ -976,6 +1036,11 @@ class EnvironmentTests(Fixture):
                 perception.state["idle_sec"] = 0
                 return "message generated too late"
 
+        def verify(state, posture, claim):
+            # 核实期间人回到了电脑前：发出的文案本身合规，但复查应该判它过期。
+            perception.state["idle_sec"] = 0
+            return "看到屏幕上还开着 Traceback，需要我一起看吗？"
+
         engine = ProactiveEngine(
             self.memory,
             perception,
@@ -983,6 +1048,9 @@ class EnvironmentTests(Fixture):
             Brain(),
             None,
             lambda *a, **k: sent.append(a) or True,
+            None,
+            None,
+            verify,
         )
         engine._decide(dict(perception.state, has_error=True), cfg)
         self.assertEqual(sent, [])

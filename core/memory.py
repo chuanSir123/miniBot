@@ -587,7 +587,8 @@ class MiniMemory:
         # Compatibility alias: claiming no longer means delivered.
         return self.claim_due_intents()
 
-    def finish_intent(self, task_id, success, error="", defer_sec=None):
+    def finish_intent(self, task_id, success, error="", defer_sec=None, terminal=False):
+        """收尾一条意图。terminal=True 表示"不要再重试"（例如核实后确认不值得打扰）。"""
         with self._get_conn() as db:
             row = db.execute(
                 "SELECT attempts FROM tasks_v2 WHERE id=? AND status='running'",
@@ -597,7 +598,9 @@ class MiniMemory:
                 return
             attempts = row[0] + (0 if defer_sec is not None else 1)
             status = (
-                "delivered" if success else ("failed" if attempts >= 5 else "pending")
+                "delivered"
+                if success
+                else ("failed" if (terminal or attempts >= 5) else "pending")
             )
             delay = defer_sec if defer_sec is not None else min(300, 2**attempts * 5)
             db.execute(
