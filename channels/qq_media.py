@@ -136,6 +136,10 @@ class MessageParser:
         self.visited, self.nodes, self.requests, self.audios = set(), 0, 0, 0
         self.media_requests = 0
         self.mentioned, self.reply_to_bot = False, False
+        # 本条消息 @ 了谁。只留 qq 号（OneBot 的 at 段不一定带昵称），
+        # 名字由 qq_policy 用近期发言补——@ 对象是"不是给我"的确定性信号，
+        # 不能再让决策模型对着一串数字猜。
+        self.at_targets = []
 
     async def request(self, action, params, media=False):
         # 引用/合并消息的递归上限与附图、语音的下载调用分开计数，
@@ -226,7 +230,8 @@ class MessageParser:
         raw_text = "\n".join(self.parts)
         text = raw_text[:16000]
         return {"text":text, "raw_text": raw_text, "direct_text":" ".join(self.direct)[:12000], "images":self.images, "media": self.media, "quoted_messages": self.quoted_messages,
-                "errors":self.errors, "mentioned":self.mentioned,"reply_to_bot":self.reply_to_bot}
+                "errors":self.errors, "mentioned":self.mentioned,"reply_to_bot":self.reply_to_bot,
+                "at_targets": self.at_targets}
 
     async def cached_quote(self, message_id):
         from core.media_store import MediaStore
@@ -272,6 +277,10 @@ class MessageParser:
                 elif kind == "at":
                     if not quoted:
                         self.direct.append("[@" + str(data.get("qq", "")) + "]")
+                        self.at_targets.append({
+                            "qq": str(data.get("qq", "")),
+                            "name": str(data.get("name") or "")[:40],
+                        })
                     if not quoted and str(data.get("qq"))==str(self.event.get("self_id")):
                         self.mentioned = True
                     self.parts.append("[@"+str(data.get("qq",""))+"]")

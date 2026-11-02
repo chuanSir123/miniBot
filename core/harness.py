@@ -270,9 +270,11 @@ HARNESS_TOOLS += [
           {"reason": {"type": "string", "description": "重启原因，写进日志，一句话即可"}}),
     _tool(
         "schedule_reminder",
-        "创建持久化提醒或条件跟进；Unix秒时间戳。条件支持 idle、active、error、error_cleared、window:文本。",
+        "创建持久化定时任务；trigger_at为首次执行Unix秒时间戳。kind=reminder只发提醒，agent到点调用智能体执行。repeat_rule留空为一次性，支持daily HH:MM、weekdays HH:MM、weekly:0 HH:MM（周一0）、interval:秒（至少60）。使用本机时区。条件支持 idle、active、error、error_cleared、window:文本。",
         {
             "trigger_at": {"type": "number"},
+            "repeat_rule": {"type": "string"},
+            "kind": {"type": "string", "enum": ["reminder", "agent"]},
             "message": {"type": "string"},
             "condition": {"type": "string"},
         },
@@ -2002,6 +2004,9 @@ class AgentHarness:
                     channel,
                     target,
                     dedupe,
+                    kind=args.get("kind", "reminder"),
+                    repeat_rule=args.get("repeat_rule", ""),
+                    actor=actor,
                 )
                 return {"ok": True, "task_id": task}
             if name == "read_history":

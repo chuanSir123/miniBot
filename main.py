@@ -131,6 +131,7 @@ class MiniBotApp:
             self.dispatcher,
             self._followup,
             self._verify_proactive,
+            self._execute_scheduled_task,
         )
         self._unsubscribe = subscribe(self._config_changed)
 
@@ -994,6 +995,14 @@ class MiniBotApp:
             return ""
         return reply
 
+    def _execute_scheduled_task(self, task):
+        return self.harness.run(
+            "执行用户先前创建的定时任务，返回实际结果；不要再次创建同一任务。\n" + task["action_prompt"],
+            session_id=task["session_id"], scope=task["scope"],
+            channel=task["channel"], target=task["target"],
+            actor=task.get("actor", ""), allow_tools=True,
+        )
+
     def _followup(self, task, state):
         """跟进型主动消息：和普通主动提醒走同一套只读核实。"""
         if task["scope"] != "local":
@@ -1038,8 +1047,9 @@ class MiniBotApp:
         from core.qq_authority import actor_from_event
         actor = actor_from_event(event)
         decision_context = build_decision_context(self.memory, session, scope, event, actor=actor)
+        # context 在前、message 在后：state 是共享前缀，当前这条消息放最后才不打断缓存。
         result = self.jev.decide(
-            json.dumps({"message": text[:6000], "context": decision_context}, ensure_ascii=False),
+            json.dumps({"context": decision_context, "message": text[:6000]}, ensure_ascii=False),
             {
                 "help": {
                     "type": "noul",

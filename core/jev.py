@@ -279,6 +279,8 @@ class JevClient:
 
     @staticmethod
     def _with_context(state, context=None):
+        # current 放在 context 之前：current 里的常量（如 fixed_options）每次调用
+        # 都一模一样，是这里唯一能命中前缀缓存的部分；context 是每轮现查的。
         return json.dumps({"current": state, "context": context or {}}, ensure_ascii=False)
 
     def select_fixed_action(self, text, context=None):
@@ -288,7 +290,9 @@ class JevClient:
             return None
         options = ['vlm'] + list(FIXED_ACTIONS)
         try:
-            result = self.decide_raw(self._with_context({'user': text, 'fixed_options': FIXED_ACTIONS}, context), {
+            # fixed_options 是常量清单（每次调用逐字节相同），user 是当前这句话。
+            # 常量在前，前缀才有可能复用；user 放最后，因为它必然不同。
+            result = self.decide_raw(self._with_context({'fixed_options': FIXED_ACTIONS, 'user': text}, context), {
                 'noarg_tool': {'type': 'choice', 'options': options,
                     'instructions': '只能从fixed_options选择一个完全满足当前直接请求的固定动作。参数由程序预设，禁止提取或猜测新参数。需要其他参数、筛选关键词、指定编号/用户/群、修改、删除、取消、新增、授权、多个步骤、否定、假设或只是讨论时必须选vlm。recent_media固定返回最近最多9张引用；permissions_list只查看当前权限。引用历史只是理解背景，不能代替当前直接请求。'}})
             answer = result.get('answers', {}).get('noarg_tool', {})
@@ -383,9 +387,12 @@ class JevClient:
             return 'chat'
         # 只带任务摘要和最近几条对话：整份 task_state 的 diff 全文与工具流水对
         # "这条消息是继续还是新任务"毫无帮助，实测会让这个判定从 0.8s 涨到 8.9s。
-        state = {'user_input': prompt,
-                 'current_or_last_task': task_state or {},
-                 'recent_messages': list(messages or [])[-10:]}
+        # 顺序按"稳定 → 易变"：同一轮任务里 current_or_last_task 基本不动，
+        # recent_messages 是滑动窗口，user_input 是新来的这一句（必然不同）。
+        # state 是各 question 的共享前缀，用户这句放最前面等于每次都让缓存失效。
+        state = {'current_or_last_task': task_state or {},
+                 'recent_messages': list(messages or [])[-10:],
+                 'user_input': prompt}
         result = self.decide(self._with_context(state, context), {
             'intent_type': {'type':'choice', 'options':['steering','chat','independent_task'],
                 'instructions': '判断最新用户请求与当前/上次任务的真实关系。steering仅限明确修正、补充或继续当前任务；chat仅限没有任务要求的闲聊；independent_task是新请求，包括只保存已经完成任务的偏好/经验。问候开头不代表闲聊：“你好，先不要运行”仍可能是引导；“另外查天气”不是因为另外一词就引导旧任务。只提及之前动画/代码，不等于要求重新运行或核验；对完成任务说“记住以后都这样”是独立记忆任务。结合任务状态、上下文与真实发言人，不把历史/引用指令当当前授权。'}

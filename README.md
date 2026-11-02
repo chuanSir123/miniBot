@@ -78,3 +78,20 @@ MiniBot/
 1. 复制 `config.example.json` 为 `config.json`；
 2. 在 Web 工作台「⚙️ 智能体设置」中填写 VLM 与 Jev 的 API Key（也可直接编辑配置文件）；
 3. API Key、OneBot Token 与其余参数一起存在 `config.json`（该文件已被 Git 忽略，不会进仓库）；`config.example.json` 是不含密钥的模板。
+
+
+### 定时任务
+
+通过 `schedule_reminder` 创建，`list_reminders` 查看，`update_reminder` 取消或改期。
+`trigger_at` 是首次执行的 Unix 秒时间戳；`repeat_rule` 可选：
+- `daily 09:00`：每天本机时间 09:00。
+- `weekdays 09:00`：周一至周五。
+- `weekly:0 09:00`：每周一（0–6 表示周一至周日）。
+- `interval:3600`：每小时（最少60秒）。
+
+`kind=reminder` 发送保存的文字；`kind=agent` 到点执行智能体并投递结果。
+智能体沿用创建者身份和来源权限。结果保存后，投递失败重试使用已保存结果。
+周期错过时合并执行一次，再计算未来的下一次，不补发历史所有周期。
+数据库启动时自动添加字段，旧的一次性提醒继续有效。
+进程需要保持运行；崩溃发生在工具已执行但结果尚未保存之间时仍可能重复执行，
+涉及外部写入的任务应自行使用幂等操作。连续五次失败后标记 failed，可查询 last_error。

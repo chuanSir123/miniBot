@@ -84,6 +84,10 @@ class MiniMemory:
                 CREATE TABLE IF NOT EXISTS qq_moderation (
                     user_id TEXT PRIMARY KEY, strikes INTEGER, updated_at REAL);
             """)
+            columns = {r[1] for r in db.execute("PRAGMA table_info(tasks_v2)")}
+            for name, definition in {"repeat_rule": "TEXT DEFAULT ''", "actor": "TEXT DEFAULT ''", "scheduled_at": "REAL DEFAULT 0", "result": "TEXT DEFAULT ''"}.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE tasks_v2 ADD COLUMN {name} {definition}")
             if not db.execute("SELECT 1 FROM chat_messages LIMIT 1").fetchone():
                 db.execute("INSERT INTO chat_messages(scope,payload,created_at) SELECT scope,content,created_at FROM events_v2 WHERE source='qq_chat' ORDER BY id")
             try:
@@ -538,13 +542,19 @@ class MiniMemory:
         target="",
         dedupe_key=None,
         kind="reminder",
+        repeat_rule="",
+        actor="",
     ):
+        from core.scheduling import next_trigger
+        next_trigger(repeat_rule, float(trigger_at), float(trigger_at))
+        if kind not in ("reminder", "followup", "agent"):
+            raise ValueError("不支持的任务类型")
         if not math.isfinite(float(trigger_at)) or not action_prompt.strip():
             raise ValueError("invalid reminder")
         with self._get_conn() as db:
             db.execute(
                 """INSERT OR IGNORE INTO tasks_v2(scope,session_id,channel,target,trigger_at,
-                condition_desc,action_prompt,dedupe_key,created_at,kind) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                condition_desc,action_prompt,dedupe_key,created_at,kind,repeat_rule,actor,scheduled_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     scope,
                     session_id,
@@ -556,6 +566,9 @@ class MiniMemory:
                     dedupe_key,
                     time.time(),
                     kind,
+                    repeat_rule,
+                    actor,
+                    float(trigger_at),
                 ),
             )
             if dedupe_key:
@@ -591,7 +604,7 @@ class MiniMemory:
         """收尾一条意图。terminal=True 表示"不要再重试"（例如核实后确认不值得打扰）。"""
         with self._get_conn() as db:
             row = db.execute(
-                "SELECT attempts FROM tasks_v2 WHERE id=? AND status='running'",
+                "SELECT attempts,repeat_rule,scheduled_at,trigger_at FROM tasks_v2 WHERE id=? AND status='running'",
                 (task_id,),
             ).fetchone()
             if row is None:
@@ -603,9 +616,15 @@ class MiniMemory:
                 else ("failed" if (terminal or attempts >= 5) else "pending")
             )
             delay = defer_sec if defer_sec is not None else min(300, 2**attempts * 5)
+            due = time.time() + delay
+            if success and row[1]:
+                from core.scheduling import next_trigger
+                due = next_trigger(row[1], row[2] or row[3], time.time())
+                status, attempts = "pending", 0
+                db.execute("UPDATE tasks_v2 SET scheduled_at=? WHERE id=?", (due, task_id))
             db.execute(
                 "UPDATE tasks_v2 SET status=?,attempts=?,lease_until=0,last_error=?,trigger_at=? WHERE id=? AND status='running'",
-                (status, attempts, error[:500], time.time() + delay, task_id),
+                (status, attempts, error[:500], due, task_id),
             )
 
     def list_intents(self, scope="local", session_id=None):
@@ -634,8 +653,8 @@ class MiniMemory:
                 )
             else:
                 cur = db.execute(
-                    f"UPDATE tasks_v2 SET trigger_at=? WHERE id=? AND {scope_cond} AND session_id=? AND status='pending'",
-                    [float(trigger_at), task_id] + scope_params + [session_id],
+                    f"UPDATE tasks_v2 SET trigger_at=?,scheduled_at=? WHERE id=? AND {scope_cond} AND session_id=? AND status='pending'",
+                    [float(trigger_at), float(trigger_at), task_id] + scope_params + [session_id],
                 )
             return cur.rowcount == 1
 

@@ -180,10 +180,100 @@ class QQGatePayloadTests(Fixture):
                  "_parsed": {"direct_text": "在吗"}}
         policy.decide_reply("在吗", event)
         state = jev.decide_raw.call_args.args[0]
-        self.assertEqual(sorted(state["context"]), ["recent_chat"])
-        self.assertEqual(len(state["context"]["recent_chat"]), 10)
-        self.assertEqual(state["context"]["recent_chat"][-1]["text"], "第14句")
+        # 键顺序是契约，不是实现细节：常量在前、当前消息垫底。
+        # 服务端把 state 当每个 question 的共享前缀，顺序反了前缀就永远分叉。
+        self.assertEqual(list(state), ["bot_self_qq", "persona_names", "recent_chat", "current_message"])
+        self.assertIn("called_persona_name", state["current_message"])
+        self.assertEqual(len(state["recent_chat"]), 10)
+        self.assertEqual(state["recent_chat"][-1]["text"], "第14句")
         self.assertLess(len(json.dumps(state, ensure_ascii=False)), 4000)
+
+
+class QQGateAtTargetTests(Fixture):
+    """门控的输入与 @ 判定。
+
+    实测：同一条消息在 recent_chat 里重复出现一次，会把 reply 的概率从
+    0.68 压到 0.16；而 "@ 了别人" 这个确定性信号原本交给模型去比 qq 数字，
+    分数在 0.0756/0.1793/0.2663 之间飘。这两条都不能回退。
+    """
+
+    BOT, OWNER, OTHER = 999, 123, 555
+
+    def policy(self, answers=None):
+        from core.qq_policy import QQPolicy
+        jev = MagicMock()
+        jev.is_configured.return_value = True
+        jev.decide_raw.return_value = answers or {"answers": {"moderation": {"choice": "allow"}}}
+        return QQPolicy(self.memory, jev), jev
+
+    def event(self, text, message_id=1, parsed=None):
+        return {"message_type": "group", "group_id": 88, "user_id": self.OWNER,
+                "self_id": self.BOT, "message_id": message_id,
+                "sender": {"nickname": "传哥", "card": ""},
+                "_parsed": parsed or {"direct_text": text}}
+
+    def test_current_message_is_not_repeated_in_history(self):
+        policy, jev = self.policy({"answers": {"reply": {"noul": 0.9},
+                                               "moderation": {"choice": "allow"}}})
+        policy.observe("上一句", self.event("上一句", message_id=1))
+        current = self.event("每天早上 9 点给我点赞 50 次", message_id=2)
+        policy.observe(current["_parsed"]["direct_text"], current)  # 线上顺序：先 observe 再判定
+        policy.decide_reply("每天早上 9 点给我点赞 50 次", current)
+        state = jev.decide_raw.call_args.args[0]
+        texts = [item["text"] for item in state["recent_chat"]]
+        self.assertEqual(texts, ["上一句"])
+        # 没有引用时不该再发一份原文，否则同一句话被看成两条
+        self.assertNotIn("text_with_quote", state["current_message"])
+
+    def test_at_other_member_is_judged_by_jev_with_at_context(self):
+        """@ 别人不写死在代码里：交给 Jev，但要给足 at_targets 与本机号码。"""
+        policy, jev = self.policy({"answers": {"reply": {"noul": 0.02},
+                                               "moderation": {"choice": "allow"}}})
+        parsed = {"direct_text": f"[@{self.OTHER}] 每天早上 9 点 给我点赞 50 次",
+                  "at_targets": [{"qq": str(self.OTHER), "name": "绵羊"}]}
+        self.assertFalse(policy.decide_reply(parsed["direct_text"],
+                                             self.event(parsed["direct_text"], parsed=parsed)))
+        questions = jev.decide_raw.call_args.args[1]
+        self.assertIn("reply", questions)             # 由 Jev 判，不短路
+        state = jev.decide_raw.call_args.args[0]
+        self.assertEqual(state["bot_self_qq"], str(self.BOT))
+        self.assertFalse(state["current_message"]["at_targets"][0]["is_this_bot"])
+        self.assertIn("绵羊", json.dumps(state, ensure_ascii=False))  # @ 对象带人名，不只 qq 号
+
+    def test_at_other_member_can_still_reply_when_jev_says_so(self):
+        policy, _ = self.policy({"answers": {"reply": {"noul": 0.93},
+                                             "moderation": {"choice": "allow"}}})
+        parsed = {"direct_text": f"[@{self.OTHER}] 这个报错怎么修",
+                  "at_targets": [{"qq": str(self.OTHER), "name": "绵羊"}]}
+        self.assertTrue(policy.decide_reply(parsed["direct_text"],
+                                            self.event(parsed["direct_text"], parsed=parsed)))
+
+    def test_at_other_member_but_persona_name_called_still_asks(self):
+        policy, jev = self.policy({"answers": {"reply": {"noul": 0.9},
+                                               "moderation": {"choice": "allow"}}})
+        parsed = {"direct_text": f"[@{self.OTHER}] 喵喵帮我看下这个报错",
+                  "at_targets": [{"qq": str(self.OTHER), "name": "绵羊"}]}
+        with patch("core.qq_policy.names", return_value=["喵喵"]):
+            self.assertTrue(policy.decide_reply(parsed["direct_text"],
+                                                self.event(parsed["direct_text"], parsed=parsed)))
+        self.assertIn("reply", jev.decide_raw.call_args.args[1])
+
+    def test_at_self_target_is_not_treated_as_other(self):
+        policy, jev = self.policy({"answers": {"reply": {"noul": 0.9},
+                                               "moderation": {"choice": "allow"}}})
+        parsed = {"direct_text": f"[@{self.BOT}] 在吗",
+                  "at_targets": [{"qq": str(self.BOT)}]}
+        self.assertTrue(policy.decide_reply(parsed["direct_text"],
+                                            self.event(parsed["direct_text"], parsed=parsed)))
+        self.assertIn("reply", jev.decide_raw.call_args.args[1])
+
+    def test_missing_reply_threshold_falls_back_instead_of_raising(self):
+        policy, jev = self.policy({"answers": {"reply": {"noul": 0.75},
+                                               "moderation": {"choice": "allow"}}})
+        cfg = {"channels": {"napcat": {"owner_ids": [str(self.OWNER)],
+                                       "blacklisted_user_ids": []}}}
+        with patch("core.qq_policy.load_config", return_value=cfg):
+            self.assertTrue(policy.decide_reply("在吗", self.event("在吗")))
 
 
 class DecideRawPayloadTests(unittest.TestCase):

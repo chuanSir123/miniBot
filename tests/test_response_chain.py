@@ -96,6 +96,28 @@ class ResponseChainTests(Fixture):
         with patch.object(jev, 'decide_raw', side_effect=TimeoutError):
             self.assertIsNone(jev.select_fixed_action('列出全部技能'))
 
+    def test_state_puts_invariant_fields_first_for_prefix_reuse(self):
+        """state 是每个 question 的共享前缀，常量必须排在前面。
+
+        服务端把 state 拼在每个 question 之前（报错原文：the state and its media
+        once, then every question），前缀从第 N 个字符分叉，后面的 KV 就全废。
+        fixed_options 每次调用逐字节相同，user 必然不同，顺序反了等于从不命中。
+        """
+        jev = JevClient()
+        with patch.object(jev, 'decide_raw', return_value={'answers': {'noarg_tool': {'choice': 'vlm', 'confidence': .99}}}) as decide:
+            jev.select_fixed_action('发最后一张图', context={'recent_media': [{'media_ref': 'm1'}]})
+        state = json.loads(decide.call_args.args[0])
+        self.assertEqual(list(state['current']), ['fixed_options', 'user'])
+
+    def test_steering_intent_state_puts_current_prompt_last(self):
+        jev = JevClient()
+        # 走 decide()，未配置 key 会在发请求前直接返回空，所以两个都要打桩。
+        with patch.object(jev, 'is_configured', return_value=True), \
+                patch.object(jev, 'decide_raw', return_value={'answers': {'intent_type': {'choice': 'chat'}}}) as decide:
+            jev.classify_steering_intent('你好', task_state={'original_goal': '改一个登录页'})
+        state = json.loads(decide.call_args.args[0])
+        self.assertEqual(list(state['current']), ['current_or_last_task', 'recent_messages', 'user_input'])
+
     def test_fixed_arguments_are_server_owned_and_still_pass_execution_gate(self):
         jev = self.jev()
         jev.select_fixed_action.return_value = 'recent_media'

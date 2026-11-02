@@ -70,12 +70,14 @@ class ProactiveEngine:
         dispatcher=None,
         followup_callback=None,
         verify_callback=None,
+        task_callback=None,
     ):
         self.memory, self.perception, self.jev, self.vlm = memory, perception, jev, vlm
         self.skill_manager, self.notify_callback = skill_manager, notify_callback
         self.dispatcher, self.followup_callback = dispatcher, followup_callback
         # 断言型消息发出前的只读核实通道（harness, readonly=True）。
         # 没有它，主动提醒就只能靠模型凭空描述状态。
+        self.task_callback = task_callback
         self.verify_callback = verify_callback
         self._stop = threading.Event()
         self._thread = None
@@ -387,9 +389,101 @@ class ProactiveEngine:
             include_window=cfg.get("enable_window_listener", True)
         )
 
+    def _submit_agent_task(self, task):
+        if task["id"] in self._followup_inflight:
+            self.memory.finish_intent(task["id"], False, defer_sec=60)
+            return
+        def run():
+            lease_stop = threading.Event()
+            def renew():
+                while not lease_stop.wait(30):
+                    with self.memory._get_conn() as db:
+                        db.execute("UPDATE tasks_v2 SET lease_until=? WHERE id=? AND status='running'", (time.time() + 120, task["id"]))
+            threading.Thread(target=renew, daemon=True).start()
+            try:
+                message = task.get("result", "")
+                if not message:
+                    if not self.task_callback:
+                        raise RuntimeError("未配置定时任务执行器")
+                    message = (self.task_callback(task) or "").strip()
+                    if not message:
+                        raise RuntimeError("定时任务未返回结果")
+                    with self.memory._get_conn() as db:
+                        db.execute("UPDATE tasks_v2 SET result=? WHERE id=? AND status='running'", (message, task["id"]))
+                ok = self._deliver(message, "scheduled_task", task)
+                self.memory.finish_intent(task["id"], ok, "" if ok else "结果投递失败")
+                if ok:
+                    with self.memory._get_conn() as db:
+                        db.execute("UPDATE tasks_v2 SET result='' WHERE id=?", (task["id"],))
+            except Exception as exc:
+                self.memory.finish_intent(task["id"], False, str(exc))
+            finally:
+                lease_stop.set()
+                self._followup_inflight.discard(task["id"])
+        self._followup_inflight.add(task["id"])
+        if self.dispatcher:
+            future = self.dispatcher.submit(task["session_id"], run, background=True)
+            if future.done() and future.exception():
+                self._followup_inflight.discard(task["id"])
+                self.memory.finish_intent(task["id"], False, str(future.exception()))
+        else:
+            run()
+
+    def _run_due_tasks(self, cfg, state):
+        preferences = self.memory.notification_preferences("local")
+        # Explicit reminders are independent of model availability and environmental quiet hours.
+        for _ in range(20):
+            claimed = self.memory.claim_due_intents(limit=1)
+            if not claimed:
+                break
+            task = claimed[0]
+            if not self.condition_met(task["condition_desc"], state):
+                self.memory.finish_intent(task["id"], False, defer_sec=15)
+                continue
+            if task["kind"] == "agent":
+                self._submit_agent_task(task)
+                continue
+            message = task["action_prompt"]
+            if task["kind"] == "followup":
+                if task["id"] in self._followup_inflight:
+                    # 租约到期被重新领取，但上一轮核实还在跑：推后，别核实两遍。
+                    self.memory.finish_intent(task["id"], False, defer_sec=30)
+                    continue
+                if (
+                    cfg.get("muted")
+                    or preferences["muted"]
+                    or self._quiet(cfg)
+                    or state.get("locked")
+                    or state.get("meeting")
+                    or state.get("fullscreen")
+                ):
+                    self.memory.finish_intent(task["id"], False, defer_sec=60)
+                    continue
+                if not self.followup_callback or not cfg.get(
+                    "allow_readonly_followup", True
+                ):
+                    # 没有核实通道就不发。以前这里的兜底是拼一句固定文案，
+                    # 既不核实也不经模型，等于替用户编造结论。
+                    self.memory.finish_intent(
+                        task["id"], False, "未启用核实通道，已静默放弃", terminal=True
+                    )
+                    continue
+                self._submit_followup(task, dict(state))
+                continue
+            # 走到这里的都是转述用户原话的提醒（"10 点开会"），内容真实性无需核实。
+            ok = self._deliver(message, "intent_reminder", task, verified=True)
+            self.memory.finish_intent(
+                task["id"], ok, "" if ok else "通道未确认投递成功"
+            )
+
     def _tick(self, cfg):
         now = time.time()
-        state = self._snapshot(cfg)
+        try:
+            state = self._snapshot(cfg)
+        except Exception as exc:
+            print("[Perception]", exc)
+            state = {"idle_sec": 0, "process": "", "title": "", "locked": False}
+        self._run_due_tasks(cfg, state)
         # has_error 的语义是"最近 error_ttl_sec 内见过报错信号"，它是个计时器，
         # 不是复检结果。只允许用来解释"为什么现在来打扰"（trigger），
         # 任何面向用户的文案都不能拿它当"问题还在"的依据。
@@ -454,47 +548,6 @@ class ProactiveEngine:
         self._last_state = state
         self._environment_signals(state, previous, cfg, now)
         preferences = self.memory.notification_preferences("local")
-        # Explicit reminders are independent of model availability and environmental quiet hours.
-        for _ in range(20):
-            claimed = self.memory.claim_due_intents(limit=1)
-            if not claimed:
-                break
-            task = claimed[0]
-            if not self.condition_met(task["condition_desc"], state):
-                self.memory.finish_intent(task["id"], False, defer_sec=15)
-                continue
-            message = task["action_prompt"]
-            if task["kind"] == "followup":
-                if task["id"] in self._followup_inflight:
-                    # 租约到期被重新领取，但上一轮核实还在跑：推后，别核实两遍。
-                    self.memory.finish_intent(task["id"], False, defer_sec=30)
-                    continue
-                if (
-                    cfg.get("muted")
-                    or preferences["muted"]
-                    or self._quiet(cfg)
-                    or state.get("locked")
-                    or state.get("meeting")
-                    or state.get("fullscreen")
-                ):
-                    self.memory.finish_intent(task["id"], False, defer_sec=60)
-                    continue
-                if not self.followup_callback or not cfg.get(
-                    "allow_readonly_followup", True
-                ):
-                    # 没有核实通道就不发。以前这里的兜底是拼一句固定文案，
-                    # 既不核实也不经模型，等于替用户编造结论。
-                    self.memory.finish_intent(
-                        task["id"], False, "未启用核实通道，已静默放弃", terminal=True
-                    )
-                    continue
-                self._submit_followup(task, dict(state))
-                continue
-            # 走到这里的都是转述用户原话的提醒（"10 点开会"），内容真实性无需核实。
-            ok = self._deliver(message, "intent_reminder", task, verified=True)
-            self.memory.finish_intent(
-                task["id"], ok, "" if ok else "通道未确认投递成功"
-            )
         if now - self._last_maintenance > 3600:
             memcfg = load_config()["memory"]
             self.memory.maintenance(memcfg["retention_days"], memcfg["max_events"])
@@ -647,7 +700,9 @@ class ProactiveEngine:
         )
         context["notification_preferences"] = self.memory.notification_preferences("local")
         context["last_notification_at"] = self._last_intervene_time
-        snapshot = json.dumps({"desktop_state": state, "context": context}, ensure_ascii=False)
+        # context 在前、desktop_state 在后：state 是共享前缀，而 desktop_state 里
+        # 的计时/计数每轮都在变，放前面等于每轮都让前缀失效。
+        snapshot = json.dumps({"context": context, "desktop_state": state}, ensure_ascii=False)
         # One Jev request returns both gate and posture.
         result = self.jev.decide(
             snapshot,

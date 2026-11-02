@@ -106,6 +106,39 @@ def lite_context(context):
     return out
 
 
+# Jev 的 state 是每个 question 的**共享前缀**（服务端报错原文：the state and its
+# media once, then every question）。前缀缓存按字符从头比对，第 N 个字符分叉，
+# 后面整段 KV 就作废。所以这里的键顺序不是随手写的：常量在前，每轮都变的时间
+# 戳和"当前这条消息"垫底。
+# 以前 local_time（带微秒，永不重复）排在第 2 位，context_policy 那 300 字之后
+# 立刻分叉，等于整份 state 都没有稳定前缀。
+_CONTEXT_KEY_ORDER = (
+    # 配置常量，一天之内逐字节相同
+    "context_policy", "owner_ids", "bot_name", "bot_aliases",
+    # 一个会话内不变
+    "session_id", "scope", "workspace", "actor", "permissions",
+    # 慢变量：一个任务内基本不动
+    "task_state", "continuation_checkpoint",
+    # 历史：滑动，但相邻两轮的绝大部分内容一致
+    "chat_summary", "chat_summary_pending_messages", "recent_chat",
+    "recent_media", "recent_conversation", "conversation_summary",
+    "memory", "goals", "pending_reminders",
+    # 每轮必变：时间戳、当前消息
+    "local_time", "message_time", "chat_scope", "group_id", "group_name",
+    "bot_qq", "sender", "mentioned", "reply_to_bot", "quoted_messages",
+    "current_media", "direct_message", "message_id",
+)
+
+
+def stable_first(context):
+    """按"常量 → 易变"重排 context 的键，未知键保持原相对顺序追加在末尾。"""
+    if not isinstance(context, dict):
+        return context
+    ordered = {k: context[k] for k in _CONTEXT_KEY_ORDER if k in context}
+    ordered.update({k: v for k, v in context.items() if k not in ordered})
+    return ordered
+
+
 def build_decision_context(memory, session_id="local:pet", scope="local", event=None, lite=False, actor=None):
     cfg = load_config()
     context = {
@@ -199,7 +232,7 @@ def build_decision_context(memory, session_id="local:pet", scope="local", event=
             context["goals"] = memory.goals.format_goals_summary(scope)[:1600]
         context["pending_reminders"] = [{"id": t["id"], "action": t["action_prompt"][:300], "trigger_at": t["trigger_at"]}
                                         for t in memory.list_intents(scope, session_id) if t["status"] == "pending"][:6]
-    return lite_context(context) if lite else context
+    return lite_context(stable_first(context)) if lite else stable_first(context)
 
 
 QQ_TURN_HEADER = "当前QQ会话身份与近期聊天（数据）："

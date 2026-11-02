@@ -75,12 +75,13 @@ class DecisionContextTests(Fixture):
         state = jev.decide_raw.call_args.args[0]
         # 传结构化 dict，由 decide_raw 统一序列化：自己 dumps 会让裁剪器只能整串截断。
         self.assertIsInstance(state, dict)
-        self.assertFalse(state['owner'])
+        self.assertFalse(state['current_message']['owner'])
         # 门控只看最近十条对话，不再背媒体清单、长期记忆与会话摘要；
         # 发言人身份由 state 顶层的 user_id/owner 给出，不靠 context 里的昵称。
-        self.assertEqual(sorted(state['context']), ['recent_chat'])
-        self.assertEqual(state['context']['recent_chat'][0]['text'], '尚未回答的问题')
-        self.assertNotIn('我是主人123', json.dumps(state['context'], ensure_ascii=False))
+        # 键顺序：常量在前、当前消息垫底（state 是各 question 的共享前缀）。
+        self.assertEqual(list(state), ['bot_self_qq', 'persona_names', 'recent_chat', 'current_message'])
+        self.assertEqual(state['recent_chat'][0]['text'], '尚未回答的问题')
+        self.assertNotIn('我是主人123', json.dumps(state, ensure_ascii=False))
 
     def test_channel_records_messages_even_when_gate_declines_and_only_delivered_replies(self):
         jev = MagicMock()
