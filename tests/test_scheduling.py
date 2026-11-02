@@ -29,3 +29,14 @@ class SchedulingTests(unittest.TestCase):
             memory.claim_due_intents()
             memory.finish_intent(task, True)
             self.assertEqual(memory.list_intents()[0]['status'], 'delivered')
+
+    def test_calendar_first_run_uses_rule(self):
+        with tempfile.TemporaryDirectory() as folder:
+            memory = MiniMemory(Path(folder) / 'memory.db')
+            with patch('core.memory.time.time', return_value=1793459400):
+                memory.add_delayed_intent(1, 'hello', repeat_rule='daily 08:00')
+            import datetime
+            row = memory.list_intents()[0]
+            local = datetime.datetime.fromtimestamp(row['trigger_at'])
+            self.assertEqual((local.hour, local.minute), (8, 0))
+            self.assertGreater(row['trigger_at'], 1793459400)

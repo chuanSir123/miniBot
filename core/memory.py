@@ -546,7 +546,10 @@ class MiniMemory:
         actor="",
     ):
         from core.scheduling import next_trigger
-        next_trigger(repeat_rule, float(trigger_at), float(trigger_at))
+        next_trigger(repeat_rule, float(trigger_at), time.time())
+        if repeat_rule and not repeat_rule.startswith("interval:"):
+            # Calendar rules define the first run too; never trust model timestamp arithmetic.
+            trigger_at = next_trigger(repeat_rule, time.time(), time.time())
         if kind not in ("reminder", "followup", "agent"):
             raise ValueError("不支持的任务类型")
         if not math.isfinite(float(trigger_at)) or not action_prompt.strip():
