@@ -1,8 +1,9 @@
 """Opt-in, process-isolated Python skills.
 
 技能目录支持 Agent Skills 规范形态：skills/<name>/SKILL.md（必须）+ scripts/（可选）。
-渐进式披露：目录技能只把 name+description 注入提示词，完整指令由
-execute_skill 无参数调用返回；带 entry 脚本的技能再以隔离子进程执行。
+渐进式披露：目录技能只把 name/description/SKILL.md 路径注入 <skills> 段，模型用
+read 读全文，再用 bash 直接跑该技能 scripts/ 下的 CLI 脚本。
+execute_skill 只作为内部兼容入口保留，不再是模型可见的执行链路。
 """
 
 import ast
@@ -301,9 +302,17 @@ class SkillManager:
                     "name": s.name,
                     "description": s.description,
                     "parameters": s.parameters_schema,
+                    # 渐进披露：模型用 read 直接读这个绝对路径，不再经技能工具。
+                    "filePath": self.skill_md_path(s),
                 }
                 for s in skills[:limit]
             ]
+
+    @staticmethod
+    def skill_md_path(skill) -> str:
+        """技能 SKILL.md 的绝对路径（<skills> 段的 <location>）。"""
+        base = skill.directory if skill.directory else SKILLS_DIR / skill.name
+        return str(base / "SKILL.md").replace("\\", "/")
 
     def execute_skill(
         self,
@@ -326,7 +335,7 @@ class SkillManager:
                 )
             if (self.skills_dir / (self._name(name) + ".py")).exists():
                 raise ValueError(f"技能 {name} 文件存在但加载失败，请检查execute入口及静态DESCRIPTION/PARAMETERS格式")
-            raise ValueError(f"技能 {name} 不存在，请先list_skills确认，创建新技能走 skill-creator 流程（write_file 写 skills/<name>/SKILL.md）；不要猜测技能名")
+            raise ValueError(f"技能 {name} 不存在，请先list_skills确认，创建新技能走 skill-creator 流程（write 写 skills/<name>/SKILL.md）；不要猜测技能名")
         if not skill.trusted:
             raise ValueError(
                 f"技能 {name} 已加载但未授权；activate_skill 只能重新扫描，不能授予权限。"
@@ -514,6 +523,16 @@ class SkillManager:
             code_content += "\nDESCRIPTION = " + repr(description) + "\n"
         if metadata.get("PARAMETERS", metadata.get("SCHEMA")) != schema:
             code_content += "\nPARAMETERS = " + repr(schema) + "\n"
+        # 新技能脚本必须能被 bash 直接跑：缺 __main__ 时自动补 CLI 入口。
+        if 'if __name__ == "__main__"' not in code_content:
+            code_content += (
+                '\n\nif __name__ == "__main__":\n'
+                '    import sys\n'
+                '    from pathlib import Path\n'
+                '    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))\n'
+                '    from core.skill_cli import main\n'
+                '    raise SystemExit(main(execute))\n'
+            )
         if len(code_content.encode("utf-8")) > 100000:
             raise ValueError("技能源码及元数据超过100KB")
         # 统一保存为 Agent Skills 目录形态：skills/<name>/{SKILL.md, scripts/<name>.py}
@@ -545,7 +564,17 @@ class SkillManager:
             ptype = prop.get("type", "any")
             pdesc = prop.get("description", "")
             param_lines.append(f"- `{key}` ({ptype}, {req})：{pdesc}")
-        usage = "\n".join(param_lines) if param_lines else "无参数。直接 `execute_skill(" + name + ")` 即可。"
+        usage = "\n".join(param_lines) if param_lines else "无参数，传 `{}` 即可。"
+        # 生成可直接复制的真实命令与参数示例，文档里不留占位符。
+        example = {
+            key: {"string": "示例文本", "integer": 1, "number": 1, "boolean": True}.get(
+                (prop or {}).get("type"), ""
+            )
+            for key, prop in props.items()
+            if key in set(schema.get("required", []) or [])
+        }
+        example_json = _json.dumps(example, ensure_ascii=False)
+        script_path = f"skills/{name}/scripts/{name}.py"
         content = (
             f"---\n"
             f"name: {name}\n"
@@ -553,7 +582,11 @@ class SkillManager:
             f"entry: scripts/{name}.py\n"
             f"---\n\n"
             f"# {name}\n\n"
-            f"通过 `execute_skill` 调用，脚本为 `scripts/{name}.py`，在隔离子进程中执行。\n\n"
+            f"本文件是**纯 Markdown 指令**：先用 `read` 读完，再用 `bash` 直接跑本技能的脚本\n"
+            f"（传 `cwd=project`，命令中的路径相对项目根目录）：\n\n"
+            f"    python {script_path} --arguments '{example_json}'\n\n"
+            f"脚本在 `skills/{name}/scripts/{name}.py`，末尾的 `__main__` 块调用 `core.skill_cli.main` "
+            f"解析参数并输出一行 JSON；需要媒体文件时先用 `get_media` 取 `file_path` 再传路径。\n\n"
             f"## 参数\n\n{usage}\n"
         )
         if body and body not in content:

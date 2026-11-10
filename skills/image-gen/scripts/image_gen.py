@@ -29,3 +29,12 @@ PARAMETERS = {
 def execute(context):
     from core.image_service import execute as run
     return run(context)
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

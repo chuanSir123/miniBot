@@ -64,12 +64,15 @@ DEFAULT_CONFIG["runtime"] = {
     # 超时即主动结束流，避免上游不关连接导致永久阻塞。
     "stream_finish_grace_sec": 3.0,
     # 已经吐过内容之后，连续多少秒收不到新数据就判定为"上游死流"并软收尾。
-    # 实测本机到网关：首字之后的分片间隔 p90 约 30~45ms，最差一次 873ms；
-    # 工具调用参数同样是按约 30ms 一片的流式分片，不是一次性返回。
-    # 这里与 stream_finish_grace_sec 取同一个 3 秒：宁可早点收尾再重试，
-    # 也不要让聊天窗口空等。真有抖动被误判时，尾部完整性判定会把"残句"
-    # 交还 harness 重试，不会静默交付半句话。
-    "stream_idle_stall_sec": 3.0,
+    # 分片间隔正常是 30~45ms，但网关本身会随机卡顿：同一份 payload 连打三次，
+    # 出现过 1.9 秒的片间空档，甚至 96 秒才吐第一个字节。3 秒阈值会把这些
+    # "只是慢"的请求误杀成断流，所以给到 10 秒；工具参数阶段另有更宽的
+    # stream_tool_stall_sec。
+    "stream_idle_stall_sec": 10.0,
+    # 工具参数正在流式返回时的空闲上限。工具参数是一条长 JSON 在逐字生成，
+    # 中途停一拍很正常（实测 200 词参数要连续生成 3.5~4 秒），网关抖动时
+    # 更容易出现秒级空档；这一阶段绝不能按文本阶段的阈值收尾。
+    "stream_tool_stall_sec": 25.0,
 }
 DEFAULT_CONFIG["anysearch"] = {"enabled": True, "api_key": ""}
 DEFAULT_CONFIG["ego_lite"] = {"enabled": True, "executable": "", "auto_install": True}
@@ -123,10 +126,6 @@ DEFAULT_CONFIG["meme"] = {
     "tag_max_rounds": 4,
     # 关掉就退化成「标签字面出现在回复里才发」的保守模式。
     "use_jev": True,
-    # 发不发的双闸：最高标签分要过这个地板，且 none 分不能比它高。
-    # 实测标定（38 个标签的真实图库）：该发时最高分≈0.99、none≈0.06；
-    # 不该发时最高分≤0.49、none 0.92~0.997。0.5 正好落在两者之间。
-    "min_tag_score": 0.5,
     # 一条消息最多采集几张图入库（还受 channels.napcat.max_images 限制）。
     "max_collect_per_message": 9,
     # 同一会话最近发过的 N 张图不再选（表情包"老是发同一张"的解法）。
@@ -315,6 +314,7 @@ def validate_config(cfg):
         ("runtime", "request_timeout_sec", 1, 600),
         ("runtime", "stream_finish_grace_sec", 0.2, 60),
         ("runtime", "stream_idle_stall_sec", 1, 600),
+        ("runtime", "stream_tool_stall_sec", 1, 600),
         ("memory", "retention_days", 1, 3650),
         ("memory", "max_events", 100, 1000000),
         ("memory", "context_chars", 500, 64000),

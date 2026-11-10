@@ -85,7 +85,7 @@ def build_messages(sid: str, brain, tail_extra: str = ""):
     )
     tail = render_tail_context(
         rc,
-        {"status": "running", "recent_tools": ["read_file:ok"]},
+        {"status": "running", "recent_tools": ["read:ok"]},
         events=(events + tail_extra).strip(),
         clock=render_clock(),
     )

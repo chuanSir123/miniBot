@@ -1,6 +1,7 @@
 """Image API adapter: scoped refs -> original data URLs -> cached output refs."""
 import base64
 import json
+import mimetypes
 import urllib.request
 from pathlib import Path
 
@@ -41,21 +42,31 @@ def _execute(context):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ValueError("prompt必须是1到12000字的文本")
     refs = context.get("image_refs", [])
+    files = context.get("image_files", [])
     if not isinstance(refs, list) or len(refs) > 9 or any(not isinstance(ref, str) for ref in refs):
         raise ValueError("image_refs必须是最多9个media_ref的数组")
+    if not isinstance(files, list) or len(files) > 9 or any(not isinstance(f, str) for f in files):
+        raise ValueError("image_files必须是最多9个本地文件路径的数组")
+    if len(refs) + len(files) > 9:
+        raise ValueError("参考图片最多9张")
     mode = context.get("mode", "auto")
     if mode not in ("auto", "generate", "edit"):
         raise ValueError("mode只能是auto、generate或edit")
-    mode = "edit" if mode == "auto" and refs else "generate" if mode == "auto" else mode
-    if mode == "edit" and not refs:
-        raise ValueError("编辑图片必须提供image_refs；先用list_media查询当前上传、引用消息或上一张生成图片，必要时get_media查看；不会退化为无参考生成")
-    if mode == "generate" and refs:
+    mode = "edit" if mode == "auto" and (refs or files) else "generate" if mode == "auto" else mode
+    if mode == "edit" and not (refs or files):
+        raise ValueError("编辑图片必须提供参考图；先用 list_media 查 media_ref，再用 get_media 取 file_path 填 image_files；不会退化为无参考生成")
+    if mode == "generate" and (refs or files):
         raise ValueError("generate模式不能带参考图片，请使用edit模式")
     store = MediaStore(runtime["media_root"])
     scope = runtime["media_scope"]
     # 模型有时会把聊天里的 media://img_xxx 原样带过来，统一收敛成裸引用。
     refs = [normalize_ref(ref) for ref in refs]
     images = [store.data_url(ref, scope) for ref in refs]
+    # 显式工具路径：get_media 返回 file_path，脚本自己读文件转 data URL，
+    # Base64 不经过模型上下文。
+    for file_path in files:
+        mime = mimetypes.guess_type(file_path)[0] or "image/png"
+        images.append("data:%s;base64,%s" % (mime, base64.b64encode(Path(file_path).read_bytes()).decode()))
     original = store.get(refs[0], scope)[0] if refs else {}
     # 无 Pillow 的环境里入库尺寸为 0（未知），这里必须退化为默认画布，不能拿 0 去除。
     default_width = original.get("width") or 480

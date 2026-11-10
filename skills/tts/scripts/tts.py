@@ -1,7 +1,10 @@
 
+import base64
 import json
+import mimetypes
 import os
 import time
+from pathlib import Path
 import urllib.request
 import urllib.error
 
@@ -35,6 +38,7 @@ def execute(context):
     instructions = context.get("instructions", "")
     language = context.get("language", "Chinese")
     ref_audios = context.get("reference_audio", [])
+    ref_files = context.get("reference_files", [])
 
     if not text or not text.strip():
         return {"ok": False, "error": "缺少 text 参数，请提供要合成的文本"}
@@ -58,16 +62,23 @@ def execute(context):
     elif mode == "clone":
         url = tts_cfg.get("clone_base_url", "") or tts_cfg.get("base_url", "")
 
-        if not ref_audios:
-            return {"ok": False, "error": "clone 模式需要 reference_audio 参数（media_ref 数组）"}
-
-        data_url_fn = minibot.get("data_url")
-        if not data_url_fn:
-            return {"ok": False, "error": "无法解析 reference_audio，缺少 data_url 工具"}
+        if not ref_audios and not ref_files:
+            return {"ok": False, "error": "clone 模式需要 reference_files（本机文件路径数组，先用 get_media 取 file_path）或 reference_audio（media_ref 数组）"}
 
         ref_data_urls = []
+        # 显式工具路径：get_media 给 file_path，脚本读文件自己生成 base64，
+        # 大段音频数据不经过模型上下文。
+        for file_path in ref_files:
+            mime = mimetypes.guess_type(file_path)[0] or "audio/wav"
+            ref_data_urls.append("data:%s;base64,%s" % (mime, base64.b64encode(Path(file_path).read_bytes()).decode()))
         for ref in ref_audios:
-            data_url = data_url_fn(ref)
+            data_url_fn = minibot.get("data_url")
+            if data_url_fn:
+                data_url = data_url_fn(ref)
+            else:
+                from core.media_store import MediaStore, normalize_ref
+                data_url = MediaStore(minibot.get("media_root")).data_url(
+                    normalize_ref(ref), minibot.get("media_scope") or "local")
             if not data_url:
                 return {"ok": False, "error": f"无法解析 reference_audio: {ref}"}
             ref_data_urls.append(data_url)
@@ -135,3 +146,12 @@ def execute(context):
 DESCRIPTION = 'TTS 语音合成，支持两种模式：design=通过文字描述设计特定音色（Qwen3 VoiceDesign），clone=提供参考音频克隆音色（IndexTTS-2.0）。当用户要求"说句话/念一段/读一下/用XX的声音/设计一个声音/克隆音色/语音合成/TTS/配音/朗读/用男声女声读/用XX的语气/把文字变成语音/模仿某人的声音"时调用本技能。即使用户没有明确说"TTS"，只要意图是把文字转成语音、用某种特定声音念、或模仿某段参考音频的音色，都应该使用本技能。'
 
 PARAMETERS = {'type': 'object', 'properties': {'mode': {'type': 'string', 'enum': ['design', 'clone'], 'description': '合成模式：design=设计声音(VoiceDesign)，clone=参考音色克隆'}, 'text': {'type': 'string', 'description': '要合成的文本内容'}, 'instructions': {'type': 'string', 'description': "design模式专用：声音描述，如'年轻男性，声音清亮，语速自然'"}, 'language': {'type': 'string', 'description': 'design模式专用：语言，默认Chinese', 'default': 'Chinese'}, 'reference_audio': {'type': 'array', 'items': {'type': 'string'}, 'description': 'clone模式专用：参考音色的media_ref数组，按顺序传当前会话的media_ref'}}}
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

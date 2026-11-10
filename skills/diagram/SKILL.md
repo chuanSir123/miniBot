@@ -3,6 +3,17 @@ name: diagram
 description: 用 SVG 画架构图、流程图、对比图、概念示意图，并渲染成高清 PNG 用于 QQ 发送或 WebUI 展示。当主人要求"画图/画个架构图/流程图/示意图/图解/可视化说明"时调用本技能。内含完整设计规范（画布、调色板、布局、图型路由），配 validate 脚本做发送前校验、render 脚本出 PNG。
 ---
 
+## 运行方式（MiniBot）
+
+脚本命令相对项目根目录执行：用 `bash` 运行，传 `cwd=project`，路径写 `skills/<name>/scripts/<file>.py`；不要在命令里写绝对路径。
+
+本技能是**纯 Markdown 指令**：用 `read` 读完，按下面的设计规范写好 SVG，再用
+`bash` 直接跑随技能附带的脚本。
+脚本就是普通命令，不需要任何技能执行工具。
+
+    python skills/diagram/scripts/validate.py --arguments '{"file_path":"assets/diagrams/example.svg"}'
+    python skills/diagram/scripts/render.py --arguments '{"file_path":"assets/diagrams/example.svg","scale":2}'
+
 # diagram：SVG 图示设计与渲染
 
 工作流：**写 SVG → `validate.py` 校验 → `render.py` 出 PNG → 把输出路径告诉用户**。
@@ -10,7 +21,7 @@ description: 用 SVG 画架构图、流程图、对比图、概念示意图，�
 
 ## 第一步：写 SVG
 
-写 SVG 文件到当前工作空间（如 `assets/diagrams/xxx.svg`）。规范分三部分：
+写 SVG 文件到当前工作空间（如 `assets/diagrams/example.svg`）。规范分三部分：
 
 ### 图型路由（先选型再动手）
 
@@ -56,7 +67,7 @@ description: 用 SVG 画架构图、流程图、对比图、概念示意图，�
 ## 第二步：校验
 
 ```
-execute_skill(diagram, {action:"validate", file_path:"assets/diagrams/xxx.svg"})
+python skills/diagram/scripts/validate.py assets/diagrams/example.svg
 ```
 
 errors 必须清零，warnings 逐条判断。校验通过才进入渲染。
@@ -64,7 +75,7 @@ errors 必须清零，warnings 逐条判断。校验通过才进入渲染。
 ## 第三步：渲染 PNG
 
 ```
-execute_skill(diagram, {action:"render", file_path:"assets/diagrams/xxx.svg", scale:2})
+python skills/diagram/scripts/render.py assets/diagrams/example.svg --scale 2
 ```
 
 - 用 Playwright 无头 Chromium 截图（自动探测可用解释器），`scale` 默认 2 出高清图

@@ -215,7 +215,7 @@ class RollingCompactionTests(Fixture):
                     # 每次换一个 start_line：重复调用守卫会把"同参数反复读"拦下来，
                     # 这个用例要测的是压缩，不是守卫。
                     return '', [{'id': 'read-' + str(inner.steps), 'type': 'function', 'function': {
-                        'name': 'read_file',
+                        'name': 'read',
                         'arguments': json.dumps({'file_path': str(path),
                                                  'start_line': inner.steps * 10})}}], {}
                 yield 'text_delta', '检查完成。'
@@ -257,6 +257,109 @@ class RollingCompactionTests(Fixture):
         self.assertEqual(brain.calls, 2)
         # 压缩会把中间过程折叠成摘要，这里只要求历史没有被清空、且仍带着目标。
         self.assertGreaterEqual(len(self.memory.get_history('local:pet')[0]), 4)
+
+    def test_overflow_is_recognized_by_meaning_not_by_status_code(self):
+        """只有"请求太长"才值得压历史；同是 400 的参数错误压了也白压。"""
+        from core.harness import is_context_overflow
+
+        for text in (
+            'HTTP 400: {"error":{"message":"This model\'s maximum context length is 32768 tokens"}}',
+            'HTTP 400 context_length_exceeded',
+            'HTTP 413: prompt is too long: 40000 tokens > 32000 maximum',
+            '【模型接口错误：请求过长，请减少输入】',
+            'HTTP 400：上下文超长',
+        ):
+            self.assertTrue(is_context_overflow(text), text)
+        for text in (
+            'HTTP 400: invalid_request_error: messages[1].content must be a string',
+            'HTTP 401: invalid api key',
+            'HTTP 502 bad gateway',
+            '',
+        ):
+            self.assertFalse(is_context_overflow(text), text)
+
+    def test_non_overflow_http_error_does_not_compact_history(self):
+        """普通 400 上压一遍历史，只会白丢上下文，还拖慢这一轮。"""
+        for i in range(30):
+            self.memory.append_message('local:pet', {'role': 'user', 'content': 'prior' + str(i) + 'x' * 300})
+
+        class Brain:
+            calls = 0
+
+            def chat(self, messages):
+                raise AssertionError('不该为普通 400 触发压缩')
+
+            def stream_chat_and_tools(inner, *args, **kwargs):
+                inner.calls += 1
+                yield 'error', 'HTTP 400: invalid_request_error'
+                yield 'text_delta', '【模型接口错误：HTTP 400: invalid_request_error】'
+                return '', [], {}
+
+        brain = Brain()
+        harness = AgentHarness(brain, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
+        reply = harness.run('继续处理当前目标')
+        self.assertIn('HTTP 400', reply)
+        self.assertEqual(brain.calls, 1)
+        self.assertIsNone(self.memory.get_history('local:pet')[1])
+
+    def test_overflow_retries_are_bounded(self):
+        """压不动就一直压会变成死循环：两次之后照实报错。"""
+        for i in range(30):
+            self.memory.append_message('local:pet', {'role': 'user', 'content': 'prior' + str(i) + 'x' * 300})
+
+        class Brain:
+            calls = 0
+
+            def chat(self, messages):
+                return '摘要'
+
+            def stream_chat_and_tools(inner, *args, **kwargs):
+                inner.calls += 1
+                yield 'error', 'HTTP 400 context_length_exceeded'
+                yield 'text_delta', 'HTTP 400 context_length_exceeded'
+                return '', [], {}
+
+        brain = Brain()
+        harness = AgentHarness(brain, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
+        reply = harness.run('继续处理当前目标')
+        self.assertIn('context_length_exceeded', reply)
+        self.assertEqual(brain.calls, 3)      # 首发 + 两次压缩重试，不再多打
+
+    def test_overflow_without_compactable_history_fails_fast(self):
+        """历史里没有可压的余量（超的是固定前缀），重发同一个请求只会再撞一次。"""
+        class Brain:
+            calls = 0
+
+            def chat(self, messages):
+                raise AssertionError('没有可压的历史，不该调摘要模型')
+
+            def stream_chat_and_tools(inner, *args, **kwargs):
+                inner.calls += 1
+                yield 'error', 'context_length_exceeded'
+                yield 'text_delta', 'HTTP 400 context_length_exceeded'
+                return '', [], {}
+
+        brain = Brain()
+        harness = AgentHarness(brain, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
+        reply = harness.run('继续处理当前目标')
+        self.assertIn('context_length_exceeded', reply)
+        self.assertEqual(brain.calls, 1)
+
+    def test_shrink_oversized_truncates_single_giant_message(self):
+        """压缩按切点工作，切点之后的巨型单条消息压不掉，只能就地截短。"""
+        from core.compaction import ContextCompactor
+
+        giant = 'x' * 40000
+        messages = [
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'tool', 'content': giant},
+            {'role': 'user', 'content': '现在呢'},
+        ]
+        shrunk = ContextCompactor.shrink_oversized(messages, 6000)
+        self.assertLess(estimate_text_tokens({'messages': shrunk}), 6000)
+        self.assertIn('已截断', shrunk[1]['content'])
+        self.assertEqual(shrunk[2]['content'], '现在呢')     # 末条提问不动
+        self.assertEqual(messages[1]['content'], giant)      # 原列表不被就地改写
 
 
 class CompactionTriggerTests(Fixture):

@@ -36,6 +36,8 @@
     "interrupt_score_threshold": 0.65,
     "poll_interval_sec": 2,
     "cooldown_sec": 180,
+    "after_user_turn_sec": 1800,
+    "daily_care_limit": 4,
     "error_ttl_sec": 300,
     "quiet_hours": [
       0,
@@ -86,7 +88,8 @@
     "max_output_chars": 12000,
     "request_timeout_sec": 45,
     "stream_finish_grace_sec": 3,
-    "stream_idle_stall_sec": 3,
+    "stream_idle_stall_sec": 10,
+    "stream_tool_stall_sec": 25,
     "jev_noarg_enabled": true,
     "verify_completion": true,
     "completion_retries": 3,
@@ -138,7 +141,6 @@
     "auto_tag": true,
     "tag_max_rounds": 4,
     "use_jev": true,
-    "min_tag_score": 0.5,
     "max_collect_per_message": 9,
     "avoid_repeat_last": 8
   },

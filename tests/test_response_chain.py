@@ -72,7 +72,7 @@ class ResponseChainTests(Fixture):
 
     def test_non_allowlisted_jev_choice_never_executes(self):
         jev = self.jev()
-        jev.select_fixed_action.return_value = 'execute_command'
+        jev.select_fixed_action.return_value = 'bash'
         class Brain:
             def stream_chat_and_tools(inner, *args, **kwargs):
                 yield 'text_delta', '你好。'
@@ -135,7 +135,7 @@ class ResponseChainTests(Fixture):
         action = resolve_fixed_action('recent_media')
         action['arguments']['limit'] = 1000
         self.assertEqual(resolve_fixed_action('recent_media')['arguments'], {'limit': 9})
-        self.assertIsNone(resolve_fixed_action({'tool': 'write_file'}))
+        self.assertIsNone(resolve_fixed_action({'tool': 'write'}))
 
     def test_powershell_http_defaults_bypass_system_proxy(self):
         import os
@@ -143,7 +143,7 @@ class ResponseChainTests(Fixture):
             self.skipTest('Windows only')
         from test_core import FakeJev
         harness = AgentHarness(None, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        result = harness._dispatch_tool('execute_command', {'command': "[System.Net.WebRequest]::DefaultWebProxy.IsBypassed([uri]'https://example.org')"})
+        result = harness._dispatch_tool('bash', {'command': "[System.Net.WebRequest]::DefaultWebProxy.IsBypassed([uri]'https://example.org')"})
         self.assertTrue(result['ok'])
         self.assertIn('True', result['output'])
 

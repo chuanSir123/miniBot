@@ -17,6 +17,9 @@ from core.harness import build_structured_system_prompt, HARNESS_TOOLS
 from core.network import direct_opener
 from core.skill_manager import SkillManager
 
+# 项目根按本文件位置推导：换机器、换目录都不用改脚本。
+ROOT = Path(__file__).resolve().parents[1].as_posix()
+
 b = VLMBrain()
 base, key, model, _ = b._settings()
 ep = base if base.endswith("/chat/completions") else base + "/chat/completions"
@@ -78,8 +81,8 @@ def run(label, system, catalog_in_tail):
         # 模拟模型返回工具调用, 并把 assistant/tool 写进历史
         msgs.append({"role": "assistant", "content": "", "tool_calls": [{
             "id": f"call_{turn}", "type": "function",
-            "function": {"name": "read_file",
-                         "arguments": json.dumps({"file_path": f"D:/github/miniBot/README.md"})}}]})
+            "function": {"name": "read",
+                         "arguments": json.dumps({"file_path": f"{ROOT}/README.md"})}}]})
         msgs.append({"role": "tool", "tool_call_id": f"call_{turn}",
                      "content": json.dumps({"ok": True, "turn": turn})})
         time.sleep(0.3)

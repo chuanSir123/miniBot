@@ -1,7 +1,7 @@
 """尾部体积与工具输出体积的回归测试。
 
 这两处体积都会被逐轮重算：尾部每轮必然 miss，工具结果则永久留在历史里。
-它们曾经各自让上下文凭空多出一整份文件（write_file 的参数 + diff 回显 +
+它们曾经各自让上下文凭空多出一整份文件（write 的参数 + diff 回显 +
 task_state 里再存一份 diff），把 TTFT 从 2.5s 抬到 9s。
 
 约定：``write`` 只回一行成功信息，``edit`` 只回改了 N 块，完整 diff 放在
@@ -28,7 +28,7 @@ class DiffForModelTests(unittest.TestCase):
         diff = self._new_file_diff()
         self.assertGreater(len(diff), 8000)
         out = diff_for_model(diff, is_new=True)
-        self.assertEqual(out, "", "新建文件的 diff 是纯冗余：全文就在 write_file 参数里")
+        self.assertEqual(out, "", "新建文件的 diff 是纯冗余：全文就在 write 参数里")
 
     def test_edit_returns_hunks_without_content(self):
         diff = (
@@ -65,7 +65,7 @@ class CompactCheckpointTests(unittest.TestCase):
                 {"path": "D:/w/pelican_bike.html", "added": 228, "removed": 0,
                  "diff": "+" + "x" * diff_len},
             ],
-            "last_tools": [{"tool": "write_file", "ok": True, "result_preview": "y" * 600}],
+            "last_tools": [{"tool": "write", "ok": True, "result_preview": "y" * 600}],
             "artifacts": ["D:/w/pelican_bike.html"],
         }
 

@@ -368,6 +368,47 @@ class JevClient:
             tags=sum(1 for tag in scores if tag != "none"), batches=asked)
         return scores
 
+    # 表情包只按 Jev 排名前 3 的标签去匹配图库。
+    MEME_TOP_TAGS = 3
+
+    def rank_meme_tags(self, message, reply, tags, top_k=None, max_batches=4):
+        """按贴切度取出前 top_k 个标签，并给出「这一轮要不要发表情」。
+
+        打分仍然交给 score_meme_tags（每个标签一个独立的 0~1 分），这里只做两件事：
+        排序取前 top_k、以及用 none 判定要不要发。把"取第几名"从调用方搬到这里，
+        是为了让「Jev 输出的是排名前三的标签」成为一条明确契约，而不是调用方各自
+        用 max() 取一个标签——那样等于把其余标签全丢掉，一个标签达不到阈值就整轮不发。
+
+        返回 (top_tags, scores)：
+          - top_tags 非空：拿这几个标签去匹配，调用方必定发一张；
+          - top_tags 为空列表：none 得分最高，这条回复不该配图；
+          - 整体返回 None：这一轮没拿到任何分（未配置/首轮就失败），调用方走降级，
+            不能把"没问到"当成"不该发"。
+        """
+        from core.console import log
+
+        scores = self.score_meme_tags(message, reply, tags, max_batches=max_batches)
+        if not scores:
+            return None
+        k = max(1, int(top_k or self.MEME_TOP_TAGS))
+        ranked = sorted(
+            ((float(value), tag) for tag, value in scores.items() if tag != "none"),
+            key=lambda item: -item[0],
+        )
+        none_score = float(scores.get("none") or 0.0)
+        top_score = ranked[0][0] if ranked else 0.0
+        if ranked and none_score > top_score:
+            log("Decision", "meme.ranked", top=[], none=round(none_score, 3),
+                top_score=round(top_score, 3), send=False)
+            return ([], scores)
+        # 先要"确实贴切"的标签；一个都没有时按排名前几位照常取，交给图库匹配兜底。
+        top = [tag for score, tag in ranked if score > 0][:k]
+        if not top:
+            top = [tag for _, tag in ranked][:k]
+        log("Decision", "meme.ranked", top=top, none=round(none_score, 3),
+            top_score=round(top_score, 3), send=bool(top))
+        return (top, scores)
+
     @staticmethod
     def _noul_value(answer) -> float:
         """noul 应答取 0~1 的分；字段缺失或格式异常一律当 0（不贴切）。"""

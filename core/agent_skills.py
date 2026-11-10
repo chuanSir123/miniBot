@@ -1,8 +1,9 @@
 """Agent Skills loader（参照 agentskills.io 开放规范）。
 
 目录形态：skills/<name>/SKILL.md（必须）+ scripts/、references/、assets/（可选）。
-渐进式披露：启动时只把 name + description 注入系统提示；完整指令在
-execute_skill 无参数调用时返回 SKILL.md 正文；带 entry 脚本的技能可继续执行。
+渐进式披露：启动时只把 name + description + SKILL.md 的绝对路径注入系统提示；
+模型用 read 把完整指令读进上下文，再按文档用 bash 跑脚本
+（每个技能自己的 scripts/<name>.py 自带 CLI 入口，由 bash 直接运行）。
 """
 import json
 import re

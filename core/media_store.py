@@ -41,6 +41,20 @@ REF_PATTERN = re.compile(r"(?:img|vid|aud)_[a-f0-9]{16}")
 KIND_LABEL = {"image": "图片", "video": "视频", "audio": "音频"}
 MAX_BYTES = {"image": 20_000_000, "video": 100_000_000, "audio": 50_000_000}
 
+# 回复里的媒体占位（`![图片](media://img_x)`）。这串标记只给聊天记录和模型看：
+# 落库时留着，模型下一轮才知道「这条回复配了哪张图」；任何直接展示给用户的
+# 地方（群文本、桌宠气泡、Web 助理记录）都必须先剥掉，用户该看到的是图片本身。
+MEDIA_LINK_RE = re.compile(r"!?\[[^\]\r\n]*\]\(media://[^)\r\n]+\)")
+
+
+def strip_media_links(text):
+    """去掉正文里的媒体占位，返回只剩人话的部分。"""
+    if not isinstance(text, str) or not text:
+        return text or ""
+    cleaned = MEDIA_LINK_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
 
 def sniff_media(data):
     """按文件头识别媒体类型，不依赖 Pillow。

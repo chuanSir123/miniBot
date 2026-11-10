@@ -10,11 +10,15 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from pathlib import Path
 from urllib.parse import urlparse
 from core.config import load_config
 from core.console import log
-from core.meme import get_meme_manager
+from core.meme import (
+    FAILURE_PREFIXES,
+    get_meme_manager,
+    pick_meme_asset,
+    record_meme_in_history,
+)
 from channels.qq_text import TextStyle
 
 
@@ -31,6 +35,14 @@ except ImportError:
 
 # 比对前先抹掉标点、空白、emoji 与颜文字，只留下有信息量的汉字/字母/数字。
 _PUNCT_RE = re.compile(r"[^\w一-龥]")
+
+# 回复里的媒体占位（`![图片](media://img_x)`）。收尾去重时要能把它从正文里摘出来，
+# 单独判断"这一轮除了这句话，还有没有新东西要发"。
+_MEDIA_LINK_RE = re.compile(r"!?\[[^\]\r\n]*\]\(media://[^)\r\n]+\)")
+
+# 引导注入的系统回显。main.py 返回的「已进入引导」确认已经告知用户，
+# harness 生效时再念一遍 [实时方向修正] xxx 就成了同一件事发两条。
+_STEERING_ECHO_PREFIXES = ("[实时方向修正]", "[实时引导]")
 
 # 群职位/群名核验结果的内存缓存：(键, 过期时刻)。职位 5 分钟、群名 30 分钟，
 # 避免每条群消息都打一次 NapCat 接口；进程内缓存即可，重启后自然重新核验。
@@ -513,6 +525,11 @@ class NapCatChannel:
             def on_intermediate(message):
                 if isinstance(event, dict):
                     event["_used_tools"] = True
+                # 引导的回显不进群：用户已经从 main.py 那条确认里知道「进引导了」，
+                # 再把同一句原文当进度播报一次就是重复。
+                if isinstance(message, str) and message.lstrip().startswith(_STEERING_ECHO_PREFIXES):
+                    log("QQ", "intermediate.skip_steering_echo", preview=message[:40])
+                    return
                 loop.call_soon_threadsafe(enqueue, message)
 
             async def send_progress():
@@ -574,6 +591,8 @@ class NapCatChannel:
                 log("QQ", "reply.error", error=str(exc))
                 # 走到这里模型通常已经不可用了，没法让人设来组织这句话，
                 # 至少别用"请稍后再试"这种客服腔。
+                if isinstance(event, dict):
+                    event["_turn_failed"] = True
                 result = "刚那条没处理成，你再说一遍？"
             finally:
                 # Flush thread-safe enqueue callbacks before the sentinel, then
@@ -593,19 +612,90 @@ class NapCatChannel:
             should_send_final = False
         elif last_intermediate:
             clean_res = result.strip()
-            # 只有在没有新媒体引用且内容与最后一次中间消息完全相同或高度雷同时才跳过
-            if clean_res == last_intermediate.strip():
+            repeated = clean_res == last_intermediate.strip() or (
+                # 段落几乎重复：只有带新媒体时才值得再发一遍正文
+                "media://" not in clean_res and _is_repeat(clean_res, last_intermediate, _FINAL_RATIO)
+            )
+            if repeated and "media://" not in clean_res:
                 should_send_final = False
-            elif "media://" not in clean_res and _is_repeat(clean_res, last_intermediate, _FINAL_RATIO):
-                should_send_final = False
+            elif repeated:
+                # 正文和最后一条进度重复，但收尾时新挂了媒体（表情包/附件）：
+                # 只补发媒体，同一段话不再说第二遍。
+                result = "\n".join(_MEDIA_LINK_RE.findall(clean_res))
+                should_send_final = bool(result)
 
         if should_send_final:
             await self.send_reply_segments(event, result)
+
+        # 正文已经出去了，再决定要不要补一张表情。顺序必须是「文字 → 图片」：
+        # 挑图要问 Jev（1~2s），压在正文前面就是让用户干等。
+        await self._send_meme_after_text(event, result if isinstance(result, str) else "")
 
         log("QQ", "reply.complete", message_id=event.get("message_id"),
             elapsed_ms=round((time.monotonic() - pipeline_started) * 1000),
             queue_wait_ms=queue_wait_ms,
             final_send_ms=round((time.monotonic() - final_send_started) * 1000))
+
+    @staticmethod
+    def _meme_chat_key(event) -> str:
+        """会话标识：群聊按群、私聊按人。表情避让只看同一个会话，互不影响。"""
+        if not isinstance(event, dict):
+            return ""
+        if event.get("message_type") == "private":
+            return f"user:{event.get('user_id')}"
+        return f"group:{event.get('group_id')}"
+
+    async def _send_meme_after_text(self, event, reply_text, session_id=""):
+        """正文发完之后挑一张表情，单独发一条；挑中就记进聊天记录。
+
+        顺序是固定的三步：先文字，再挑图，最后图片。挑图只认这句最终回复，工具
+        调用过程中的进度文本不参与——那是之前表情包总配错味的原因。图片发出去
+        之后补一条 assistant 记录（`![图片](media://img_x)`），下一轮模型才知道
+        自己发过哪张，不会重复发同一张。
+        """
+        if not isinstance(event, dict) or event.get("_meme_sent") or event.get("_turn_failed"):
+            return
+        event["_meme_sent"] = True
+        text = reply_text.strip() if isinstance(reply_text, str) else ""
+        if not text or text.startswith(FAILURE_PREFIXES):
+            return
+        from core.decision_context import qq_scope
+
+        scope = qq_scope(event)
+        parsed = event.get("_parsed") or {}
+        incoming = parsed.get("direct_text") or parsed.get("text") or ""
+        try:
+            picked = await asyncio.to_thread(
+                pick_meme_asset, text, incoming, scope, self._meme_chat_key(event))
+        except Exception as exc:
+            log("QQ", "meme.pick_error", error=str(exc)[:160])
+            return
+        if not picked:
+            return
+
+        # 走一遍正常的媒体解析：类型、scope 校验、本机路径都在这一层统一处理。
+        from channels.qq_reply import reply_parts
+
+        try:
+            parts = reply_parts(f"![图片](media://{picked['ref']})", event)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            log("QQ", "meme.segment_error", error=str(exc)[:160])
+            return
+        media_part = next((p for p in parts if p.get("type") == "image"), None)
+        if not media_part:
+            return
+
+        await asyncio.sleep(random.uniform(0.6, 1.2))
+        private = event.get("message_type") == "private"
+        action = "send_private_msg" if private else "send_group_msg"
+        target = event.get("user_id") if private else event.get("group_id")
+        delivered = await self._send_segments(
+            action, target, [{"type": "image", "data": media_part["data"]}],
+            media_asset=media_part.get("_media"), asset_scope=scope)
+        log("QQ", "reply.sent_meme", user_id=str(event.get("user_id", "")), ok=delivered,
+            meme=str(picked.get("path", "")).replace("\\", "/").rsplit("/", 1)[-1])
+        if delivered:
+            await asyncio.to_thread(record_meme_in_history, session_id or scope, picked["ref"])
 
     async def send_reply_segments(self, event, text_reply):
         is_intermediate = bool(isinstance(event, dict) and event.get("_is_intermediate"))
@@ -657,44 +747,12 @@ class NapCatChannel:
                     self.policy.observe("[已发送" + {"image": "图片", "record": "语音", "video": "视频"}[part["type"]] + "]", sent_event, role="assistant")
         return all_delivered
 
-    @staticmethod
-    def _meme_chat_key(event) -> str:
-        """会话标识：群聊按群、私聊按人。表情避让只看同一个会话，互不影响。"""
-        if not isinstance(event, dict):
-            return ""
-        if event.get("message_type") == "private":
-            return f"user:{event.get('user_id')}"
-        return f"group:{event.get('group_id')}"
-
-    async def _pick_meme_for_turn(self, event, reply_text: str):
-        """一轮对话最多发一次表情；同一轮最多决策两次（进度一次、终稿一次）。
-
-        进度的语境和终稿不一定相同，所以进度上"没选中"不该连累终稿；但真发出去
-        一次之后就必须收手——同一轮里连发几张才是噪音的来源。
-        """
-        if not isinstance(event, dict) or event.get("_meme_sent"):
-            return None
-        if int(event.get("_meme_tries") or 0) >= 2:
-            return None
-        event["_meme_tries"] = int(event.get("_meme_tries") or 0) + 1
-        parsed = event.get("_parsed") or {}
-        incoming = parsed.get("direct_text") or parsed.get("text") or ""
-        exclude = event.setdefault("_meme_paths", set())
-        chat_key = self._meme_chat_key(event)
-        try:
-            path = await asyncio.to_thread(
-                get_meme_manager().choose_meme, incoming, reply_text, list(exclude), chat_key
-            )
-        except Exception as exc:
-            log("QQ", "meme.choose_error", error=str(exc)[:160])
-            return None
-        if path:
-            event["_meme_sent"] = True
-            exclude.add(path)
-        return path
-
     async def _send_text_reply(self, event, text_reply: str):
-        """拟人化分段发送回复，并附带一张与本轮语境匹配的表情包。"""
+        """拟人化分段发送回复。
+
+        这里只发文字。表情包由 `_send_meme_after_text` 在这之后单独挑、单独发，
+        正文里永远不会有 media:// 占位——用户看到的应该是图片，不是那串括号。
+        """
         uid = str(event.get("user_id", ""))
         is_private = event.get("message_type") == "private"
         target = event.get("user_id") if is_private else event.get("group_id")
@@ -706,10 +764,7 @@ class NapCatChannel:
         # 标记从正文里剥掉，免得用户看到中括号。
         clean_text, _legacy_hint = extract_meme_tag(text_reply)
         # 报文类兜底文案也算错误：报错原样送出，不做任何「美化」。
-        is_error = clean_text.lstrip().startswith(
-            ("【模型接口错误", "【对话模型请求超时", "【VLM", "模型连接失败",
-             "【[WinError", "【[Errno", "【网络", "【连接")
-        )
+        is_error = clean_text.lstrip().startswith(FAILURE_PREFIXES)
 
         # 工具场景曾经整条不拆，727 字的搜索结果总结就是这样变成「一大筐」的——
         # 用了工具只说明内容是交付物，不代表它不该分条。现在只有代码块必须整体送达。
@@ -729,36 +784,16 @@ class NapCatChannel:
             )
 
         all_delivered = bool(segments_to_send)
-        # 挑表情要问 Jev（一次 HTTP，通常 1~2s）。让它在正文发送的同时跑，
-        # 而不是发完再问：多段消息本来就有打字间隔，这段时间正好用来做决策。
-        meme_task = None if is_error else asyncio.create_task(
-            self._pick_meme_for_turn(event, clean_text)
-        )
-        try:
-            # 逐段模拟打字发送
-            for i, segment in enumerate(segments_to_send):
-                if i > 0:
-                    delay = min(1.8, max(0.8, len(segment) * 0.05 + random.uniform(0.3, 0.7)))
-                    await asyncio.sleep(delay)
-                delivered = await self._send(action, target, segment)
-                all_delivered = bool(delivered) and all_delivered
-                if delivered and self.policy and hasattr(self.policy, "observe"):
-                    self.policy.observe(segment, event, role="assistant")
-                log("QQ", "reply.sent_segment", user_id=uid, segment=i + 1, ok=delivered)
-
-            meme_file = await meme_task if meme_task else None
-        finally:
-            if meme_task and not meme_task.done():
-                meme_task.cancel()
-        if meme_file and Path(meme_file).exists():
-            await asyncio.sleep(random.uniform(0.5, 1.0))
-            file_url = Path(meme_file).resolve().as_uri()
-            meme_payload = [{"type": "image", "data": {"file": file_url}}]
-            delivered = await self._send_segments(action, target, meme_payload)
-            log("QQ", "reply.sent_meme", user_id=uid, ok=delivered, meme=Path(meme_file).name)
-            # 真发出去才记冷却：选中但发送失败的图不该被白白避开
-            if delivered:
-                get_meme_manager().note_sent(self._meme_chat_key(event), meme_file)
+        # 逐段模拟打字发送
+        for i, segment in enumerate(segments_to_send):
+            if i > 0:
+                delay = min(1.8, max(0.8, len(segment) * 0.05 + random.uniform(0.3, 0.7)))
+                await asyncio.sleep(delay)
+            delivered = await self._send(action, target, segment)
+            all_delivered = bool(delivered) and all_delivered
+            if delivered and self.policy and hasattr(self.policy, "observe"):
+                self.policy.observe(segment, event, role="assistant")
+            log("QQ", "reply.sent_segment", user_id=uid, segment=i + 1, ok=delivered)
         return all_delivered
 
     async def request(self, action, params):
@@ -828,17 +863,68 @@ class NapCatChannel:
             self.policy.observe(message, {"message_type": "group", "group_id": group_id, "self_id": self._self_id}, role="assistant")
         return delivered
 
-    def send_notification(self, channel, target, message):
+    async def _send_notification_async(self, channel, target, message, session_id=""):
+        """通知类消息也按「文本 / 媒体」拆开送。
+
+        定时任务、主动提醒的正文里可能带着 `![图片](media://img_x)` 占位——那是给
+        聊天记录看的标记。以前这里直接走 `_send` 纯文本，结果群里看到的是一串
+        中括号，图片反而没发出去。占位符永远不上屏：文字归文字发，媒体单独一条。
+        """
+        from channels.qq_reply import reply_parts
+        from core.media_store import strip_media_links
+
+        is_group = channel == "qq_group"
+        action = "send_group_msg" if is_group else "send_private_msg"
+        event = (
+            {"message_type": "group", "group_id": target, "self_id": self._self_id}
+            if is_group
+            else {"message_type": "private", "user_id": target, "self_id": self._self_id}
+        )
+        try:
+            parts = reply_parts(message, event)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            log("QQ", "notice.media_error", error=str(exc)[:160])
+            parts = [{"type": "text", "data": {"text": str(message)}}]
+
+        delivered = True
+        sent_media = False
+        for part in parts:
+            if part.get("type") == "text":
+                # 占位符原本独占一行，拆走之后会剩个空行；通知消息不留这种尾巴。
+                text = (part.get("data", {}).get("text") or "").rstrip()
+                if not text.strip():
+                    continue
+                ok = await self._send(action, target, text)
+            else:
+                from core.decision_context import qq_scope
+
+                sent_media = True
+                ok = await self._send_segments(
+                    action, target,
+                    [{"type": part["type"], "data": part["data"]}],
+                    media_asset=part.get("_media"),
+                    asset_scope=qq_scope(event) if part.get("_media") else None,
+                )
+                log("QQ", "notice.sent_media", channel=channel, kind=part["type"], ok=bool(ok))
+            delivered = bool(ok) and delivered
+
+        # 给策略层喂的也是剥掉占位的正文：它跟的是"说了什么"，不是内部引用。
+        spoken = strip_media_links(str(message))
+        if delivered and spoken and not sent_media:
+            # 定时任务/主动提醒也是陪聊：正文出去之后再补一张表情，顺序不变。
+            await self._send_meme_after_text(event, spoken, session_id)
+        if delivered and spoken and self.policy and hasattr(self.policy, "observe"):
+            self.policy.observe(spoken, event, role="assistant")
+        return delivered
+
+    def send_notification(self, channel, target, message, session_id=""):
         if not self._running or not self._loop or self._loop.is_closed():
             return False
-        coro = (
-            self.send_group_msg(target, message)
-            if channel == "qq_group"
-            else self.send_private_msg(target, message)
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_notification_async(channel, target, message, session_id), self._loop
         )
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
-            return future.result(12)
+            return bool(future.result(30))
         except Exception:
             future.cancel()
             return False

@@ -113,3 +113,12 @@ def _pick_ws_cfg(cfg):
 DESCRIPTION = '给 QQ 好友资料页点赞（OneBot send_like）。当主人或群友说「赞我/点赞/给我点赞/帮我点个赞/给xxx点赞」时使用。参数 user_id 为要点赞的好友 QQ 号（字符串或数字）；不传则默认给当前消息发送者点赞。通过 NapCat 的 OneBot WebSocket 通道（带 access_token 的 Authorization 头）发送 send_like 请求。'
 
 PARAMETERS = {'type': 'object', 'properties': {'user_id': {'type': 'string', 'description': '要点赞的好友 QQ 号；不传则给当前消息发送者点赞'}, 'count': {'type': 'integer', 'description': '点赞次数，默认 1', 'default': 1}}, 'additionalProperties': False}
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

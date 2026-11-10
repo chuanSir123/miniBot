@@ -151,10 +151,10 @@ def _truncate(text, max_chars):
 # ---------------------------------------------------------------------------
 
 _FILE_TOOL_KINDS = {
-    "read_file": "read",
+    "read": "read",
     "list_files": "read",
-    "write_file": "written",
-    "edit_file": "edited",
+    "write": "written",
+    "edit": "edited",
 }
 
 
@@ -369,7 +369,8 @@ class ContextCompactor:
 
     # -- 主流程 -------------------------------------------------------------
 
-    def _run_compaction_worker(self, history, keep=KEEP_RECENT_MESSAGES):
+    def _run_compaction_worker(self, history, keep=KEEP_RECENT_MESSAGES,
+                               keep_tokens=None, budget_override=None):
         if self.memory and not self.summary:
             _, persisted = self.memory.get_history(self.session_id)
             if persisted:
@@ -379,11 +380,11 @@ class ContextCompactor:
         if not entries or not self.brain or self.cancelled():
             return False
 
-        cut, split = find_cut_point(entries, self.keep_recent_tokens(), keep)
+        cut, split = find_cut_point(entries, keep_tokens or self.keep_recent_tokens(), keep)
         if cut == 0 and keep > 4 and len(entries) >= 6:
             # 上下文压力优先于"至少留 20 条"的舒适下限：几轮工具就把窗口撑爆时，
             # 只留 4 条也必须压，否则只能等溢出报错。
-            cut, split = find_cut_point(entries, self.keep_recent_tokens(), 4)
+            cut, split = find_cut_point(entries, keep_tokens or self.keep_recent_tokens(), 4)
         prefix = entries[:cut]
         if not prefix:
             log("Compaction", "skipped", session=self.session_id, reason="没有可压缩的前缀",
@@ -400,7 +401,7 @@ class ContextCompactor:
             return False
         self._last_attempt = attempt
 
-        summary = self._summarize(prefix, split=split)
+        summary = self._summarize(prefix, split=split, budget_override=budget_override)
         if not summary:
             log("Compaction", "skipped", session=self.session_id, reason="摘要生成失败", prefix=len(prefix))
             return False
@@ -423,7 +424,72 @@ class ContextCompactor:
             covered_until_id=new_cutoff, compressed=len(prefix), kept=len(entries) - len(prefix))
         return True
 
-    def _summarize(self, prefix, split=False):
+    def compact_for_overflow(self, history, failed_tokens):
+        """服务端已经明确报超长之后的强制压缩。
+
+        与常规压缩最大的区别是"压到多大"的参照物。常规路径看配置里的
+        context_window，可这个值完全可能比服务端真实窗口大（换了模型没同步改配置、
+        中间还隔了一层代理），照它压等于没压。这里以"刚刚失败的那次请求"为基准，
+        目标取它的一半，摘要请求自己也被压到同一量级以下（见 _summarize 的
+        budget_override）——否则压缩这一步会先撞同一堵墙。
+
+        第一次压不动（保留区自身就超预算）就退到只留 1 条；再压不动，说明问题
+        不在"历史太多"，而在"某一条太大"，交给 shrink_oversized 处理。
+        """
+        failed = int(failed_tokens or 0)
+        if failed <= 0 or not history:
+            return False
+        target = max(2000, failed // 2)
+        for keep in (KEEP_RECENT_MESSAGES, 1):
+            # 上一轮可能刚因"没有可压的前缀"记过标记，这里要允许重试。
+            self._last_attempt = None
+            if self._run_compaction_worker(history, keep=keep,
+                                           keep_tokens=max(1000, target // 4),
+                                           budget_override=target):
+                log("Compaction", "overflow_compacted", session=self.session_id,
+                    failed_tokens=failed, target=target, keep=keep)
+                return True
+        log("Compaction", "overflow_skipped", session=self.session_id,
+            failed_tokens=failed, target=target, reason="没有可压缩的前缀")
+        return False
+
+    @staticmethod
+    def shrink_oversized(messages, target_tokens, min_chars=400):
+        """最后一道兜底：把单条超大消息就地截短。
+
+        压缩是按"切点"工作的——切点之前进摘要、之后原样保留。所以"一条 20 万字符
+        的工具结果"只要落在保留区里，压多少次都还在，请求照样发不出去。这里按体积
+        从大到小逐次减半，直到估算降到目标以下。
+
+        只改返回的副本，不动历史行：原文还在库里，模型真需要可以 read_history 取回。
+        """
+        if target_tokens <= 0 or not messages:
+            return messages
+        result = copy.deepcopy(messages)
+        for _ in range(40):
+            if estimate_text_tokens({"messages": result}) <= target_tokens:
+                break
+            index, size = -1, 0
+            for position, message in enumerate(result):
+                content = message.get("content")
+                if not isinstance(content, str) or message.get("role") == "system":
+                    continue
+                # 末条是这一轮的提问，砍它等于把用户的话截一半，宁可继续砍别的。
+                if position == len(result) - 1 and message.get("role") == "user":
+                    continue
+                if len(content) > size and len(content) > min_chars:
+                    index, size = position, len(content)
+            if index < 0:
+                break
+            content = result[index]["content"]
+            keep = max(200, len(content) // 2)
+            head, tail = content[: keep // 2], content[-keep // 2:]
+            result[index]["content"] = (
+                head + "\n…[内容过长，已截断；原始结果仍在历史里，必要时用 read_history 查询]…\n" + tail
+            )
+        return result
+
+    def _summarize(self, prefix, split=False, budget_override=None):
         """一次结构化摘要调用。已有摘要时走增量更新，不重新总结。"""
         previous = (self.summary or {}).get("summary", "")
         task_checkpoint = None
@@ -435,6 +501,11 @@ class ContextCompactor:
 
         cfg = load_config()["vlm"]
         budget = max(2000, cfg["context_window"] - cfg["max_tokens"] - 1000)
+        if budget_override:
+            # 服务端已经报过超长时，配置里的窗口不能信（它可能比服务端真实窗口大）。
+            # 摘要请求本身也是发给同一个服务端的，必须压到失败请求那个量级以下，
+            # 否则"压缩"这一步会先撞同一堵墙，压来压去全是白跑。
+            budget = min(budget, max(2000, int(budget_override)))
         conversation = serialize_conversation(history_for_model)
         while estimate_text_tokens(conversation) > budget and len(history_for_model) > 1:
             history_for_model = history_for_model[len(history_for_model) // 2:]

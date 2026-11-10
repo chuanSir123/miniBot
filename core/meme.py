@@ -4,12 +4,15 @@
   收集  —— 本地目录扫描 + 群聊静默采集（保留原图，动图不会退化成首帧）
   打标  —— 优先读图片自带元数据/文件名；拿不到再调 VLM 看图出标签
   汇总  —— meme_tags 表维护「每个标签下有几张图、被发过几次」
-  打分  —— Jev 一次请求给每个标签打独立的分，图分 = 各标签分按位置衰减求和
+  打分  —— Jev 给每个标签打独立的分，取排名前三，图分 = 这三个标签的加权匹配度
 
-第四步不能退化成「让模型挑一个标签」：一张图常带 3~6 个标签，选出「可爱」之后，
+第四步不能退化成「让模型挑一个标签」：一张图常带 3~6 个标签，选中「可爱」之后，
 候选池里既有一张真的在卖萌的，也有一张贴着「可爱」但主体情绪是「疑惑」的，
 两者在标签层面完全等价，随机抽一张就是错配。只有让每个标签各自带着分回来，
 多出来的标签才真正参与决策。
+
+取前三而不是只取第一名：只认一个标签时，其余标签全被丢掉，那个标签的分只要不够高
+整轮就不发（线上表现就是几乎不发）。前三名一起参与匹配，发不发只由 none 决定。
 
 用 noul 而不是 choice 也是为此：noul 是独立概率，跨批可直接合并比较，
 所以超过 64 个标签时可以按 63 个一批切开问；choice 是批内相对的 softmax 分布，
@@ -37,6 +40,7 @@ from core.media_store import sniff_media
 
 DEFAULT_MEME_DIR = Path(__file__).resolve().parent.parent / "assets" / "memes"
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "memes.db"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 VALID_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MIME_EXT = {
@@ -47,15 +51,42 @@ MIME_EXT = {
     "image/bmp": ".bmp",
 }
 # 采集入库上限。表情包极少超过这个体积，超了多半是聊天里发的大图。
-MAX_STORED_BYTES = 8_000_000
+# 但 QQ 的动画表情动辄十几兆（几百帧 GIF），卡太紧会把它们全拒收。
+MAX_STORED_BYTES = 12_000_000
 # 打标上限：base64 之后体积会涨 1/3，太大只会拖慢队列。
 MAX_TAGGED_BYTES = 5_000_000
 MAX_TAGS_PER_MEME = 8
+# 判「同一张图」的画面容忍度：64 位 dHash 的汉明距离上限。
+# 取 6 是经验值——重编码、改尺寸一般落在 0~4 位，不同表情基本在 15 位以上。
+BLACKLIST_SIMILARITY = 6
+
+
+def _rel(path) -> str:
+    """库里只存相对项目根的路径。
+
+    以前存的是绝对路径，项目目录一搬整个图库就变成一堆死链，只能手工修。
+    相对路径跟着项目走，怎么搬都不散，换台机器也能直接用。
+    项目外的图（用户手动放进来的）没得相对，仍然存绝对。
+    """
+    try:
+        return Path(path).resolve().relative_to(PROJECT_ROOT).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _abs(path) -> str:
+    """把库里的路径还原成可打开的绝对路径（老的绝对路径记录照样能用）。"""
+    candidate = Path(str(path))
+    return str(candidate if candidate.is_absolute() else PROJECT_ROOT / candidate)
 
 # 图分权重：标签在图上排第一就按它的原分算，往后依次衰减。
 # 只加到第 4 个标签为止——再往后基本都是凑数的画风词，给了权重只会让
 # "标签多但都弱"的图挤掉"只有一个标签但完全贴切"的图。
 TAG_POSITION_WEIGHTS: Sequence[float] = (1.0, 0.5, 0.3, 0.15)
+
+# Jev 排名前三的标签：第一名是它真正想表达的语气，第二、三名只是备选，
+# 所以权重依次衰减，不能让"备选标签在图库里图多"反过来盖过第一名。
+TOP_TAG_WEIGHTS: Sequence[float] = (1.0, 0.6, 0.35)
 
 # 情绪桶只在「Jev 不可用」的降级路径里用来把标签归到语气大类，不再写库。
 EMOTION_KEYWORDS: Dict[str, List[str]] = {
@@ -80,6 +111,13 @@ SUGGESTED_TAGS: Sequence[str] = (
 )
 
 TAG_VOCAB = "、".join(SUGGESTED_TAGS)
+
+# 报文类兜底文案（模型/网络故障）原样送出，不配表情——配了像是在报错上贴笑脸。
+# 「附件发送失败」同理：那条本身就是坏消息，后面跟张表情更像嘲讽。
+FAILURE_PREFIXES = (
+    "【模型接口错误", "【对话模型请求超时", "【VLM", "模型连接失败",
+    "【[WinError", "【[Errno", "【网络", "【连接", "附件发送失败",
+)
 
 TAG_INSTRUCTION = (
     "你是表情包图库的标注员。看这张图，先判断它是不是表情包，再决定输出。\n"
@@ -258,8 +296,74 @@ def filename_tags(path: Path) -> List[str]:
     return normalize_tags(tags)
 
 
+def chat_key_from_scope(scope) -> str:
+    """把工具作用域换成表情避让用的会话键。
+
+    同一个会话在不同层有三种写法：channel 层记的是 ``group:123`` / ``user:456``，
+    main.py 传下来的是 ``qq_group_123``，媒体库内部又用 ``qq:group:123``。
+    对不上就会出现"刚发的那张"永远找不到，所以这里把它们收敛成 channel 的写法。
+    """
+    match = re.match(r"qq[:_](group|private)[:_](\d+)", str(scope or ""))
+    if not match:
+        return ""
+    return f"{'group' if match[1] == 'group' else 'user'}:{match[2]}"
+
+
+def _perceptual_hash(data: bytes) -> str:
+    """64 位 dHash：把图缩成 9×8 灰度，比相邻像素亮度，得到一个"长得像"的指纹。
+
+    为什么不只用 md5：md5 认字节，认不出画面。用户在 QQ 里把一张图存下来再发，
+    客户端会重新编码（去 EXIF、改压缩率、转格式），字节全变了，画面一点没变。
+    要"这张图以后别发了"，必须按画面认。
+
+    Pillow 是可选依赖（requirements-core 里标了 Optional）。装不上就返回空串，
+    调用方退回 md5 精确匹配，功能仍在，只是认不出重编码过的图。
+    """
+    if not data:
+        return ""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except ImportError:
+        return ""
+    try:
+        with Image.open(BytesIO(data)) as image:
+            # GIF 只看第一帧：表情包的主体信息几乎都在首帧，逐帧比会慢一个量级。
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            pixels = list(image.convert("L").resize((9, 8), resampling).getdata())
+    except Exception:
+        return ""
+    value = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            value = (value << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+    return f"{value:016x}"
+
+
+def _hamming(left: str, right: str) -> int:
+    """两个 dHash 差了几位；任何一边为空都算"没法比"，返回一个大数。"""
+    if not left or not right or len(left) != len(right):
+        return 64
+    return bin(int(left, 16) ^ int(right, 16)).count("1")
+
+
+def _phash_usable(phash: str) -> bool:
+    """这个指纹能不能拿来判"是不是同一张图"。
+
+    纯色图、纯渐变图的 dHash 会退化成全 0 或全 1 —— 两张颜色完全不同的纯色图
+    指纹一模一样。按指纹删图的代价是删错人，所以这类图直接不参与画面比对，
+    退回到 md5 精确匹配：宁可删不掉，也不能删错。
+    """
+    if not phash or len(phash) != 16:
+        return False
+    bits = bin(int(phash, 16)).count("1")
+    return 6 <= bits <= 58
+
+
 class MemeManager:
-    """表情包库：入库、打标、汇总、挑选。"""
+    """表情包库：入库、打标、汇总、挑选、删除。"""
 
     def __init__(self, meme_dir: Optional[Path] = None, db_path: Optional[Path] = None):
         # 路径在运行时解析而不是默认参数绑定：测试要能把库重定向到临时目录，
@@ -276,7 +380,11 @@ class MemeManager:
         # 只在内存里记，重启清零 —— 冷却窗口丢一次没什么代价，
         # 持久化反而要在清理旧会话上花心思。
         self._recent: Dict[str, deque] = {}
+        # 画面指纹缓存：file_hash -> dHash。删除是低频操作，按需算一次就够，
+        # 不落库也就省了一次 schema 迁移。
+        self._phash_cache: Dict[str, str] = {}
         self._init_db()
+        self._normalize_paths()
         self.scan_local_memes()
         self.rebuild_tag_summary()
         self._ensure_tagger()
@@ -317,6 +425,14 @@ class MemeManager:
                     count INTEGER DEFAULT 0,
                     used INTEGER DEFAULT 0,
                     updated_at REAL
+                )
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS meme_blacklist (
+                    file_hash TEXT PRIMARY KEY,
+                    phash TEXT DEFAULT '',
+                    reason TEXT DEFAULT '',
+                    created_at REAL
                 )
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_memes_hash ON memes(file_hash)")
@@ -363,6 +479,16 @@ class MemeManager:
         db.execute("CREATE INDEX IF NOT EXISTS idx_memes_hash ON memes(file_hash)")
         log("Meme", "schema.migrated")
 
+    def _normalize_paths(self):
+        """把历史记录里的绝对路径就地改写成相对项目根（幂等，老库也能跑）。"""
+        with self._lock, self._db() as db:
+            rows = db.execute("SELECT id, file_path FROM memes WHERE file_path IS NOT NULL").fetchall()
+            for row in rows:
+                stored = str(row["file_path"])
+                relative = _rel(stored)
+                if relative != stored:
+                    db.execute("UPDATE memes SET file_path = ? WHERE id = ?", (relative, row["id"]))
+
     # ------------------------------------------------------------ 收集
     def scan_local_memes(self):
         """扫描本地目录，把新文件登记进库（已有记录不动，保住使用计数）。
@@ -371,7 +497,7 @@ class MemeManager:
         启动都白等好几秒。文件被原地替换过的，用 retag_all() 重打一次即可。
         """
         with self._lock, self._db() as db:
-            known = {row["file_path"] for row in db.execute("SELECT file_path FROM memes") if row["file_path"]}
+            known = {_abs(row["file_path"]) for row in db.execute("SELECT file_path FROM memes") if row["file_path"]}
             for root, _, files in os.walk(self.meme_dir):
                 for name in files:
                     path = Path(root) / name
@@ -390,7 +516,7 @@ class MemeManager:
                     db.execute(
                         "INSERT OR IGNORE INTO memes (file_hash, file_path, source, tags,"
                         " tag_source, use_count, created_at, tagged_at) VALUES (?,?,?,?,?,0,?,?)",
-                        (digest, str(path), "local", json.dumps(tags, ensure_ascii=False),
+                        (digest, _rel(path), "local", json.dumps(tags, ensure_ascii=False),
                          "filename" if tags else "", time.time(), time.time() if tags else None),
                     )
                     if not tags:
@@ -404,6 +530,11 @@ class MemeManager:
         if kind != "image":
             return None
         digest = hashlib.md5(image_bytes).hexdigest()
+        # 用户明确说过「这张别发了」的图，再被人发回来也不能重新入库 —— 只删记录
+        # 不拦采集的话，删掉的那张过一会儿就会自己长回来。
+        if self.is_blacklisted(digest, image_bytes):
+            log("Meme", "collect.skipped_blacklisted", hash=digest[:8])
+            return None
         collect_dir = self.meme_dir / "collected"
         collect_dir.mkdir(parents=True, exist_ok=True)
         target = collect_dir / f"{digest}{MIME_EXT.get(mime, '.png')}"
@@ -413,7 +544,7 @@ class MemeManager:
             if row:
                 # 重复收集不能重置 use_count：旧实现用 INSERT OR REPLACE，每收一次
                 # 就把 id 和计数清零，"少发重复图"的机制于是永远不生效。
-                db.execute("UPDATE memes SET file_path = ? WHERE id = ?", (str(target), row["id"]))
+                db.execute("UPDATE memes SET file_path = ? WHERE id = ?", (_rel(target), row["id"]))
                 if not target.exists():
                     try:
                         target.write_bytes(image_bytes)
@@ -429,7 +560,7 @@ class MemeManager:
             db.execute(
                 "INSERT INTO memes (file_hash, file_path, source, tags, tag_source,"
                 " use_count, created_at, tagged_at) VALUES (?,?,?,?,?,0,?,?)",
-                (digest, str(target), source, json.dumps(tags, ensure_ascii=False),
+                (digest, _rel(target), source, json.dumps(tags, ensure_ascii=False),
                  "embedded" if tags else "", time.time(), time.time() if tags else None),
             )
             if not tags:
@@ -458,7 +589,7 @@ class MemeManager:
         except sqlite3.Error:
             return
         for row in rows:
-            self._enqueue_tag(row["file_hash"], row["file_path"])
+            self._enqueue_tag(row["file_hash"], _abs(row["file_path"]))
 
     def _enqueue_tag(self, digest: str, path: str):
         try:
@@ -553,6 +684,152 @@ class MemeManager:
             rows = db.execute("SELECT tag, count, used FROM meme_tags WHERE count > 0 ORDER BY used ASC, count DESC").fetchall()
         return [dict(row) for row in rows]
 
+    # ------------------------------------------------------------ 删除与拉黑
+    # 「有些不合适，以后别发了」是两件事，缺一件都不成立：
+    #   删  —— memes 记录、文件、标签汇总一起清掉，候选池里再也没有它
+    #   拉黑 —— 记住这张图长什么样，采集时再遇到直接拒收
+    # 只删不拉黑，群友把它再发一遍就会被静默采集回来，等于白删。
+    def _blacklist(self, digest: str, phash: str, reason: str = ""):
+        with self._lock, self._db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO meme_blacklist (file_hash, phash, reason, created_at)"
+                " VALUES (?,?,?,?)",
+                (digest, phash or "", str(reason)[:200], time.time()),
+            )
+
+    def is_blacklisted(self, digest: str, data: bytes = b"") -> bool:
+        """这张图是否被明确删过。
+
+        先按 md5 查（命中就是原图，最便宜）；没中再按画面比一遍——用户把删掉的图
+        重新发出来时，QQ 往往已经重新编码，md5 变了，只有 dHash 认得出来。
+        黑名单只有几十条，逐条比不比建索引慢。
+        """
+        if not digest:
+            return False
+        with self._lock, self._db() as db:
+            if db.execute("SELECT 1 FROM meme_blacklist WHERE file_hash = ?", (digest,)).fetchone():
+                return True
+            known = [row["phash"] for row in db.execute(
+                "SELECT phash FROM meme_blacklist WHERE phash IS NOT NULL AND phash != ''").fetchall()]
+        if not known or not data:
+            return False
+        phash = _perceptual_hash(data)
+        if not _phash_usable(phash):
+            return False
+        return any(_phash_usable(other) and _hamming(phash, other) <= BLACKLIST_SIMILARITY
+                   for other in known)
+
+    def _phash_for(self, row) -> str:
+        """取某条记录的画面指纹，按 file_hash 缓存。"""
+        digest = str(row["file_hash"] or "")
+        if digest in self._phash_cache:
+            return self._phash_cache[digest]
+        value = ""
+        if row["file_path"]:
+            try:
+                value = _perceptual_hash(Path(_abs(row["file_path"])).read_bytes())
+            except (OSError, ValueError):
+                value = ""
+        self._phash_cache[digest] = value
+        return value
+
+    def forget(self, path: str = "", digest: str = "", reason: str = "") -> Dict[str, object]:
+        """按库内路径或 hash 删掉一张。找不到就如实说找不到。"""
+        with self._lock, self._db() as db:
+            row = None
+            if digest:
+                row = db.execute("SELECT * FROM memes WHERE file_hash = ?", (digest,)).fetchone()
+            if row is None and path:
+                # 库里存相对路径；调用方可能给绝对路径，两种都试一次。
+                for candidate in (_rel(path), str(path)):
+                    row = db.execute("SELECT * FROM memes WHERE file_path = ?", (candidate,)).fetchone()
+                    if row is not None:
+                        break
+        if row is None:
+            return {"ok": False, "error": "表情库里没有这张图"}
+        return self._forget_row(row, "path", reason)
+
+    def forget_last(self, chat_key: str, reason: str = "用户要求删除") -> Dict[str, object]:
+        """删掉本会话最近一次发出去的那张表情包。"""
+        path = self.last_sent(chat_key)
+        if not path:
+            return {"ok": False, "error": "这个会话里我还没发过表情包，没有可删的"}
+        return self.forget(path=path, reason=reason)
+
+    def forget_by_image(self, data: bytes, reason: str = "用户要求删除") -> Dict[str, object]:
+        """按图片内容定位库里的那张并删掉。
+
+        命中判断两级：md5 认字节（原图转发），dHash 认画面（存下来再发）。
+        都不中也要拉黑——用户的意思本来就是"这张以后别发"，库里有没有是另一回事。
+        """
+        if not data:
+            return {"ok": False, "error": "没有拿到图片内容"}
+        digest = hashlib.md5(data).hexdigest()
+        phash = _perceptual_hash(data)
+        with self._lock, self._db() as db:
+            row = db.execute("SELECT * FROM memes WHERE file_hash = ?", (digest,)).fetchone()
+            matched_by = "hash" if row is not None else ""
+            if row is None and _phash_usable(phash):
+                # 全库比一遍画面。图库几百张，删除是低频动作，按需算指纹就够，
+                # 不值得为了省几毫秒往表里加一列再维护它。
+                closest = None
+                for candidate in db.execute(
+                        "SELECT * FROM memes WHERE file_path IS NOT NULL").fetchall():
+                    other = self._phash_for(candidate)
+                    if not _phash_usable(other):
+                        continue
+                    distance = _hamming(phash, other)
+                    if distance <= BLACKLIST_SIMILARITY and (closest is None or distance < closest[0]):
+                        closest = (distance, candidate)
+                if closest is not None:
+                    row, matched_by = closest[1], "phash"
+        if row is not None:
+            return self._forget_row(row, matched_by, reason)
+        self._blacklist(digest, phash, reason)
+        return {"ok": True, "deleted": None, "matched_by": "none", "blacklisted": True,
+                "message": "表情库里原本没有这张图；已记下来，以后收到也不会再收录。"}
+
+    def _forget_row(self, row, matched_by: str, reason: str) -> Dict[str, object]:
+        """真正执行删除：记录 + 黑名单 + 文件 + 标签汇总 + 会话冷却。"""
+        digest = str(row["file_hash"] or "")
+        path = _abs(row["file_path"]) if row["file_path"] else ""
+        with self._lock, self._db() as db:
+            db.execute("DELETE FROM memes WHERE id = ?", (row["id"],))
+            db.execute(
+                "INSERT OR REPLACE INTO meme_blacklist (file_hash, phash, reason, created_at)"
+                " VALUES (?,?,?,?)",
+                (digest, self._phash_for(row), str(reason)[:200], time.time()),
+            )
+        # 冷却队列里也要摘掉：留着它只会让"刚发的那张"指向一个已经不存在的文件。
+        with self._lock:
+            for recent in self._recent.values():
+                with contextlib.suppress(ValueError):
+                    recent.remove(path)
+        removed_file = False
+        if path:
+            try:
+                Path(path).unlink()
+                removed_file = True
+            except OSError:
+                removed_file = False
+        # rebuild 自己拿锁，不能在上面的 with 里面调，会自锁。
+        self.rebuild_tag_summary()
+        log("Meme", "forgotten", hash=digest[:8], by=matched_by, removed_file=removed_file,
+            file=Path(path).name if path else "", reason=str(reason)[:60])
+        return {
+            "ok": True,
+            "deleted": {
+                "file_hash": digest,
+                "file_path": _rel(path) if path else "",
+                "tags": normalize_tags(row["tags"] or "[]"),
+                "matched_by": matched_by,
+            },
+            "matched_by": matched_by,
+            "file_removed": removed_file,
+            "blacklisted": True,
+            "message": "已从表情库删除，之后不会再发；这张图再被人发回来也不会被重新收录。",
+        }
+
     # ------------------------------------------------------------ 挑选
     def note_sent(self, chat_key: str, path: str):
         """记录某会话刚发过的图，供后续挑图避让。真正发出后才记。"""
@@ -564,6 +841,18 @@ class MemeManager:
             if path in recent:
                 recent.remove(path)      # 移到末尾：越近发的越不容易再被选中
             recent.append(path)
+
+    def last_sent(self, chat_key: str) -> str:
+        """本会话最近发出去的那张图（绝对路径）；没发过返回空串。
+
+        「你刚刚发的那张删掉」全靠这一个指针：模型不需要知道文件名，
+        也不需要用户重新发图来对齐内容。
+        """
+        if not chat_key:
+            return ""
+        with self._lock:
+            recent = self._recent.get(chat_key)
+            return str(recent[-1]) if recent else ""
 
     def _cooldown_paths(self, chat_key: Optional[str]) -> Set[str]:
         if not chat_key:
@@ -608,6 +897,12 @@ class MemeManager:
             return 2
         return 1
 
+    @staticmethod
+    def _image_position_weight(image_tags: Sequence[str], tag: str) -> float:
+        """标签在这张图上排得越前，这张图越"主张"这个情绪。"""
+        rank = MemeManager._primary_rank(image_tags, tag)
+        return TAG_POSITION_WEIGHTS[min(rank, len(TAG_POSITION_WEIGHTS)) - 1]
+
     def _candidates_for_tag(self, tag: str, exclude_paths: Sequence[str] = (),
                             limit: Optional[int] = None) -> List[Dict[str, object]]:
         """取该标签下的候选图，按「首位标签优先 > 发得少 > 随机」排好序。
@@ -624,7 +919,7 @@ class MemeManager:
             ).fetchall()
         items: List[Dict[str, object]] = []
         for row in rows:
-            path = row["file_path"]
+            path = _abs(row["file_path"])
             if path in excluded:
                 continue
             tags = normalize_tags(row["tags"] or "[]")
@@ -665,11 +960,11 @@ class MemeManager:
         """为一轮回复挑一张表情包；返回 None 表示这轮不该发。
 
         chat_key（群号 / 私聊用户号）用于会话级避让：该会话最近发过的图这轮不再入选，
-        否则「赞同」这种只有一张图的标签每次都会发同一张，全库都在冷却这轮就歇着。
+        避免「赞同」这种只有一张图的标签每次都发同一张。
 
-        决策只有一轮：Jev 给每个标签各自打分（外加一个"这条不该发"的 none），
-        然后在全库上按「图自己的标签得分加权」排名取第一。不再有"先选一个标签、
-        再在该标签下挑图"的漏斗——那个漏斗会把标签层面等价、实际情绪不同的图混在一起。
+        决策只有一轮：Jev 给全库标签各自打分，取排名前三的标签，然后按「图自己的
+        标签匹配度」取第一张。发不发只由 Jev 的 none 判定，不再卡分数门槛——
+        门槛会让"三个标签都只是中等贴切"这种正常情况整轮沉默，线上表现就是几乎不发。
         """
         cfg = load_config().get("meme", {})
         summary = self.tag_summary()
@@ -685,18 +980,23 @@ class MemeManager:
             log("Meme", "skip", reason="no_tags")
             return None
 
-        scores = None
+        pick = None
         if cfg.get("use_jev", True):
             try:
                 from core.jev import JevClient
 
-                scores = JevClient().score_meme_tags(
+                pick = JevClient().rank_meme_tags(
                     message=message, reply=reply, tags=tags, max_batches=rounds_cap)
             except Exception as exc:
                 log("Meme", "jev.error", error=str(exc)[:160])
-                scores = None
-        if scores:
-            return self._pick_by_scores(scores, cooldown, cfg)
+                pick = None
+        if pick is not None:
+            top_tags, scores = pick
+            if not top_tags:
+                log("Meme", "skip", reason="none_wins",
+                    none=round(float(scores.get("none") or 0.0), 3))
+                return None
+            return self._pick_by_tags(top_tags, scores, cooldown)
 
         # 降级（Jev 不可用）：只在标签字面出现在回复里时才发，宁缺毋滥。
         lowered = (reply or "").lower()
@@ -710,33 +1010,19 @@ class MemeManager:
             log("Meme", "skip", reason="tag_empty", tag=fallback_tag)
         return path
 
-    def _pick_by_scores(self, scores: Dict[str, float], exclude_paths: Sequence[str],
-                        cfg: Dict[str, object]) -> Optional[str]:
-        """按标签分数给全库每张图打分，取最高的那张。
+    def _pick_by_tags(self, top_tags: Sequence[str], scores: Dict[str, float],
+                      exclude_paths: Sequence[str]) -> Optional[str]:
+        """用 Jev 排名前三的标签匹配全库，取匹配度最高的一张，必定发出一张。
 
-        图分 = 它自己各标签得分的加权和，位置越靠前权重越高。位置衰减是必须的：
-        纯求和会让"标签多的图"天然占便宜——一张 8 个标签、每个都弱沾边的图，
-        会盖过一张只有一个标签但完全贴切的图。首位给满权重、往后依次半衰，
-        等于「主张最重要，附带标签只做温和加分」。
+        匹配度 = Σ 位置权重(top1~3) × 标签分 × 图自身位置权重。
+        Jev 已经用 none 回答过"要不要发"，这里再卡一道分数阈值，等于让"三个标签
+        都只是中等贴切"这种正常情况整轮沉默——旧实现就是这么几乎不发的。
 
-        `none` 是独立的"这条不该发表情"判断，比最高标签分还高就不发。
-        实测该发时 none≈0.06、最高分≈0.99；不该发时 none≈0.92~0.997、最高分≤0.49。
+        图库覆盖不到这 3 个标签时逐级退让，但一定会发：先只看标签重叠数，
+        再退到全库最久没发的一张，避免"图库里碰巧没有这个情绪"就整轮哑掉。
         """
-        none_score = float(scores.get("none") or 0.0)
-        ranked = [(float(value), tag) for tag, value in scores.items() if tag != "none"]
-        if not ranked:
-            log("Meme", "skip", reason="no_scored_tag")
+        if not top_tags:
             return None
-        top_score, top_tag = max(ranked)
-        if none_score > top_score:
-            log("Meme", "skip", reason="none_wins",
-                none=round(none_score, 3), top=round(top_score, 3))
-            return None
-        floor = float(cfg.get("min_tag_score", 0.5))
-        if top_score < floor:
-            log("Meme", "skip", reason="below_floor", top=round(top_score, 3), floor=floor)
-            return None
-
         excluded = set(exclude_paths or ())
         with self._lock, self._db() as db:
             rows = db.execute(
@@ -744,28 +1030,39 @@ class MemeManager:
             ).fetchall()
         items: List[Dict[str, object]] = []
         for row in rows:
-            path = row["file_path"]
-            if path in excluded:
+            path = _abs(row["file_path"])
+            if path in excluded or not Path(path).exists():
                 continue
             tags = normalize_tags(row["tags"] or "[]")
-            if not tags or not Path(path).exists():
+            if not tags:
                 continue
-            score = 0.0
-            for position, tag in enumerate(tags[:len(TAG_POSITION_WEIGHTS)]):
-                score += TAG_POSITION_WEIGHTS[position] * float(scores.get(tag) or 0.0)
-            if score <= 0:
-                continue
-            items.append({"id": row["id"], "path": path, "tags": tags,
-                          "score": score, "use_count": int(row["use_count"] or 0)})
+            score = sum(
+                TOP_TAG_WEIGHTS[position] * float(scores.get(tag) or 0.0)
+                * self._image_position_weight(tags, tag)
+                for position, tag in enumerate(top_tags) if tag in tags
+            )
+            items.append({
+                "id": row["id"], "path": path, "tags": tags, "score": score,
+                "overlap": len(set(top_tags) & set(tags)),
+                "use_count": int(row["use_count"] or 0),
+            })
         if not items:
-            log("Meme", "skip", reason="no_matching_image", tag=top_tag)
+            log("Meme", "skip", reason="no_image", tags=list(top_tags))
             return None
-        best = max(items, key=lambda item: (float(item["score"]),
-                                            -int(item["use_count"]),
-                                            random.random()))
-        log("Meme", "picked", tag=top_tag, score=round(float(best["score"]), 3),
-            tags=best["tags"])
-        return self._take(best, top_tag)
+        best = max(items, key=lambda item: (float(item["score"]), int(item["overlap"]),
+                                            -int(item["use_count"]), random.random()))
+        if float(best["score"]) <= 0:
+            best = max(items, key=lambda item: (int(item["overlap"]),
+                                                -int(item["use_count"]), random.random()))
+            log("Meme", "matched.by_overlap", tags=list(top_tags),
+                overlap=best["overlap"])
+        if int(best["overlap"]) == 0:
+            best = min(items, key=lambda item: (int(item["use_count"]), random.random()))
+            log("Meme", "matched.by_rotation", tags=list(top_tags))
+        used_tag = next((tag for tag in top_tags if tag in best["tags"]), top_tags[0])
+        log("Meme", "picked", tag=used_tag, top=list(top_tags),
+            score=round(float(best["score"]), 3), tags=best["tags"])
+        return self._take(best, used_tag)
 
     def retag_all(self):
         """清空标签重新打一遍（换词表或模型后手动调用）。"""
@@ -874,6 +1171,69 @@ def extract_meme_tag(text: str) -> Tuple[str, Optional[str]]:
         clean_text = (text[:match.start()] + text[match.end():]).strip().rstrip("，。！ ")
         return clean_text, match.group(1).strip()
     return text, None
+
+
+def pick_meme_asset(reply: str, message: str = "", scope: str = "main",
+                    chat_key: str = "") -> dict:
+    """按最终回复挑一张表情并存进媒体库，返回 ``{"path", "ref"}``；不挑返回 ``{}``。
+
+    这里只做「挑 + 存」，不碰正文：发送顺序必须是先文字、后图片，而挑图要问
+    Jev（1~2s）。把它压在正文前面，用户就会盯着空气多等一两秒——之前挂占位符
+    那版正是这个毛病。决策依据仍然只有最终回复，工具的中间文本不参与。
+    """
+    text = reply if isinstance(reply, str) else ""
+    if not text.strip():
+        return {}
+    if text.lstrip().startswith(FAILURE_PREFIXES):
+        return {}
+    # 正文里已经有媒体（生成好的图/视频）就不再加一张表情：两条媒体连着发是噪音，
+    # 而且文件类交付物后面跟个表情很像在开玩笑。
+    if "media://" in text:
+        return {}
+    chat_key = chat_key or chat_key_from_scope(scope)
+    try:
+        manager = get_meme_manager()
+        path = manager.choose_meme(message or "", text, chat_key=chat_key or None)
+        if not path:
+            return {}
+        data = Path(path).read_bytes()
+        from core.media_store import MediaStore
+
+        asset = MediaStore().add(data, scope or "main", origin="sent", label=Path(path).name)
+        ref = str(asset.get("media_ref") or "")
+        if not ref:
+            return {}
+        if chat_key:
+            # 冷却记在挑中时：发送失败最多让一张图下次再被避开，比重复发同一张便宜。
+            manager.note_sent(chat_key, path)
+        log("Meme", "picked", ref=ref, file=Path(path).name, chat=chat_key or scope,
+            bytes=len(data), reply_chars=len(text))
+        return {"path": str(path), "ref": ref}
+    except Exception as exc:
+        log("Meme", "pick.error", error=str(exc)[:160])
+        return {}
+
+
+def record_meme_in_history(session_id: str, ref: str) -> bool:
+    """把「这一轮发了张表情」作为一条独立记录写进聊天记录。
+
+    正文那条在发送前就落库了（含工具的轮次结构复杂，事后回填要改库）。分成
+    两条更贴近真实：文字一条、图片一条，role 都是 assistant，下一轮模型照样
+    知道「我上一条发过这张图」，也就不会把同一张再发一遍。
+    """
+    if not session_id or not ref:
+        return False
+    try:
+        from core.memory import MiniMemory
+
+        MiniMemory().append_message(session_id, {
+            "role": "assistant",
+            "content": f"![图片](media://{ref})",
+        })
+        return True
+    except Exception as exc:
+        log("Meme", "record.error", error=str(exc)[:160])
+        return False
 
 
 # 单例管理

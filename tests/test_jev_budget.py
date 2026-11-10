@@ -13,7 +13,7 @@ from core.jev_budget import MAX_STATE_CHARS, SAFE_STATE_CHARS, fit_state, fit_wi
 def big_state(chars=180_000):
     filler = "填充" * (chars // 2)
     return json.dumps({"current": {"current_request": "做一个动画页面", "reply": "完成",
-                                   "current_trace": [{"index": i, "tool": "execute_command",
+                                   "current_trace": [{"index": i, "tool": "bash",
                                                       "result": {"ok": True, "output": "x" * 5000}}
                                                      for i in range(20)]},
                        "context": {"task_state": {"file_changes": [
@@ -61,7 +61,7 @@ class CompactTaskStateTests(unittest.TestCase):
         self.assertEqual(compact["original_goal"], "画鹈鹕")
 
     def test_trims_tool_history_and_previews(self):
-        state = {"last_tools": [{"tool": "execute_command", "ok": True,
+        state = {"last_tools": [{"tool": "bash", "ok": True,
                                  "result_preview": "z" * 5000} for _ in range(20)]}
         compact = compact_task_state(state, max_tools=6, preview=200)
         self.assertEqual(len(compact["last_tools"]), 6)

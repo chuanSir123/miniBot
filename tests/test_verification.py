@@ -22,7 +22,7 @@ class VerificationTests(unittest.TestCase):
         for command in ['Get-ChildItem', 'echo 1 passed', 'python -m py_compile app.js',
                         'python --version']:
             with self.subTest(command=command):
-                trace = [step('execute_command', {'command': command}, exit_code=0, output='1 passed'),
+                trace = [step('bash', {'command': command}, exit_code=0, output='1 passed'),
                          step('capture_screen')]
                 self.assertIn('功能测试缺失', completion_gate(trace, ['app.js'], 'main'))
 
@@ -39,16 +39,16 @@ class VerificationTests(unittest.TestCase):
                 ('uv run pytest -q', '5 passed, 1 warning in 1.2s'),
                 ('python -m unittest discover -s tests', 'All 12 tests passed')]:
             with self.subTest(command=command):
-                trace = [step('execute_command', {'command': command}, exit_code=0, output=output)]
+                trace = [step('bash', {'command': command}, exit_code=0, output=output)]
                 self.assertEqual('', completion_gate(trace, ['app.js'], 'main'))
 
     def test_test_like_command_without_report_is_not_evidence(self):
-        trace = [step('execute_command', {'command': 'python tests/smoke.py'}, exit_code=0, output='done')]
+        trace = [step('bash', {'command': 'python tests/smoke.py'}, exit_code=0, output='done')]
         self.assertIn('功能测试缺失', completion_gate(trace, ['app.js'], 'main'))
 
     def test_old_tests_failures_zero_tests_and_masked_exit_are_rejected(self):
-        edit = step('edit_file', {'file_path': 'app.js'})
-        good = step('execute_command', {'command': 'node --test test/app.cjs'}, exit_code=0, output='# pass 4')
+        edit = step('edit', {'file_path': 'app.js'})
+        good = step('bash', {'command': 'node --test test/app.cjs'}, exit_code=0, output='# pass 4')
         self.assertFalse(completion_gate([edit, good], ['app.js'], 'main'))
         self.assertTrue(completion_gate([good, edit], ['app.js'], 'main'))
         for result in [dict(ok=False, exit_code=1, output='1 failed'),
@@ -56,13 +56,13 @@ class VerificationTests(unittest.TestCase):
                        dict(exit_code=0, output='2 passed, 1 failed'),
                        dict(exit_code=0, output='success'),
                        dict(exit_code=0, output='# pass 4', timeout=True)]:
-            self.assertTrue(completion_gate([step('execute_command', {'command': 'python -m unittest'}, **result)], ['app.js'], 'main'))
+            self.assertTrue(completion_gate([step('bash', {'command': 'python -m unittest'}, **result)], ['app.js'], 'main'))
 
     def test_visual_evidence_must_match_latest_artifact(self):
         """页面证据只核对"有没有渲过、有没有运行错误"，动效是否达标由放行判定看图。"""
-        edit = step('write_file', {'file_path': 'app.html'})
+        edit = step('write', {'file_path': 'app.html'})
         capture = step('capture_screen', target='app.html', frames_captured=4, dynamic_detected=True, runtime_checked=True)
-        test = step('execute_command', {'command': 'node --test test_app.cjs'}, exit_code=0, output='# pass 2')
+        test = step('bash', {'command': 'node --test test_app.cjs'}, exit_code=0, output='# pass 2')
         self.assertFalse(completion_gate([edit, test, capture], ['app.html'], 'main'))
         self.assertTrue(completion_gate([capture, edit], ['app.html'], 'main'))
         self.assertTrue(completion_gate([step('capture_screen', target='other.html')], ['app.html'], 'main'))
@@ -115,15 +115,15 @@ class VerificationTests(unittest.TestCase):
             path = root / 'app.js'
             path.write_text('broken', encoding='utf-8')
             self.assertIn(str(path.resolve()), source_snapshot(root))
-            good = step('execute_command', {'command': 'node --test test_app.cjs'}, exit_code=0, output='# pass 2')
-            mutate = step('execute_command', {'command': 'write source'}, changed_files=[str(path)])
+            good = step('bash', {'command': 'node --test test_app.cjs'}, exit_code=0, output='# pass 2')
+            mutate = step('bash', {'command': 'write source'}, changed_files=[str(path)])
             self.assertIn('功能测试缺失', completion_gate([good, mutate], [str(path)], 'main'))
 
     def test_unrelated_green_suite_cannot_hide_failed_suite(self):
-        failed = step('execute_command', {'command': 'node --test test_a.cjs'}, ok=False, exit_code=1, output='# fail 1')
-        passed = step('execute_command', {'command': 'node --test test_b.cjs'}, exit_code=0, output='# pass 1')
+        failed = step('bash', {'command': 'node --test test_a.cjs'}, ok=False, exit_code=1, output='# fail 1')
+        passed = step('bash', {'command': 'node --test test_b.cjs'}, exit_code=0, output='# pass 1')
         self.assertIn('功能测试失败', completion_gate([failed, passed], ['app.js'], 'main'))
-        repaired = step('execute_command', {'command': 'node --test test_a.cjs'}, exit_code=0, output='# pass 1')
+        repaired = step('bash', {'command': 'node --test test_a.cjs'}, exit_code=0, output='# pass 1')
         self.assertEqual('', completion_gate([failed, passed, repaired], ['app.js'], 'main'))
 
     def test_real_browser_reports_javascript_exception(self):
@@ -158,7 +158,7 @@ class VerificationTests(unittest.TestCase):
             (root / 'test_app.py').write_text('import unittest\nfrom app import add\nclass Tests(unittest.TestCase):\n def test_add(self): self.assertEqual(add(2, 3), 5)\n', encoding='utf-8')
             def evidence():
                 result = run_bounded([sys.executable, '-m', 'unittest', '-v'], cwd=directory)
-                return [dict(tool='execute_command', arguments={'command': 'python -m unittest -v'}, result=result)]
+                return [dict(tool='bash', arguments={'command': 'python -m unittest -v'}, result=result)]
             self.assertIn('测试失败', completion_gate(evidence(), [str(source)], 'main'))
             source.write_text('def add(a, b): return a + b\n', encoding='utf-8')
             self.assertEqual('', completion_gate(evidence(), [str(source)], 'main'))
@@ -182,7 +182,7 @@ class VerificationTests(unittest.TestCase):
                 result = harness.review(
                     '最终验收完成！亮点是动画流畅。',
                     '改一下 app.py',
-                    [step('write_file', {'file_path': str(source)}, path=str(source))])
+                    [step('write', {'file_path': str(source)}, path=str(source))])
         self.assertFalse(result['ok'])
         self.assertIn('测试', result['feedback'])
 
@@ -217,7 +217,7 @@ class RepairLoopTests(Fixture):
                 if len(self.calls) == 1:
                     yield 'text_delta', '先把说明改成三段式。'
                     return '', [{'id': '0', 'type': 'function',
-                                 'function': {'name': 'write_file',
+                                 'function': {'name': 'write',
                                               'arguments': json.dumps({'file_path': 'notes.md', 'content': 'a\nb\nc'})}}], {}
                 yield 'text_delta', '说明已改成三段式。'
                 return '', [], {}
@@ -272,7 +272,7 @@ class RepairLoopTests(Fixture):
             n = len(calls)
             if n == 1:
                 yield 'text_delta', '已完成交付，亮点是全部功能。'
-                return '', [tool('write_file', {'file_path': 'app.js', 'content': 'bad'})], {}
+                return '', [tool('write', {'file_path': 'app.js', 'content': 'bad'})], {}
             if n == 2:
                 yield 'text_delta', '全部完成，测试通过。'
                 return '', [], {}
@@ -281,11 +281,11 @@ class RepairLoopTests(Fixture):
                 self.assertIn('全部完成，测试通过。', published)
                 self.assertNotIn('已修复并通过测试。', published)
                 self.assertIn('功能测试缺失', str(messages))
-                return '', [tool('edit_file', {'file_path': 'app.js', 'target': 'bad', 'replacement': 'fixed'}), tool('execute_command', {'command': 'node --test test_app.cjs'})], {}
+                return '', [tool('edit', {'file_path': 'app.js', 'target': 'bad', 'replacement': 'fixed'}), tool('bash', {'command': 'node --test test_app.cjs'})], {}
             yield 'text_delta', '已修复并通过测试。'
             return '', [], {}
         brain.stream_chat_and_tools.side_effect = stream
-        with patch.object(harness, '_dispatch_tool', side_effect=lambda name, args, *extra, **kw: {'ok': True, **({'exit_code': 0, 'output': '# pass 2'} if name == 'execute_command' else {})}):
+        with patch.object(harness, '_dispatch_tool', side_effect=lambda name, args, *extra, **kw: {'ok': True, **({'exit_code': 0, 'output': '# pass 2'} if name == 'bash' else {})}):
             reply = harness.run('修改 app.js 并验证功能', on_text_chunk=lambda delta, full: published.append(full), on_intermediate=progress.append, on_text_reset=resets.append)
         self.assertIn('已修复', reply)
         self.assertEqual(4, len(calls))
@@ -317,7 +317,7 @@ class RepairLoopTests(Fixture):
                 if self.n == 1:
                     yield 'text_delta', '先把逻辑写上。'
                     return '', [{'id': '0', 'type': 'function',
-                                 'function': {'name': 'write_file',
+                                 'function': {'name': 'write',
                                               'arguments': json.dumps({'file_path': 'app.js', 'content': 'bad'})}}], {}
                 yield 'text_delta', '所有功能完成，测试全部通过！'
                 return '', [], {}

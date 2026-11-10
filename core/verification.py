@@ -107,7 +107,7 @@ def last_mutation_index(trace):
     return max(
         (i for i, entry in enumerate(trace or ())
          if entry.get('result', {}).get('changed_files')
-         or (entry.get('tool') in {'write_file', 'edit_file'}
+         or (entry.get('tool') in {'write', 'edit'}
              and entry.get('result', {}).get('ok'))),
         default=-1)
 
@@ -120,7 +120,7 @@ def test_evidence(trace, after=-1):
     """
     found = {}
     for index, entry in enumerate(trace or ()):
-        if index <= after or entry.get('tool') != 'execute_command':
+        if index <= after or entry.get('tool') != 'bash':
             continue
         command = str(entry.get('arguments', {}).get('command', '')).strip()
         if not command or NOT_A_TEST.match(command):
@@ -158,10 +158,10 @@ def completion_gate(trace, modified_files, scope, motion_required=True):
         tests = test_evidence(trace, after=last_edit)
         if not tests:
             broken = next((str(t.get('arguments', {}).get('command', '')) for t in reversed(fresh)
-                           if t.get('tool') == 'execute_command'
+                           if t.get('tool') == 'bash'
                            and not t.get('result', {}).get('ok')), '')
             hint = f'最后一次修改后 {broken} 执行失败，先修复再补测试。' if broken else ''
-            return ('【功能测试缺失】最后一次修改后没有跑出任何断言结果。请用 execute_command 运行'
+            return ('【功能测试缺失】最后一次修改后没有跑出任何断言结果。请用 bash 运行'
                     '相关功能测试（自定义测试脚本、pytest/unittest、node --test、npm test 等都可以），'
                     '输出里要能看到通过/失败的用例数量。列目录、截图、语法编译和启动程序都不算。' + hint)
         for command, latest in tests.items():

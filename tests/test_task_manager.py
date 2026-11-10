@@ -108,9 +108,9 @@ class TestTaskManagerAndHarness(unittest.TestCase):
         self.assertFalse(task.is_alive())
 
     def test_harness_tools_dispatch(self):
-        # 1. execute_command with background=True
+        # 1. bash with background=True
         res = self.harness._dispatch_tool(
-            "execute_command",
+            "bash",
             {"command": "Write-Output 'bg output'", "background": True},
         )
         self.assertTrue(res["ok"])

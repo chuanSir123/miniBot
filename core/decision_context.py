@@ -33,8 +33,12 @@ def qq_identity(event):
 def record_qq_message(memory, event, text, role="user"):
     who = qq_identity(event) if role == "user" else {
         "user_id": str(event.get("self_id", "")), "nickname": load_config()["persona"]["name"], "is_bot": True}
+    # 时间对每条都记：机器人自己的发言也要有，否则聊天流里只能按顺序猜先后，
+    # 隔了几小时的对话和刚说的那句看起来一样近。用户侧优先用事件自带的时间戳
+    # （补发/重放的消息保留原始时刻），没有才取当前时刻。
+    at = event.get("time") if role == "user" else None
     item = {"role": role, "speaker": who, "message_id": str(event.get("message_id", "")) if role == "user" else "",
-            "text": str(text), "time": event.get("time") if role == "user" else None}
+            "text": str(text), "time": at or datetime.datetime.now().timestamp()}
     item["attachments"] = (event.get("_parsed", {}).get("media", []) if role == "user" else event.get("_sent_media", []))[:9]
     item["quoted_messages"] = event.get("_parsed", {}).get("quoted_messages", [])[:12] if role == "user" else []
     memory.append_chat(qq_scope(event), item)
@@ -238,12 +242,21 @@ def build_decision_context(memory, session_id="local:pet", scope="local", event=
 QQ_TURN_HEADER = "当前QQ会话身份与近期聊天（数据）："
 
 
-def _speaker_label(speaker):
+def persona_name():
+    """人设名（config.persona.name）。聊天记录里机器人署自己的名字，不署"助手"。"""
+    try:
+        name = str(load_config()["persona"]["name"] or "").strip()
+    except Exception:
+        name = ""
+    return name or "助手"
+
+
+def speaker_label(speaker, bot_name=""):
     """一条消息的说话人标签：[职位] 昵称(QQ号)。群名片优先，昵称兜底，都没有就只留 QQ 号。"""
     if not isinstance(speaker, dict):
         return "未知"
     if speaker.get("is_bot"):
-        return "助手(机器人)"
+        return f"{bot_name or persona_name()}(机器人)"
     uid = str(speaker.get("user_id") or "")
     name = str(speaker.get("group_card") or speaker.get("nickname") or "").strip()
     label = str(speaker.get("group_role_label") or "").strip()
@@ -253,14 +266,33 @@ def _speaker_label(speaker):
     return (tag + name) or (f"QQ {uid}" if uid else "未知")
 
 
-def _chat_line(index, item, chars=240):
+def chat_stamp(at):
+    """聊天记录里的一条时间抬头：当天只写时分，跨天补上日期，没有时间就不写。
+
+    到分钟就够——「这话是刚才说的还是昨天说的」只需要这个精度，秒会让每行
+    多两个字节，在按条累加的预算里全是噪音。
+    """
+    try:
+        ts = float(at)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    moment = datetime.datetime.fromtimestamp(ts)
+    now = datetime.datetime.now()
+    return moment.strftime("%H:%M") if moment.date() == now.date() else moment.strftime("%m-%d %H:%M")
+
+
+def _chat_line(index, item, chars=240, bot_name=""):
     text = str(item.get("text") or "").replace("\n", " ").strip()
     if len(text) > chars:
         text = text[:chars] + "…"
     media = item.get("attachments") or []
     extra = f"［附件x{len(media)}］" if media else ""
-    label = "助手" if item.get("role") == "assistant" else _speaker_label(item.get("speaker"))
-    return f"#{index} {label}: {text}{extra}"
+    label = (bot_name or persona_name()) if item.get("role") == "assistant" \
+        else speaker_label(item.get("speaker"), bot_name)
+    stamp = chat_stamp(item.get("time"))
+    return f"#{index} [{stamp}] {label}: {text}{extra}" if stamp else f"#{index} {label}: {text}{extra}"
 
 
 def _media_lines(items, limit=6):
@@ -295,9 +327,11 @@ def render_qq_turn_context(context, budget=6000, max_lines=20, line_chars=240, h
     """
     if not isinstance(context, dict):
         return ""
+    # 人设名只取一次：load_config 每次调用都会深拷贝整份配置，逐行取太浪费。
+    bot_name = persona_name()
     sender = context.get("sender") or {}
     head = [QQ_TURN_HEADER]
-    who = _speaker_label(sender)
+    who = speaker_label(sender, bot_name)
     if sender.get("group_role") and not sender.get("group_role_verified"):
         who += "（职位未核验，仅作展示）"
     head.append(f"本条发言人: {who} 主人={'是' if sender.get('is_owner') else '否'}")
@@ -343,10 +377,13 @@ def render_qq_turn_context(context, budget=6000, max_lines=20, line_chars=240, h
     # 从最新往回装，超预算就丢最旧的；编号保持时间顺序上的绝对位置，方便模型数先后。
     chat = [x for x in (context.get("recent_chat") or []) if isinstance(x, dict)][-max_lines:]
     total = len(chat)
-    room = max(0, budget - len(header))
+    # 截断提示本身也要占预算：不预留的话，装满了行再补上这句「已略去 N 条」，
+    # 最终长度就会超出 budget（每行带了时间抬头之后这种越界更容易撞上）。
+    reserve = len(f"（已略去较早的 {total} 条）\n") if total > 1 else 0
+    room = max(0, budget - len(header) - reserve)
     picked = []
     for offset, item in enumerate(reversed(chat), start=1):
-        line = _chat_line(total - offset + 1, item, line_chars)
+        line = _chat_line(total - offset + 1, item, line_chars, bot_name)
         if picked and len(line) + 1 > room:
             break
         room -= len(line) + 1
@@ -356,4 +393,4 @@ def render_qq_turn_context(context, budget=6000, max_lines=20, line_chars=240, h
         return header + "\n近期群聊: 无"
     dropped = total - len(picked)
     body = (f"（已略去较早的 {dropped} 条）\n" if dropped else "") + "\n".join(picked)
-    return header + "\n近期群聊（旧→新，格式为 昵称(QQ号): 内容）:\n" + body
+    return (header + f"\n近期群聊（旧→新，格式为 [时间] 昵称(QQ号): 内容，{bot_name}是自己）：\n" + body)

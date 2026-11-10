@@ -1,4 +1,5 @@
 import json
+import unittest
 from unittest.mock import patch
 
 from test_core import Fixture, FakeJev, FakePerception
@@ -12,19 +13,19 @@ class SkillLifecycleTests(Fixture):
     def harness(self, brain=None):
         return AgentHarness(brain, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
 
-    def test_write_file_skill_flow_discovery_disclosure_and_execution(self):
-        """模拟 skill-creator 流程：write_file 写技能目录 → 自动发现 → 披露 → 执行。"""
+    def test_write_skill_flow_discovery_disclosure_and_execution(self):
+        """模拟 skill-creator 流程：write 写技能目录 → 自动发现 → 披露 → 执行。"""
         harness = self.harness()
         base = harness.skill_manager.skills_dir / 'echo'
-        saved = harness._dispatch_tool('write_file', {
+        saved = harness._dispatch_tool('write', {
             'file_path': str(base / 'SKILL.md'),
             'content': '---\nname: echo\ndescription: 回显输入文本\nentry: scripts/echo.py\n---\n\n调用时传 prompt 参数。\n'})
         self.assertTrue(saved['ok'])
-        harness._dispatch_tool('write_file', {
+        harness._dispatch_tool('write', {
             'file_path': str(base / 'parameters.json'),
             'content': json.dumps({"type": "object", "properties": {
                 "prompt": {"type": "string", "description": "要回显的文本"}}, "required": ["prompt"]})})
-        harness._dispatch_tool('write_file', {
+        harness._dispatch_tool('write', {
             'file_path': str(base / 'scripts' / 'echo.py'),
             'content': 'def execute(context):\n    return {"ok": True, "output": context.get("prompt", "hello")}\n'})
         # 自动发现（签名机制），也可显式 activate_skill 重扫
@@ -67,9 +68,9 @@ class SkillLifecycleTests(Fixture):
         marker = self.root / 'imported.txt'
         base = harness.skill_manager.skills_dir / 'candidate'
         code = f'from pathlib import Path\nPath({str(marker)!r}).write_text("executed")\ndef execute(context): return "ok"'
-        harness._dispatch_tool('write_file', {'file_path': str(base / 'SKILL.md'),
+        harness._dispatch_tool('write', {'file_path': str(base / 'SKILL.md'),
             'content': '---\nname: candidate\ndescription: 候选\nentry: scripts/candidate.py\n---\n\n说明。\n'})
-        harness._dispatch_tool('write_file', {'file_path': str(base / 'scripts' / 'candidate.py'), 'content': code})
+        harness._dispatch_tool('write', {'file_path': str(base / 'scripts' / 'candidate.py'), 'content': code})
         active = harness._dispatch_tool('activate_skill', {'skill_name': 'candidate'})
         self.assertTrue(active['ok'])
         self.assertIn('candidate', [s['name'] for s in active['skills']])
@@ -104,7 +105,7 @@ class SkillLifecycleTests(Fixture):
                 inner.count += 1
                 if inner.count == 1:
                     return '', [{'id': 'write-once', 'type': 'function', 'function': {
-                        'name': 'write_file', 'arguments': json.dumps({'file_path': str(path), 'content': 'created'})}}], {}
+                        'name': 'write', 'arguments': json.dumps({'file_path': str(path), 'content': 'created'})}}], {}
                 yield 'text_delta', '已经完成'
                 return '已经完成', [], {}
 
@@ -116,5 +117,33 @@ class SkillLifecycleTests(Fixture):
             self.assertEqual(context['continuation_checkpoint']['original_goal'], '创建文件')
             self.assertTrue(context['continuation_checkpoint']['last_tools'][0]['ok'])
             self.assertEqual(harness.run('继续'), '已经完成')
-        self.assertEqual(dispatch.call_count, 1)
-        self.assertEqual(path.read_text(encoding='utf-8'), 'created')
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(path.read_text(encoding='utf-8'), 'created')
+
+
+class InlineSkillArgumentsTests(unittest.TestCase):
+    """PowerShell 5.1 会吞掉内联 JSON 的双引号，这里锁住执行层的兼容行为。"""
+
+    def test_inline_json_quotes_are_protected_idempotently(self):
+        from core.harness import _protect_inline_skill_arguments
+        cmd = "python skills/tts/scripts/tts.py --arguments '{\"mode\":\"clone\",\"text\":\"喵\"}'"
+        out = _protect_inline_skill_arguments(cmd)
+        self.assertIn('\\"mode\\":\\"clone\\"', out)
+        self.assertEqual(_protect_inline_skill_arguments(out), out)
+
+    def test_at_file_and_plain_commands_are_untouched(self):
+        from core.harness import _protect_inline_skill_arguments
+        at = 'python skills/tts/scripts/tts.py --arguments @D:/tmp/args.json'
+        self.assertEqual(_protect_inline_skill_arguments(at), at)
+        plain = 'git status --short'
+        self.assertEqual(_protect_inline_skill_arguments(plain), plain)
+
+    def test_broken_json_error_points_to_the_file_form(self):
+        from core.skill_cli import _parse_arguments
+        with self.assertRaisesRegex(ValueError, '@<参数文件路径>'):
+            _parse_arguments('{mode:clone,text:喵}')
+
+    def test_valid_inline_json_still_parses(self):
+        from core.skill_cli import _parse_arguments
+        self.assertEqual(_parse_arguments('{"mode":"clone","text":"喵"}'),
+                         {"mode": "clone", "text": "喵"})

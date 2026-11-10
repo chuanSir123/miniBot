@@ -90,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
                     full = paragraph + "\n\n"
                     send("text_delta", {"full": paragraph[:8], "delta": paragraph[:8]})
                     send("text_delta", {"full": full, "delta": paragraph[8:] + "\n\n"})
-                    tool = "execute_command" if index < 2 else "write_file"
+                    tool = "bash" if index < 2 else "write"
                     args = {"command": "检查页面布局"} if index < 2 else {"file_path": "webui/index.html", "content": "<main>\n  <p>任务执行过程</p>\n</main>"}
                     send("tool_call", {"tool": tool, "args": args})
                     send("tool_result", {"tool": tool, "result": {"ok": True, "added": 166 if index == 2 else 0, "removed": 0, "output": "验证通过"}})

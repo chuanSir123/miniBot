@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import queue
+import re
 import socket
 import threading
 import time
@@ -18,6 +19,17 @@ from core.console import log
 
 # 流读取线程的结束哨兵（标识对象，避免与真实数据行混淆）。
 _STREAM_EOF = object()
+
+# 这些状态码属于"模型本身或它前面的网关坏了"，换一个模型往往立刻可用：
+# 404 模型下线/名字写错、5xx 是上游崩溃或网关断开、429 是当前模型过载。
+# 400/401/403/413/422 是请求体或凭证的问题，换模型只会原样再失败一次。
+_FALLBACK_HTTP_STATUS = frozenset(
+    {404, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+)
+
+# 模型刚失败过的冷却时间：主模型 404 时，接下来这段时间直接走备用模型，
+# 不必每轮都先撞一次墙。可用 runtime.model_fallback_cooldown_sec 覆盖。
+_DEFAULT_FALLBACK_COOLDOWN_SEC = 120.0
 
 # 判断"内容是不是已经说到句子结尾了"。上游半开/被 RST 时我们拿不到
 # finish_reason，只能靠这个兜底：末尾是标点、右括号、颜文字、emoji 视为说完了；
@@ -64,6 +76,10 @@ class VLMBrain:
         self.enable_thinking = cfg.get("enable_thinking", False)
         self.reasoning_effort = cfg.get("reasoning_effort", "none")
         self.last_usage: Dict[str, Any] = {}
+        # 备选模型回退用：记录"最近失败过的模型 -> 冷却截止时刻"。
+        # 同一个 Brain 实例被所有渠道共享，所以读写都要过锁。
+        self._model_cooldown: Dict[str, float] = {}
+        self._cooldown_lock = threading.Lock()
 
     def is_configured(self) -> bool:
         return bool((self._overrides[1] or load_config()["vlm"]["api_key"]).strip())
@@ -94,6 +110,104 @@ class VLMBrain:
             model or cfg["model"],
             cfg,
         )
+
+    # ---------- 主模型不可用时的备用模型回退 ----------
+
+    @staticmethod
+    def _fallback_status(message) -> Optional[int]:
+        """从错误文本里取 HTTP 状态码；只有"换模型可能救得回来"的才返回。"""
+        match = re.search(r"HTTP\s*(\d{3})", str(message or ""))
+        if not match:
+            return None
+        code = int(match.group(1))
+        return code if code in _FALLBACK_HTTP_STATUS else None
+
+    @staticmethod
+    def _model_label(model_override=None) -> str:
+        if isinstance(model_override, dict):
+            return str(model_override.get("model") or model_override.get("id") or "")
+        return str(model_override or "")
+
+    def _model_keys(self, model_override=None) -> set:
+        """一个模型的所有可识别名字（id / name / model），用于去重和冷却。"""
+        if isinstance(model_override, dict):
+            candidates = [model_override.get(k) for k in ("id", "name", "model")]
+        elif model_override:
+            candidates = [model_override]
+            try:
+                from core.config import resolve_vlm_model_config
+                resolved = resolve_vlm_model_config(model_override)
+                candidates += [resolved.get(k) for k in ("id", "name", "model")]
+            except Exception:
+                pass
+        else:
+            candidates = [self.model]
+        return {
+            str(value).strip().lower()
+            for value in candidates
+            if str(value or "").strip()
+        }
+
+    def _cooldown_until(self, keys) -> float:
+        with self._cooldown_lock:
+            return max((self._model_cooldown.get(k, 0.0) for k in keys), default=0.0)
+
+    def _mark_model_failed(self, model_override=None):
+        """把模型拉进冷却期：下一轮请求直接由备用模型顶上。"""
+        keys = self._model_keys(model_override)
+        if not keys:
+            return
+        try:
+            ttl = float(
+                load_config()["runtime"].get(
+                    "model_fallback_cooldown_sec", _DEFAULT_FALLBACK_COOLDOWN_SEC
+                )
+                or _DEFAULT_FALLBACK_COOLDOWN_SEC
+            )
+        except (KeyError, TypeError, ValueError):
+            ttl = _DEFAULT_FALLBACK_COOLDOWN_SEC
+        now = time.monotonic()
+        with self._cooldown_lock:
+            for key in keys:
+                self._model_cooldown[key] = now + max(ttl, 0.0)
+            # 顺手清掉过期条目，避免长期运行后字典只增不减。
+            self._model_cooldown = {
+                k: v for k, v in self._model_cooldown.items() if v > now
+            }
+
+    def _fallback_candidates(self, model_override=None, limit: int = 2) -> List[str]:
+        """主模型失败后能顶上的模型，按配置顺序取前 limit 个。
+
+        跳过与当前模型同名/同 id 的项——只换 id 不换上层模型等于没换；
+        也跳过正在冷却期的项。
+        """
+        try:
+            from core.config import get_vlm_models
+            models = get_vlm_models()
+        except Exception as exc:  # 配置读不出来就老实不做回退
+            log("VLM", "model.fallback.config_error", error=str(exc)[:200])
+            return []
+
+        now = time.monotonic()
+        seen = self._model_keys(model_override)
+        chain: List[str] = []
+        for item in models:
+            keys = {
+                str(item.get(key) or "").strip().lower()
+                for key in ("id", "name", "model")
+                if item.get(key)
+            }
+            if not keys or keys & seen:
+                continue
+            if self._cooldown_until(keys) > now:
+                continue
+            seen |= keys
+            ident = str(item.get("id") or item.get("model") or "").strip()
+            if ident:
+                chain.append(ident)
+            if len(chain) >= limit:
+                break
+        return chain
 
     @staticmethod
     def _stream_socket(response):
@@ -324,16 +438,12 @@ class VLMBrain:
                 return str(error)[:500]
         return str(error)[:500]
 
-    def chat(
+    def _chat_once(
         self,
-        messages: List[Dict[str, Any]],
-        image_bytes: Optional[bytes] = None,
+        formatted_messages: List[Dict[str, Any]],
         model_override: Optional[Union[str, Dict[str, Any]]] = None,
-    ) -> str:
-        """非流式标准聊天"""
-        if not self.is_configured():
-            return "【提示】未配置 VLM API Key，请先在配置中心填写。"
-
+    ) -> Tuple[str, Optional[int]]:
+        """单次非流式请求，返回 (文本, HTTP 状态码)。成功时状态码为 None。"""
         settings = self._settings(model_override=model_override)
         base_url, api_key, _, _ = settings
         endpoint = (
@@ -341,7 +451,6 @@ class VLMBrain:
             if not base_url.endswith("/chat/completions")
             else base_url
         )
-        formatted_messages = self._prepare_messages(messages, image_bytes)
         payload = self._build_payload(
             formatted_messages, stream=False, settings=settings
         )
@@ -375,18 +484,124 @@ class VLMBrain:
                     log("VLM", "cache.usage", mode="chat", **report)
             choices = resp_json.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "").strip()
-            return ""
+                return choices[0].get("message", {}).get("content", "").strip(), None
+            return "", None
         except urllib.error.HTTPError as e:
             err = e.read(2048).decode("utf-8", errors="ignore")
             err = err.replace(api_key, "[redacted]")
             print(f"[VLM] HTTP Error {e.code}: {err}")
-            return f"【VLM 报错】HTTP {e.code}: {err[:80]}"
+            return f"【VLM 报错】HTTP {e.code}: {err[:80]}", e.code
         except Exception as e:
             print(f"[VLM] Request error: {e}")
-            return f"【VLM 网络异常】{str(e)[:80]}"
+            return f"【VLM 网络异常】{str(e)[:80]}", None
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        image_bytes: Optional[bytes] = None,
+        model_override: Optional[Union[str, Dict[str, Any]]] = None,
+        allow_fallback: bool = True,
+    ) -> str:
+        """非流式标准聊天；主模型 404/5xx 时自动换备用模型重试。"""
+        if not self.is_configured():
+            return "【提示】未配置 VLM API Key，请先在配置中心填写。"
+
+        formatted_messages = self._prepare_messages(messages, image_bytes)
+        chain = self._fallback_candidates(model_override) if allow_fallback else []
+        attempts = [model_override] + chain
+        if chain and self._cooldown_until(self._model_keys(model_override)) > time.monotonic():
+            # 主模型刚失败过：这段时间直接走备用模型。
+            attempts = list(chain)
+
+        text = ""
+        for index, attempt in enumerate(attempts):
+            text, status = self._chat_once(formatted_messages, attempt)
+            if status not in _FALLBACK_HTTP_STATUS or index == len(attempts) - 1:
+                return text
+            self._mark_model_failed(attempt)
+            log(
+                "VLM",
+                "model.fallback",
+                mode="chat",
+                from_model=self._model_label(attempt) or self.model,
+                to_model=self._model_label(attempts[index + 1]),
+                http_status=status,
+            )
+        return text
 
     def stream_chat_and_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        image_bytes: Optional[bytes] = None,
+        model_override: Optional[Union[str, Dict[str, Any]]] = None,
+        cancel_event: Optional[threading.Event] = None,
+        allow_fallback: bool = False,
+        max_fallbacks: int = 2,
+    ) -> Generator[
+        Tuple[str, Any], None, Tuple[str, List[Dict[str, Any]], Dict[str, Any]]
+    ]:
+        """流式生成；主模型 404/502 这类错误时自动换备用模型接着来。
+
+        只在**还没吐出任何内容**且错误码属于"模型/网关不可用"时回退：用户已经
+        看到半截回复后再换模型重来，只会得到重复内容。allow_fallback 由调用方
+        按渠道决定（pet/qq 没有手动选模型，最适合自动顶上）。
+        """
+        chain = (
+            self._fallback_candidates(model_override, limit=max_fallbacks)
+            if allow_fallback
+            else []
+        )
+        attempts = [model_override] + chain
+        if chain and self._cooldown_until(self._model_keys(model_override)) > time.monotonic():
+            # 主模型刚失败过：这一轮直接从备用模型开始，不再撞一次墙。
+            attempts = list(chain)
+
+        for index, attempt in enumerate(attempts):
+            is_last = index == len(attempts) - 1
+            emitted = False
+            refusal = None
+            stream = self._stream_once(
+                messages,
+                tools=tools,
+                image_bytes=image_bytes,
+                model_override=attempt,
+                cancel_event=cancel_event,
+            )
+            try:
+                while True:
+                    try:
+                        kind, data = next(stream)
+                    except StopIteration as done:
+                        return done.value
+                    if kind == "error" and not is_last and not emitted:
+                        code = self._fallback_status(data)
+                        if code is not None:
+                            refusal = (code, str(data))
+                            break
+                    if kind in ("text_delta", "reasoning_delta", "tool_call_delta"):
+                        emitted = True
+                    yield kind, data
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if refusal is None:
+                return ("", [], {})
+            status, detail = refusal
+            self._mark_model_failed(attempt)
+            log(
+                "VLM",
+                "model.fallback",
+                from_model=self._model_label(attempt) or self.model,
+                to_model=self._model_label(attempts[index + 1]),
+                http_status=status,
+                reason=detail[:200],
+            )
+        return ("", [], {})
+
+    def _stream_once(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -446,7 +661,13 @@ class VLMBrain:
         received = 0
         request_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
-        last_data = started
+        # 空闲计时的基准必须是"分片真正到达的时间"，而不是主循环消费到它的
+        # 时间。分片先由读线程塞进队列，主循环再逐条取；一旦某个 yield 让消费端
+        # 卡住几秒（桌宠气泡、Web 广播、日志 IO），队列里明明躺着刚到的数据，
+        # 主循环醒来时却会算出"已经静默 3 秒"从而误判死流。读线程负责刷新它。
+        arrival = [started]
+        consumed_at = [started]
+        gap_logged = [0]
         stage = "等待连接或响应头"
         runtime_cfg = load_config()["runtime"]
         timeout = runtime_cfg["request_timeout_sec"]
@@ -456,11 +677,16 @@ class VLMBrain:
         finish_grace = float(runtime_cfg.get("stream_finish_grace_sec") or 3.0)
         # 已经吐过内容后的"死流"止损阈值。上游半开连接（既不 FIN 也不 RST）
         # 在 TCP 层看不到任何异常，readline 会一直阻塞到 socket 超时；如果只
-        # 依赖 request_timeout_sec，用户就要干等满 180 秒。实测首字之后的分片
-        # 间隔 p90 仅 30~45ms、最差 873ms（工具调用参数也是约 30ms 一片的流式
-        # 分片），所以 3 秒足够判断"这条流已经死了"；真正长的等待只发生在首字
-        # 之前（prefill，实测最长 6.3s），那一段仍由 request_timeout_sec 兜。
-        stall_sec = float(runtime_cfg.get("stream_idle_stall_sec") or 3.0)
+        # 依赖 request_timeout_sec，用户就要干等满 180 秒。
+        # 但分片间隔虽然正常只有 30~45ms，网关本身会随机卡顿（实测同一份 payload
+        # 连打三次：1.9 秒片间空档、96 秒才吐首字节），阈值压太紧就会把"只是慢"
+        # 的请求误杀成断流。
+        stall_sec = float(runtime_cfg.get("stream_idle_stall_sec") or 10.0)
+        # 工具调用参数是一条长 JSON 在逐字生成，中途停一拍是常态（实测 200 词
+        # 参数要连续生成 3.5~4 秒），这一阶段的空闲上限单独放宽。
+        tool_stall_sec = float(
+            runtime_cfg.get("stream_tool_stall_sec") or max(stall_sec, 25.0)
+        )
         finish_seen_at: Optional[float] = None
         # 软收尾原因：上游没给终结信号就断了/哑了，但有效内容已经收全。
         soft_tail: Optional[str] = None
@@ -486,7 +712,8 @@ class VLMBrain:
         try:
             resp = _open_request(req, timeout=timeout)
             stage = "等待首行流数据"
-            last_data = time.monotonic()
+            # 连接建立完成后重新起算等待首行的时间。
+            arrival[0] = time.monotonic()
             stream_socket = self._stream_socket(resp)
             self._enable_keepalive(stream_socket)
             # readline 是阻塞调用，任何 Event 都叫不醒它。这里用独立读线程把数据
@@ -501,6 +728,19 @@ class VLMBrain:
                         raw = resp.readline(1048576)
                         if not raw:
                             break
+                        # 只有真正的 SSE 数据行才算"上游还活着"：空行和
+                        # `: ping` 之类心跳注释不能证明模型还在生成。
+                        if raw.lstrip().startswith(b"data:"):
+                            now_ts = time.monotonic()
+                            gap = now_ts - arrival[0]
+                            # 线上偶发的秒级空档只有在这里才看得见：主循环的
+                            # 分片间隔日志会被消费延迟污染。
+                            if gap >= 1.5 and gap_logged[0] < 5:
+                                gap_logged[0] += 1
+                                log("VLM", "stream.gap", request_id=request_id,
+                                    gap_ms=round(gap * 1000), stage=stage,
+                                    received_bytes=received)
+                            arrival[0] = now_ts
                         line_queue.put(raw)
                 except BaseException as exc:  # noqa: BLE001 - 原样抛回主循环
                     pump_errors.append(exc)
@@ -530,7 +770,10 @@ class VLMBrain:
                     diagnostic("stream.cancelled", reason="user_cancel")
                     break
                 now = time.monotonic()
-                if finish_seen_at is not None and now - finish_seen_at >= finish_grace:
+                # 队列里还压着没消费的分片时，说明数据早就到了，只是消费端
+                # （桌宠气泡/Web 广播/日志 IO）慢了一拍，绝不能判死流。
+                backlog = not line_queue.empty()
+                if finish_seen_at is not None and now - finish_seen_at >= finish_grace and not backlog:
                     # 终止语义已到，网关只是没补 [DONE] / 没关连接。
                     complete = True
                     diagnostic("stream.tail.closed", reason="finish_grace",
@@ -545,8 +788,12 @@ class VLMBrain:
                 idle_limit = stall_sec if saw_delta else timeout
                 if saw_delta and has_reasoning and not reasoning_done:
                     idle_limit = max(idle_limit, stall_sec * 5, 30.0)
-                idle = now - last_data
-                if idle > idle_limit:
+                if tool_calls_map:
+                    idle_limit = max(idle_limit, tool_stall_sec)
+                # 取"最后到达"和"最后消费"里更晚的那个：到达时刻防消费端卡顿
+                # 被误判，消费时刻防队列刚被抽空后立刻被旧到达时间误杀。
+                idle = now - max(arrival[0], consumed_at[0])
+                if idle > idle_limit and not backlog:
                     if (saw_delta and full_content and not tool_calls_map
                             and _tail_looks_complete("".join(full_content))):
                         # 内容已经收全，只是上游没补 finish_reason/[DONE] 就哑了。
@@ -559,6 +806,18 @@ class VLMBrain:
                         break
                     # 心跳行不算数据，避免被 keep-alive 维持的假活流无限拖住。
                     if saw_delta:
+                        # 记清楚断在哪一段：是纯文本说完就哑了，还是工具参数
+                        # 吐到一半哑了。线上排查只看 received_bytes 分不出来。
+                        diagnostic(
+                            "stream.stall",
+                            idle_ms=round(idle * 1000),
+                            chars=len("".join(full_content)),
+                            tool_calls=len(tool_calls_map),
+                            tool_args_chars=sum(
+                                len(tc["arguments"]) for tc in tool_calls_map.values()
+                            ),
+                            finish_reason=finish_reason,
+                        )
                         raise TimeoutError(
                             f"连续 {round(idle)} 秒未收到任何新数据切片"
                         )
@@ -610,6 +869,7 @@ class VLMBrain:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or not line.startswith("data:"):
                     continue
+                consumed_at[0] = time.monotonic()
                 if line[5:].strip() == "[DONE]":
                     complete = True
                     # 再多读一小段，把 chunked 终止块消费干净，连接才能安全回池复用。
@@ -663,7 +923,6 @@ class VLMBrain:
                 if (delta.get("content") or delta.get("tool_calls")
                         or delta.get("reasoning_content") or delta.get("reasoning")
                         or delta.get("thought") or delta.get("thinking")):
-                    last_data = time.monotonic()
                     if not saw_delta:
                         saw_delta = True
                         stage = "读取流数据"
@@ -782,11 +1041,11 @@ class VLMBrain:
                 diagnostic("request.error", exception_type=type(e).__name__,
                            reason_type=type(reason).__name__, detail=message,
                            timeout=timed_out,
-                           idle_ms=round((time.monotonic() - last_data) * 1000))
+                           idle_ms=round((time.monotonic() - max(arrival[0], consumed_at[0])) * 1000))
                 is_ssl_eof = "EOF occurred in violation of protocol" in str(e) or "SSLEOFError" in type(reason).__name__
                 is_conn_reset = "ConnectionResetError" in type(reason).__name__ or "10054" in str(e) or "RemoteDisconnected" in type(reason).__name__
                 if timed_out:
-                    idle_sec = round(time.monotonic() - last_data)
+                    idle_sec = round(time.monotonic() - max(arrival[0], consumed_at[0]))
                     if saw_delta:
                         message = (f"对话模型请求超时：读取流数据期间连续 {idle_sec} 秒没有新数据"
                                    f"（空闲上限 {round(stall_sec)} 秒，已累计接收 {received} 字节；"

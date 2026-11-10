@@ -56,3 +56,12 @@ def execute(context):
         }
 
     return {"ok": False, "error": f"未知 action: {action}（可用: tags / pick）"}
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

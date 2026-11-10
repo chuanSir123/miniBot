@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from core.text_budget import estimate_text_tokens
@@ -44,6 +46,73 @@ KIND_STEERING = "steering"
 
 # 投影时必须剥掉的内部字段（下划线开头的一律剥掉）。
 INTERNAL_KEYS = ("meta",)
+
+# 落库抬头的时间格式。到分钟就够：再细的精度对"这话多久以前说的"没有意义，
+# 却会在每一行正文前面多占几个 token。历史和聊天流用同一种精度，核对时不打架。
+STAMP_FORMAT = "%Y-%m-%d %H:%M"
+
+
+def entry_stamp(at: Optional[float] = None) -> str:
+    """条目时间：默认取当前时刻。"""
+    return time.strftime(STAMP_FORMAT, time.localtime(at if at else time.time()))
+
+
+def stamped_user_entry(text: str, speaker: Optional[Dict[str, Any]] = None,
+                       channel: str = "", target: str = "",
+                       at: Optional[float] = None) -> Dict[str, Any]:
+    """落库用的用户条目：正文带 `[时间] 说话人：` 抬头，meta 留结构化字段。
+
+    为什么抬头写进正文而不是只放 meta：meta 在投影时会被剥掉，模型只看得到
+    正文。群聊里几个人混着说，历史交给模型时若没有「谁、什么时候」的分界，
+    它就只能把上一条当成当前说话人。结构化那份照样留在 meta 里给界面/排查用。
+
+    没有 speaker（Web、桌宠、定时任务）时正文原样不动——那些渠道没有昵称和
+    QQ 号可标，硬加个抬头只会污染正文。
+    """
+    now = at if at else time.time()
+    meta: Dict[str, Any] = {"at": round(now, 3), "channel": channel}
+    content = text
+    if speaker:
+        from core.decision_context import speaker_label
+
+        nickname = str(speaker.get("group_card") or speaker.get("nickname") or "").strip()
+        meta.update(
+            nickname=nickname,
+            qq=str(speaker.get("user_id") or ""),
+            role=str(speaker.get("group_role_label") or ""),
+        )
+        if target:
+            meta["target"] = str(target)
+        # 正文可能是图文混合的块列表：这类调用要原样留着，别把列表插进 f-string
+        # 变成 "['...']"。抬头只加在纯文本上。
+        if isinstance(text, str):
+            # 先剥掉可能已经带着的旧抬头（Web 端"编辑并重跑"会把落库正文原样送回），
+            # 否则同一句话会被盖上两个时间和两个昵称。
+            body = user_utterance_text(text)
+            content = f"[{entry_stamp(now)}] {speaker_label(speaker)}：{body}"
+    return {"role": "user", "content": content, "meta": meta}
+
+
+def stamped_entry(entry: Dict[str, Any], at: Optional[float] = None) -> Dict[str, Any]:
+    """给一条即将落库的 assistant 条目补上时间（meta 投影时剥掉，不影响请求）。"""
+    meta = dict(entry.get("meta") or {})
+    meta.setdefault("at", round(at if at is not None else time.time(), 3))
+    entry["meta"] = meta
+    return entry
+
+
+# `[2026-11-05 09:58:12] 昵称(QQ号)：正文` 的抬头，只认行首这一种形态。
+_STAMP_HEAD_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?\] [^\n：]{0,64}：")
+
+
+def user_utterance_text(content: str) -> str:
+    """剥掉落库抬头，取回用户原话。
+
+    去重、引导匹配这类比较必须拿原话：历史里存的是带 `[时间] 昵称(QQ号)：` 的
+    整行，拿它跟本轮原文比永远不相等，同一句话会被当成新的一句再追加一次。
+    """
+    text = str(content or "")
+    return _STAMP_HEAD_RE.sub("", text, count=1)
 
 
 # ---------------------------------------------------------------------------

@@ -468,7 +468,17 @@
       max-height: 280px;
       overflow-y: auto;
       border-top: none;
-      scroll-behavior: smooth;
+      /* 这里刻意不用 smooth：思考内容是逐字往下长的，每个 delta 都要把滚动条
+         钉到底部，平滑动画会被下一帧立刻打断，观感是滚动条一直在抖。 */
+      scroll-behavior: auto;
+      overflow-anchor: none;
+    }
+    /* 展开时的入场。以前 display:none 直接切 block，是"啪"地蹦出来，
+       配上流式内容一起动就像动画算错了。 */
+    .thinking-body.showing { animation: thinkingReveal 0.2s ease-out; }
+    @keyframes thinkingReveal {
+      from { opacity: 0; transform: translateY(-6px); }
+      to { opacity: 1; transform: translateY(0); }
     }
     .thinking-container.collapsed .thinking-body {
       display: none;
@@ -2455,7 +2465,8 @@
 
     function buildThinkingElement(text, done) {
       const box = document.createElement('div');
-      box.className = 'thinking-container collapsed ' + (done ? '' : 'active');
+      // 折叠只看 done：进行中还折叠着，箭头却是"展开"，第一次点开就像是动画错了。
+      box.className = done ? 'thinking-container collapsed' : 'thinking-container active';
       box.innerHTML = `
         <div class="thinking-header" tabindex="0" role="button" onclick="toggleThinkingBlock(this)">
           <div style="display:flex; align-items:center; gap:8px;">
@@ -2475,7 +2486,7 @@
       const failed = t.result?.ok === false;
       const statusClass = isDone ? (failed ? 'tool-status-err' : 'tool-status-ok') : 'tool-status-running';
       const statusLabel = isDone ? (failed ? '失败' : '完成') : '执行中…';
-      const isFileOp = ['write_file', 'edit_file'].includes(t.name);
+      const isFileOp = ['write', 'edit'].includes(t.name);
       if (isFileOp) {
         let fp = '';
         try {
@@ -2562,6 +2573,10 @@
             currentTurn.thinkingBody = box.querySelector('.thinking-body');
             currentTurn.thinkingStartTime = Date.now();
             currentTurn.thinkingDone = false;
+            // 已经渲染过的这部分不用再画一遍：记下来，后续 delta 拿来比对去重。
+            currentTurn.reasoningFull = block.text || '';
+            currentTurn.reasoningRendered = block.text || '';
+            currentTurn.reasoningRenderedAt = Date.now();
           }
         } else if (block.type === 'text') {
           const el = document.createElement('div');
@@ -2649,13 +2664,13 @@
         try { a = JSON.parse(a); } catch (e) { a = {}; }
       }
       switch (name) {
-        case 'execute_command':
+        case 'bash':
           return { icon: '', title: '运行了命令', detail: a?.command ? a.command.slice(0, 50) : '' };
-        case 'read_file':
+        case 'read':
           return { icon: '', title: '读取了文件', detail: a?.file_path ? a.file_path.split(/[\\/]/).pop() : '' };
-        case 'write_file':
+        case 'write':
           return { icon: '', title: '写入了文件', detail: a?.file_path ? a.file_path.split(/[\\/]/).pop() : '' };
-        case 'edit_file':
+        case 'edit':
           return { icon: '', title: '编辑了文件', detail: a?.file_path ? a.file_path.split(/[\\/]/).pop() : '' };
         case 'capture_screen':
           return { icon: '', title: '捕获了屏幕核验效果', detail: a?.reason || '' };
@@ -2794,15 +2809,15 @@
               argsObj = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : (rawArgs || {});
             } catch (e) {}
 
-            const isFileOp = ['write_file', 'edit_file'].includes(toolName);
+            const isFileOp = ['write', 'edit'].includes(toolName);
             if (isFileOp) {
               const fp = argsObj.file_path || argsObj.path ;
               const fname = fp ? fp.split(/[\/]/).pop() : fp;
               let added = 0;
               let deleted = 0;
-              if (toolName === 'write_file' && argsObj.content) {
+              if (toolName === 'write' && argsObj.content) {
                 added = argsObj.content.split('\n').length;
-              } else if (toolName === 'edit_file') {
+              } else if (toolName === 'edit') {
                 if (argsObj.target) deleted = argsObj.target.split('\n').length;
                 if (argsObj.replacement) added = argsObj.replacement.split('\n').length;
               }
@@ -3447,12 +3462,18 @@
 
     function setTaskPhase(phaseText) {
       if (!phaseText) return;
+      // 相位字幕基本是固定的（"模型深度思考中..."），每个 token 都重写一遍
+      // 五个 DOM 节点没有意义；真正在走的是计时器，它有自己的心跳。
+      if (phaseText === currentTaskPhase) return;
       currentTaskPhase = phaseText;
       updateLiveActivityUI();
     }
 
     // Task Execution State & Steering Mode Switcher
     function setTaskState(running, statusMsg = '') {
+      // 运行中状态是幂等的。流式内容每个 token 都会调一次，重写这八个 DOM
+      // 属性纯属浪费主线程——首帧（isTaskRunning 还是 false）该做的照做。
+      if (running && isTaskRunning && !statusMsg) return;
       isTaskRunning = running;
       const dot = document.getElementById('status_dot');
       const statusText = document.getElementById('status_text');
@@ -3515,7 +3536,7 @@
       const timeline = document.getElementById('chat_timeline');
       const toolName = data.name || data.tool || '';
       const toolId = data.id || `call_${data.index || 0}`;
-      const isFileOp = data.is_file_op || ['write_file', 'edit_file'].includes(toolName);
+      const isFileOp = data.is_file_op || ['write', 'edit'].includes(toolName);
       const desc = getFriendlyToolDesc(toolName, { snippet: data.snippet, ...data });
       setTaskPhase(` 正在执行: ${desc.title}`);
 
@@ -3587,7 +3608,7 @@
           }
         }
       } else {
-        // Non-file streaming status (e.g. execute_command, capture_screen)
+        // Non-file streaming status (e.g. bash, capture_screen)
         let step = document.getElementById(`tool_step_${toolName}_running`) ||
                    document.querySelector(`.tool-step-container[data-tool="${toolName}"][data-running="1"]`);
         if (!step) {
@@ -3619,7 +3640,7 @@
       const timeline = document.getElementById('chat_timeline');
       const toolName = data.tool || '';
       const toolId = data.id || `call_${currentTurn.toolCount++}`;
-      const isFileOp = ['write_file', 'edit_file'].includes(toolName);
+      const isFileOp = ['write', 'edit'].includes(toolName);
       const desc = getFriendlyToolDesc(toolName, data.args);
       setTaskPhase(` 正在执行: ${desc.title}`);
 
@@ -3675,7 +3696,7 @@
     function handleToolResult(data) {
       setTaskPhase('📊 分析工具返回结果中...');
       const toolName = data.tool || '';
-      const isFileOp = ['write_file', 'edit_file'].includes(toolName);
+      const isFileOp = ['write', 'edit'].includes(toolName);
 
       if (isFileOp) {
         const card = document.querySelector(`.streaming-code-card.streaming-active[data-tool="${toolName}"]`) ||
@@ -3715,7 +3736,7 @@
           if (metaBox) {
             const badge = document.createElement('span');
             badge.className = `tool-step-badge ${ok ? 'tool-status-ok' : 'tool-status-err'}`;
-            badge.textContent = ok ? (card.dataset.tool === 'edit_file' ? '已更新' : '已生成') : '失败';
+            badge.textContent = ok ? (card.dataset.tool === 'edit' ? '已更新' : '已生成') : '失败';
             badge.style.marginLeft = '4px';
             metaBox.appendChild(badge);
           }
@@ -3767,7 +3788,12 @@
         thinkingBox: null,
         thinkingBody: null,
         thinkingStartTime: null,
-        thinkingDone: false
+        thinkingDone: false,
+        // 思考内容的渲染缓冲：delta 只更新它，按节流真正落 DOM。
+        reasoningFull: '',
+        reasoningRendered: '',
+        reasoningTimer: null,
+        reasoningRenderedAt: 0
       };
     }
 
@@ -3794,7 +3820,10 @@
       currentTurn.traceBox = null;
       const group = ensureTurnGroup();
       const box = document.createElement('div');
-      box.className = 'thinking-container active collapsed';
+      // 思考中就该是展开的：折叠发生在 reasoning_complete（collapseThinking）。
+      // 以前这里一创建就带 collapsed，于是箭头挂着"▼"却是收起状态，
+      // 第一次点开才手动展开，看起来像展开动画算错了。
+      box.className = 'thinking-container active';
       box.innerHTML = `
         <div class="thinking-header" tabindex="0" role="button" onclick="toggleThinkingBlock(this)">
           <div style="display:flex; align-items:center; gap:8px;">
@@ -3810,11 +3839,24 @@
       currentTurn.thinkingBody = box.querySelector('.thinking-body');
       currentTurn.thinkingStartTime = Date.now();
       currentTurn.thinkingDone = false;
+      // 同一轮里工具调用之后可能再思考一次：渲染缓冲跟着新块归零，
+      // 否则新块会拿上一块的文本做"没变化就跳过"，最后一片空白。
+      if (currentTurn.reasoningTimer) {
+        clearTimeout(currentTurn.reasoningTimer);
+        currentTurn.reasoningTimer = null;
+      }
+      currentTurn.reasoningFull = '';
+      currentTurn.reasoningRendered = '';
+      currentTurn.reasoningRenderedAt = 0;
       currentTurn.blocks.push({ kind: 'reasoning', el: box });
       return box;
     }
 
     function endThinkingBlock() {
+      if (currentTurn.reasoningTimer) {
+        clearTimeout(currentTurn.reasoningTimer);
+        currentTurn.reasoningTimer = null;
+      }
       if (currentTurn.thinkingBox) collapseThinking();
       currentTurn.thinkingBox = null;
       currentTurn.thinkingBody = null;
@@ -3919,11 +3961,60 @@
     function toggleThinkingBlock(headerEl) {
       const box = headerEl.closest('.thinking-container');
       if (!box) return;
+      const willCollapse = !box.classList.contains('collapsed');
       box.classList.toggle('collapsed');
+      const body = box.querySelector('.thinking-body');
+      if (body && !willCollapse) {
+        // 重新触发一次入场动画（展开时才做，收起不需要）。
+        body.classList.remove('showing');
+        void body.offsetWidth;
+        body.classList.add('showing');
+        // 刚展开时补渲染一次：折叠期间的 delta 都被节流掉了，这里要对齐最新内容。
+        if (box === currentTurn.thinkingBox && currentTurn.reasoningFull) {
+          flushReasoningRender();
+          body.scrollTop = body.scrollHeight;
+        }
+      }
       const chevron = box.querySelector('.thinking-chevron');
       if (chevron) {
         chevron.textContent = box.classList.contains('collapsed') ? '▶' : '▼';
       }
+    }
+
+    // 思考内容整段重渲染很贵：以前每个 reasoning_delta 都把 body.innerHTML 全量
+    // 重设一遍，思考一长就是 O(n²) 的字符串拼接加 DOM 重建，越到后面越卡。
+    // 按 ~90ms 节流，视觉上仍是逐字流出来的，渲染次数却降了一个数量级。
+    const REASONING_RENDER_INTERVAL = 90;
+
+    function queueReasoningRender(full) {
+      currentTurn.reasoningFull = full || '';
+      if (currentTurn.reasoningTimer) return;
+      const wait = Math.max(
+        0, REASONING_RENDER_INTERVAL - (Date.now() - (currentTurn.reasoningRenderedAt || 0))
+      );
+      currentTurn.reasoningTimer = setTimeout(flushReasoningRender, wait);
+    }
+
+    function flushReasoningRender() {
+      if (currentTurn.reasoningTimer) {
+        clearTimeout(currentTurn.reasoningTimer);
+        currentTurn.reasoningTimer = null;
+      }
+      const body = currentTurn.thinkingBody;
+      if (!body) return;
+      const full = currentTurn.reasoningFull || '';
+      if (full === currentTurn.reasoningRendered) return;
+      currentTurn.reasoningRendered = full;
+      currentTurn.reasoningRenderedAt = Date.now();
+      // 全量重设会把 scrollTop 打回 0：用户往上翻看前面思路时，
+      // 下一个 delta 就把他弹回顶部。按"原本是否贴着底部"决定跟随还是保位。
+      const prevTop = body.scrollTop;
+      const nearBottom = body.scrollHeight - prevTop - body.clientHeight <= 40;
+      body.innerHTML = renderMarkdown(full);
+      body.scrollTop = nearBottom ? body.scrollHeight : prevTop;
+      // 思考块变高会让整条时间线跟着长，跟随滚动放在这里一起做，
+      // 每 90ms 一次重排，而不是每个 token 一次。
+      smartScrollToBottom(false);
     }
 
     let currentSseSessionId = null;
@@ -4029,19 +4120,16 @@
           setTaskState(true);
           setTaskPhase(' 模型深度思考中...');
           beginThinkingBlock();
-          if (currentTurn.thinkingBody) {
-            const body = currentTurn.thinkingBody;
-            const bodyNearBottom = (body.scrollHeight - body.scrollTop - body.clientHeight <= 40);
-            body.innerHTML = renderMarkdown(data.full);
-            if (bodyNearBottom) {
-              body.scrollTop = body.scrollHeight;
-            }
-          }
-          smartScrollToBottom(false);
+          // 渲染和滚动都交给节流后的 flushReasoningRender 一起做：
+          // 读 scrollHeight 会强制重排，跟在全量重渲染后面每个 token 来一次，
+          // 就是思考越长越卡的主因。
+          queueReasoningRender(data.full);
         } catch (err) {}
       });
 
       listen('reasoning_complete', e => {
+        // 收尾前把缓冲里最后一段落下去，否则末尾几个字会被节流吃掉。
+        flushReasoningRender();
         endThinkingBlock();
       });
 

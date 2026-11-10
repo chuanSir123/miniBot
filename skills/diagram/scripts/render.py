@@ -5,6 +5,7 @@ r"""diagram render: 把 SVG 渲染成高清 PNG（Playwright 无头 Chromium 截
 探测装了 playwright 的解释器 → 起子进程截图。截图用
 device_scale_factor 放大出高清图，clip 到 viewBox 尺寸去掉白边。
 """
+import glob
 import json
 import os
 import shutil
@@ -30,17 +31,49 @@ with sync_playwright() as p:
 print("CAPTURE_OK")
 '''
 
-_PY_CANDIDATES = [
-    sys.executable,
-    shutil.which("python"),
-    shutil.which("python3"),
-    r"C:\users\admin\appdata\local\programs\python\python310\python.exe",
-]
+def _python_candidates():
+    """装了 playwright 的解释器候选。
+
+    顺序：环境变量指定 > 当前解释器 > PATH 里的 python/python3 > 常见安装目录。
+    这里不能写死某个用户名下的路径——别人机器上那个目录根本不存在。
+    """
+    seen, out = set(), []
+
+    def push(value):
+        value = (value or "").strip()
+        if value and value not in seen and os.path.isfile(value):
+            seen.add(value)
+            out.append(value)
+
+    push(os.environ.get("MINIBOT_PYTHON") or os.environ.get("PLAYWRIGHT_PYTHON"))
+    push(sys.executable)
+    push(shutil.which("python"))
+    push(shutil.which("python3"))
+
+    bases = [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES"),
+             os.environ.get("PROGRAMFILES(X86)")]
+    if os.name == "nt":
+        # 精简环境里 PROGRAMFILES 可能没设，按系统盘补回标准目录。
+        # 盘符要带分隔符，否则 join("C:", "Program Files") 会变成盘符相对路径。
+        drive = os.path.splitdrive(os.environ.get("WINDIR") or "C:\\Windows")[0] or "C:"
+        drive = drive + os.sep
+        bases += [os.path.join(drive, "Program Files"), os.path.join(drive, "Program Files (x86)"),
+                  os.path.join(os.path.expanduser("~"), "AppData", "Local")]
+    for base in bases:
+        if not base:
+            continue
+        for hit in sorted(glob.glob(os.path.join(base, "Programs", "Python", "Python3*", "python.exe")), reverse=True):
+            push(hit)
+        for hit in sorted(glob.glob(os.path.join(base, "Python3*", "python.exe")), reverse=True):
+            push(hit)
+    for hit in ("/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"):
+        push(hit)
+    return out
 
 
 def _python_with_playwright():
     seen = set()
-    for py in _PY_CANDIDATES:
+    for py in _python_candidates():
         if not py or py in seen:
             continue
         seen.add(py)
@@ -88,7 +121,7 @@ def execute(context):
     py = _python_with_playwright()
     if not py:
         return {"ok": False, "error": "未找到装 playwright 的 Python 解释器（尝试过: %s）" %
-                ", ".join(p for p in _PY_CANDIDATES if p)}
+                ", ".join(_python_candidates() or ["无可用候选"])}
 
     try:
         pr = subprocess.run(
@@ -112,3 +145,12 @@ def execute(context):
         "scale": scale,
         "python_used": py,
     }
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

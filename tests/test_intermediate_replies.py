@@ -28,7 +28,7 @@ class IntermediateReplyTests(Fixture):
                     yield 'reasoning_delta', 'PRIVATE_REASONING'
                     yield 'text_delta', '我先'
                     yield 'text_delta', '创建文件。'
-                    return '', [{'id': 'write', 'type': 'function', 'function': {'name': 'write_file',
+                    return '', [{'id': 'write', 'type': 'function', 'function': {'name': 'write',
                         'arguments': json.dumps({'file_path': str(path), 'content': 'ok'})}}], {}
                 yield 'text_delta', '完成了。'
                 return '', [], {}

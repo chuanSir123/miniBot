@@ -77,7 +77,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
             task_state = {
                 "original_goal": "编写一个快速排序算法",
                 "status": "awaiting_input",
-                "last_tools": [{"tool": "write_file", "ok": True}],
+                "last_tools": [{"tool": "write", "ok": True}],
             }
             # Steering phrases
             self.assertEqual(jev.classify_steering_intent("不对，改成冒泡排序", task_state=task_state), "steering")
@@ -313,7 +313,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
             msg_id = self.memory.append_message(session, {"role": "user", "content": "做个动画"})["_id"]
 
             mgr.begin_turn(session, scope, message_id=msg_id)
-            # 模拟 execute_skill / ffmpeg 绕过 write_file 直接落盘
+            # 模拟 execute_skill / ffmpeg 绕过 write 直接落盘
             (ws / "anim.mp4").write_bytes(b"m" * 256)
             (ws / "preview.gif").write_bytes(b"g" * 128)
             (ws / "images").mkdir()
@@ -338,7 +338,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
         finally:
             shutil.rmtree(ws, ignore_errors=True)
 
-    def test_edit_file_tool(self):
+    def test_edit_tool(self):
         brain = MagicMock()
         jev = MagicMock()
         skill_manager = MagicMock()
@@ -348,15 +348,15 @@ class TestWorkspaceAndSteering(unittest.TestCase):
         test_file = Path(self.temp_dir) / "sample_edit.py"
         test_file.write_text("def run():\n    a = 1\n    return a\n", encoding="utf-8")
 
-        # Execute edit_file
+        # Execute edit
         res = harness._execute_tool(
-            "edit_file",
+            "edit",
             {"file_path": str(test_file), "target": "a = 1", "replacement": "a = 999"},
             scope="main",
             session_id="web:main:edit_test",
             channel="web",
             target="",
-            permitted={"edit_file"},
+            permitted={"edit"},
         )
         self.assertTrue(res["ok"])
         self.assertIn("a = 999", test_file.read_text(encoding="utf-8"))
@@ -462,7 +462,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
     def test_live_tool_delta_streaming_and_sse_dispatch(self):
         # 1. Verify streaming parser yields dynamic line counts
         from core.streaming_parser import parse_tool_delta
-        delta_res = parse_tool_delta("write_file", '{"file_path": "pelican.html", "content": "<div>Pelican</div>\n<span>Test</span>\n', scope="main")
+        delta_res = parse_tool_delta("write", '{"file_path": "pelican.html", "content": "<div>Pelican</div>\n<span>Test</span>\n', scope="main")
         self.assertTrue(delta_res["is_file_op"])
         self.assertEqual(delta_res["file_path"], "pelican.html")
         self.assertEqual(delta_res["lines_added"], 3)
@@ -474,7 +474,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
             ("tool_call_delta", {
                 "index": 0,
                 "id": "call_123",
-                "name": "write_file",
+                "name": "write",
                 "delta": "<div>Pelican</div>\n",
                 "arguments_so_far": '{"file_path": "pelican.html", "content": "<div>Pelican</div>\n"}'
             }),
@@ -501,7 +501,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
 
         self.assertEqual(len(received_deltas), 1)
         first_delta = received_deltas[0]
-        self.assertEqual(first_delta["name"], "write_file")
+        self.assertEqual(first_delta["name"], "write")
         self.assertTrue(first_delta["is_file_op"])
         self.assertEqual(first_delta["file_path"], "pelican.html")
         self.assertEqual(first_delta["lines_added"], 2)
@@ -662,7 +662,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
                 yield 'text_delta', '一下旋转角：'
                 yield 'text_delta', '重新解算。'
                 return '', [{'id': 'c1', 'type': 'function', 'function': {
-                    'name': 'execute_command', 'arguments': json.dumps({'command': 'echo hi'})}}], {}
+                    'name': 'bash', 'arguments': json.dumps({'command': 'echo hi'})}}], {}
             yield 'text_delta', '修好了。'
             return '', [], {}
 
@@ -699,8 +699,8 @@ class TestWorkspaceAndSteering(unittest.TestCase):
         """Verify user workspaces like 'my_project' in Web channel are trusted and not blocked by QQ permissions."""
         from core.qq_authority import tool_access
         # 1. tool_access check
-        self.assertTrue(tool_access("my_project", "write_file", {"file_path": "demo.html"}))
-        self.assertTrue(tool_access("my_project", "execute_command", {"command": "dir"}))
+        self.assertTrue(tool_access("my_project", "write", {"file_path": "demo.html"}))
+        self.assertTrue(tool_access("my_project", "bash", {"command": "dir"}))
 
         # 2. Harness tool execution check
         brain = MagicMock()
@@ -711,7 +711,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
 
         harness = AgentHarness(brain, jev, self.memory, perception, skill_manager)
         res = harness._execute_tool(
-            "write_file",
+            "write",
             {"file_path": "pelican_bike.html", "content": "<h1>test</h1>"},
             scope="my_project",
             session_id="web:my_project:default",
@@ -733,7 +733,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
                 "reasoning": "正在分析问题...",
                 "reasoning_done": False,
                 "text": "初始文本",
-                "tools": [{"name": "write_file", "status": "done"}],
+                "tools": [{"name": "write", "status": "done"}],
                 "started_at": 12345,
                 "is_active": True
             }
@@ -950,13 +950,13 @@ class SteeringBlockTests(unittest.TestCase):
             status("正在执行工具...")
             on_tool_call = kwargs.get("on_tool_call")
             if on_tool_call:
-                on_tool_call("write_file", {"path": "test.txt"})
+                on_tool_call("write", {"path": "test.txt"})
             on_tool_delta = kwargs.get("on_tool_delta")
             if on_tool_delta:
                 on_tool_delta({"output": "chunk1"})
             on_tool_result = kwargs.get("on_tool_result")
             if on_tool_result:
-                on_tool_result("write_file", {"ok": True})
+                on_tool_result("write", {"ok": True})
 
             on_text("你好", "你好")
             on_text("，主人！", "你好，主人！")

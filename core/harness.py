@@ -1,12 +1,17 @@
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from core.console import log
-import itertools
 import json
 import os
 import re
 import time
 from pathlib import Path
 
+from core.agent_loop import (
+    AgentLoop,
+    FinishTurnDecision,
+    PendingMessageQueue,
+    TurnContext,
+)
 from core.compaction import ContextCompactor
 from core.transcript import (
     KIND_MEMORY,
@@ -14,6 +19,9 @@ from core.transcript import (
     is_internal_user_entry,
     last_meta,
     memory_entry,
+    stamped_entry,
+    stamped_user_entry,
+    user_utterance_text,
 )
 
 
@@ -34,11 +42,15 @@ def needs_user_prompt_append(history, user_prompt):
     Web 端在发起请求时已先落过一次；记忆条目也以 user 身份跟在后面。
     如果直接看"最后一条 user"，命中的会是记忆条目，于是同一句话被追加第二次
     —— 这就是切换会话时命令打印两遍的原因。
+
+    比较前两边都剥掉 `[时间] 昵称(QQ号)：` 抬头：落库那份带抬头，原文没有，
+    不剥的话每次都会判成"新的一句"。
     """
     last_user = last_real_user_message(history)
     if last_user is None:
         return True
-    return str(last_user.get("content") or "") != str(user_prompt or "")
+    stored = user_utterance_text(last_user.get("content") or "")
+    return stored != user_utterance_text(user_prompt)
 
 
 def _recall_payload(memory_recall, context_prompt, context_events):
@@ -67,7 +79,7 @@ HARNESS_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "execute_command",
+            "name": "bash",
             "description": "执行本地终端命令。Windows 固定使用 PowerShell，请使用 PowerShell 语法；列出文件名用 Get-ChildItem -LiteralPath '路径' -Name，不要使用 CMD 的 dir /b。确需 CMD 时显式调用 cmd.exe /c。非 Windows 使用系统 shell。",
             "parameters": {
                 "type": "object",
@@ -86,6 +98,12 @@ HARNESS_TOOLS = [
                         "description": "是否在后台异步运行（耗时较长、非阻塞的命令建议设为 true）",
                         "default": False,
                     },
+                    "cwd": {
+                        "type": "string",
+                        "enum": ["workspace", "project"],
+                        "description": "命令工作目录：workspace=当前会话工作空间（默认，相对路径按它解析）；project=项目根目录（技能脚本命令用这个，路径写成 skills/<name>/scripts/<file>.py）。只接受这两个值，不能填任意路径。",
+                        "default": "workspace",
+                    },
                 },
                 "required": ["command"],
             },
@@ -94,7 +112,7 @@ HARNESS_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
+            "name": "read",
             "description": "读取本地文件内容，支持指定行范围，防止长文件过载。",
             "parameters": {
                 "type": "object",
@@ -121,7 +139,7 @@ HARNESS_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_file",
+            "name": "write",
             "description": "写入或覆盖本地文件内容。",
             "parameters": {
                 "type": "object",
@@ -139,7 +157,7 @@ HARNESS_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "edit_file",
+            "name": "edit",
             "description": "精确替换现有文件中的代码或文本片段。target 必须与现有文件中的目标代码段完全严格匹配，replacement 为替换的新代码。",
             "parameters": {
                 "type": "object",
@@ -169,23 +187,6 @@ HARNESS_TOOLS = [
                     "height": {"type": "integer", "description": "浏览器渲染视口高度，默认 800"},
                 },
                 "required": ["reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_skill",
-            "description": "执行内置或用户技能。脚本型技能传 arguments 执行；指令型技能（只有SKILL.md）先不带 arguments 调用获取完整说明，再按说明执行。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": {"type": "string", "description": "技能名称"},
-                    "arguments": {"type": "object", "description": "技能参数JSON对象，例如 {\"prompt\":\"日落\",\"width\":480}，不要序列化为字符串"},
-                    "background": {"type": "boolean", "description": "是否在后台异步运行", "default": False},
-                    "timeout_sec": {"type": "number", "description": "首阶段等待超时秒数，默认按技能配置"},
-                },
-                "required": ["skill_name"],
             },
         },
     },
@@ -250,19 +251,47 @@ def _tool(name, description, properties, required=()):
     }
 
 
+# 技能已改成纯 Markdown 指令：模型只用 read 读 SKILL.md，再用 bash
+# 直接跑 skills/<name>/scripts/ 下的脚本。execute_skill 不再出现在给模型的工具清单里，这里保留一份
+# 定义仅供 CLI / 内部调用与既有回归用例复用（权限校验仍统一走 _execute_tool）。
+INTERNAL_TOOL_DEFS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_skill",
+            "description": "[内部] 执行已注册技能，模型不可见；请改用 read + bash。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "技能名称"},
+                    "arguments": {"type": "object", "description": "技能参数JSON对象"},
+                    "background": {"type": "boolean", "description": "是否在后台异步运行", "default": False},
+                    "timeout_sec": {"type": "number", "description": "首阶段等待超时秒数"},
+                },
+                "required": ["skill_name"],
+            },
+        },
+    },
+]
+
 HARNESS_TOOLS += [
     _tool("read_chat_history", "读取当前群/私聊的原始聊天记录，包括未触发回复的消息；摘要中的旧消息可用此工具回查，不跨会话读取。",
           {"before_id": {"type": "integer"}, "limit": {"type": "integer"}}),
-    _tool("manage_permissions", "结合当前主人回复、引用消息和历史理解授权/撤销意图。例如引用某人申请联网权限后主人回复‘可以’‘给他开一下’，应据引用的真实发送者QQ和所申请能力执行授权，无需固定关键词。仅当前实际发言人是配置主人时能grant/revoke；引用主人、群友自称主人不授予身份。目标QQ可从引用消息结构化发送者信息、@或明确历史记录获取，不凭昵称猜测。主人只是讨论/拒绝申请时不授权，目标/能力不明确时询问。群内默认当前群，私聊默认private；只有明确跨群/全局要求才填all。单个技能用skills，工具用tools，全部工具填tools=['*']；duration_minutes=0长期。",
+    _tool("manage_permissions", "结合当前主人回复、引用消息和历史理解授权/撤销意图。例如引用某人申请联网权限后主人回复‘可以’‘给他开一下’，应据引用的真实发送者QQ和所申请能力执行授权，无需固定关键词。仅当前实际发言人是配置主人时能grant/revoke；引用主人、群友自称主人不授予身份。目标QQ可从引用消息结构化发送者信息、@或明确历史记录获取，不凭昵称猜测。主人只是讨论/拒绝申请时不授权，目标/能力不明确时询问。群内默认当前群，私聊默认private；只有明确跨群/全局要求才填all。工具用tools，全部工具填tools=['*']；skills 仍可填（技能是 Markdown 指令，会转成 bash 工具权限）；duration_minutes=0长期。",
           {"action": {"type": "string", "enum": ["grant", "revoke", "list"]},
            "user_id": {"type": "string", "description": "目标QQ号；只有主人明确要求本群全体成员时才使用*，并限定具体群"}, "chat_scope": {"type": "string"},
            "tools": {"type": "array"}, "skills": {"type": "array"}, "duration_minutes": {"type": "number"}}, ["action"]),
     _tool("list_media", "查询当前会话近期媒体引用（图片/视频/音频）及来源。修改上一张/刚才的图时先查询；优先选当前上传或引用消息的媒体，不要猜测media_ref。不会返回Base64。",
           {"limit": {"type": "integer"}, "message_id": {"type": "string"}}),
-    _tool("get_media", "查看当前会话指定媒体的元数据；图片额外返回预览。不返回Base64文本；编辑图片时复用同一个media_ref。",
+    _tool("get_media", "解析当前会话的 media_ref：返回元数据与本机文件路径 file_path。技能脚本需要图片/音频数据时，先用本工具取 file_path，再作为文件参数传给脚本；图片额外返回预览。不返回 Base64 文本，避免大段数据进入上下文；编辑图片时复用同一个 media_ref。",
           {"media_ref": {"type": "string"}}, ["media_ref"]),
     _tool("register_media", "把已确认存在的本机媒体文件（图片/视频/音频，如 .png .jpg .mp4 .webm .mp3 .wav .m4a）登记为当前会话media_ref，以便编辑、发送到QQ或后续引用。相对路径按当前Harness工作空间解析。",
           {"file_path": {"type": "string"}}, ["file_path"]),
+    _tool("forget_meme", "把不该再发的表情包从表情库彻底删除（记录和文件一起删），之后不会再被选中；同时按画面记住这张图，别人再发回来也不会被重新收录。target=last 删本会话我最近发出去的那张；target=media 按当前会话的 media_ref 删（用户把同一张图重新发回来时说“这张别发了”用这个，先 list_media 取 ref）；target=path 按表情库内文件路径删。只有用户明确要求删除表情包时才调用，不要拿它删普通聊天图片。",
+          {"target": {"type": "string", "enum": ["last", "media", "path"]},
+           "media_ref": {"type": "string", "description": "target=media 时的媒体引用"},
+           "file_path": {"type": "string", "description": "target=path 时的表情库内路径"}},
+          ["target"]),
     _tool("activate_skill", "重新扫描技能目录并重新加载技能清单（技能目录变化通常会被自动发现，一般无需调用）。",
           {"skill_name": {"type": "string"}}, ["skill_name"]),
     _tool("restart_bot", "重启 MiniBot 本体进程：优雅停机后由启动器自动重新拉起，用于改了配置/技能后需要立刻生效的场景。"
@@ -351,6 +380,10 @@ HARNESS_TOOLS += [
         ["action"],
     ),
 ]
+
+# 模型只看得到 HARNESS_TOOLS；内部兼容工具仅供 CLI / 回归用例走同一套执行与权限链。
+ALL_TOOL_DEFS = HARNESS_TOOLS + INTERNAL_TOOL_DEFS
+
 # 工具路由提示、行为准则与技能目录全部归到 core/context_builder.py，
 # 按「路由提示 / 行为准则 / 技能目录」三类组织：
 # 能力与参数只写在 HARNESS_TOOLS 的 schema 里，行为约束只写在 TOOL_GUIDELINES 里，
@@ -449,22 +482,98 @@ def assess_command(command: str, is_tainted: bool = False) -> dict:
 
 
 # ==========================================================
+# Windows PowerShell 内联 JSON 参数适配
+# ==========================================================
+# 只匹配 ``--arguments '...'`` 这种单引号包裹的内联写法（SKILL.md 的约定）。
+_INLINE_SKILL_ARGS = re.compile(r"(--arguments\s+)'((?:[^']|'')*)'")
+
+
+# 各家服务端说"这次请求超过模型上下文"的措辞都不一样，按语义认，不能拿
+# HTTP 400 一刀切——参数写错、图片格式不对也是 400，压缩历史救不了它们，
+# 在那些错误上压一遍只会白白丢掉历史。
+CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[ _-]?length[ _-]?exceeded"
+    r"|maximum context length"
+    r"|context[ _-]?window[ _-]?exceed"
+    r"|reduce the length of the (?:messages|conversation)"
+    r"|prompt is too long"
+    r"|input (?:is )?too long"
+    r"|too many (?:input )?tokens"
+    r"|exceed(?:s|ed)? (?:the )?(?:model'?s? )?(?:maximum )?context"
+    r"|超出.{0,8}上下文|上下文.{0,6}(?:超|过)长|请求.{0,4}过长",
+    re.IGNORECASE,
+)
+
+
+def is_context_overflow(error_text) -> bool:
+    """这句报错是"请求太长"还是"请求坏了"——只有前者值得压缩后重发。"""
+    return bool(error_text) and bool(CONTEXT_OVERFLOW_RE.search(str(error_text)))
+
+
+def _protect_inline_skill_arguments(command: str) -> str:
+    """让 ``--arguments '{"a":"中文"}'`` 在 PowerShell 5.1 下完整到达 python。
+
+    PowerShell 5.1 调用原生 exe 时不转义参数里的 ``"``，CreateProcess 把它当
+    分组符吃掉：python 实际收到 ``{a:中文}``，json.loads 报
+    "Expecting property name enclosed in double quotes"。在单引号字符串里把
+    ``"`` 写成 ``\\"``，命令行解析会还原成字面双引号（本机实测通过）。
+
+    只处理「单引号包裹且内容含双引号」的内联 JSON；``--arguments @文件``
+    （没有双引号，本来就不会被吞）和双引号写法一律原样返回。纯字符串处理，
+    由调用方决定是否只在 Windows 启用。
+    """
+    if "--arguments" not in command:
+        return command
+
+    def _escape(match: re.Match) -> str:
+        prefix, raw = match.group(1), match.group(2)
+        if raw.startswith("@") or '"' not in raw:
+            return match.group(0)
+        normalized = raw.replace('\\"', '"')  # 幂等：已经转义过的不再加一层
+        return prefix + "'" + normalized.replace('"', '\\"') + "'"
+
+    return _INLINE_SKILL_ARGS.sub(_escape, command)
+
+
+# ==========================================================
 # 重复调用守卫
 # ==========================================================
 # 只读工具：同样的参数再执行一次，结果必然一样。模型拿到一样的内容不会前进，
 # 只会再读一次——pelican_bike.html 连续读七遍就是这种空转。
 # 有副作用的工具（写文件、跑命令、截图）不在此列：改完文件重跑同一条测试命令
 # 是完全正常的操作，靠参数相同去拦会误伤。
-# 只有"结果完全由参数决定"的工具才配拦截：read_file 有文件版本戳兜底，
-# get_media 按 media_ref 取同一个文件。list_files / read_history 的结果会随
-# 新文件、新消息变化，按参数相同去拦会把"确认一下刚才写进去没有"挡掉。
-STABLE_READ_TOOLS = frozenset({"read_file", "get_media"})
+# 只有"结果完全由参数决定"的工具才配拦截：read 有文件版本戳兜底，
+# get_media 按 media_ref 取同一个文件。
+STABLE_READ_TOOLS = frozenset({"read", "get_media"})
+
+# 幂等但"会随会话状态变"的查询工具：同一参数连着问，答案基本不变，但中间如果
+# 登记了新媒体、加了新提醒，答案确实会变。给它们放宽一档，让"登记完再列一遍"
+# 这种连贯动作正常通过，只在第四次重复时才判定为空转。
+IDEMPOTENT_READ_TOOLS = frozenset({"list_media", "list_skills", "list_reminders"})
 
 # 第 2 次：内容照给，但附一句"和上一步一样"；第 3 次起：不再执行，直接退回提示。
 DUPLICATE_NOTICE_AT = 2
 DUPLICATE_BLOCK_AT = 3
-# 一直重复到第 6 次说明提示没用，直接收尾，避免 100 轮上限里空转几百秒。
-DUPLICATE_ABORT_AT = 6
+# 状态型查询工具宽一档：第 3 次提醒，第 4 次才拦。
+DUPLICATE_STATEFUL_NOTICE_AT = 3
+DUPLICATE_STATEFUL_BLOCK_AT = 4
+# 拦了还接着来，说明提示没用。对齐 pi 的 block + terminate：判定死循环就在这一批
+# 调用之后收尾，而不是再空转到第 6 次——每一次空转都是一次完整的模型请求。
+DUPLICATE_ABORT_AT = 4
+DUPLICATE_STATEFUL_ABORT_AT = 5
+
+# 「同样参数」之外还有一层：参数不同、工具也可能是同一个，但一直在失败。
+# 这是 pi restartLimit 的形状——同类失败连续 N 次就该判死，而不是无限重试。
+# 提醒线放得低，因为连续失败也可能是正常的排错过程；收尾线才代表真打转。
+CONSECUTIVE_FAILURE_NOTICE_AT = 5
+CONSECUTIVE_FAILURE_ABORT_AT = 9
+
+
+def _duplicate_thresholds(name: str) -> Tuple[int, int, int]:
+    """该工具在第几次提醒、第几次开始拦截、第几次收尾。"""
+    if name in STABLE_READ_TOOLS:
+        return DUPLICATE_NOTICE_AT, DUPLICATE_BLOCK_AT, DUPLICATE_ABORT_AT
+    return DUPLICATE_STATEFUL_NOTICE_AT, DUPLICATE_STATEFUL_BLOCK_AT, DUPLICATE_STATEFUL_ABORT_AT
 
 
 def call_signature(name: str, args: dict) -> str:
@@ -514,10 +623,17 @@ def file_version(path: str, scope: str = "main") -> str:
 def guard_repeated_call(name, args, signature, seen, scope, step):
     """判断这次调用是否在空转。返回 (拦截结果或 None, 给模型的提醒)。
 
-    seen 是本次 run 内的字典，键为签名。所有工具都计数（收尾时据此提醒），但只有
-    STABLE_READ_TOOLS 会被真正拦住；记录里带文件版本戳，所以"改完文件再读同一个
-    文件"算新的一次，不受影响。
+    seen 是本次 run 内的字典，键为签名。只读类工具（STABLE_READ_TOOLS +
+    IDEMPOTENT_READ_TOOLS）会被真正拦住，其余工具只计数——有副作用的调用参数相同
+    是正常现象，重跑同一条测试命令不该被挡。
+
+    记录里带文件版本戳，所以"改完文件再读同一个文件"算新的一次，不受影响。
+
+    拦截结果里带 ``terminate``：重复到 DUPLICATE_ABORT_AT 次时不再只是"退回一个
+    错误"，而是告诉主循环这一轮可以收尾了。这是 pi 的 block + terminate 语义——
+    判死循环就要停，而不是继续把 max_turns 耗在同一件事上。
     """
+    guarded = name in STABLE_READ_TOOLS or name in IDEMPOTENT_READ_TOOLS
     version = file_version(str(args.get("file_path") or ""), scope) if name in STABLE_READ_TOOLS else ""
     record = seen.get(signature)
     if record and record.get("version") == version:
@@ -525,16 +641,17 @@ def guard_repeated_call(name, args, signature, seen, scope, step):
     else:
         record = {"count": 1, "version": version, "step": step, "last": {}}
         seen[signature] = record
-    if name not in STABLE_READ_TOOLS:
+    if not guarded:
         return None, ""
+    notice_at, block_at, abort_at = _duplicate_thresholds(name)
     count = record["count"]
-    if count < DUPLICATE_NOTICE_AT:
+    if count < notice_at:
         return None, ""
     last = record.get("last") or {}
     follow = ""
     if last.get("next_start"):
         follow = f"要看后续内容请传 start_line={last['next_start']}，要换角度看请用其他工具。"
-    if count < DUPLICATE_BLOCK_AT:
+    if count < block_at:
         return None, (f"这次调用与第 {record['step'] + 1} 步完全相同，结果也一样，"
                       f"不会带来新信息。改用不同参数或直接基于已有内容作答。{follow}")
     return {
@@ -545,6 +662,7 @@ def guard_repeated_call(name, args, signature, seen, scope, step):
             f"重复同样的调用不会得到新结果：{follow or '请换参数、换工具，或基于已有内容直接作答。'}"
         ),
         "same_as_step": record["step"] + 1,
+        "terminate": count >= abort_at,
     }, ""
 
 
@@ -563,7 +681,9 @@ class AgentHarness:
         self._active_lock = threading.Lock()
         self._tainted_sessions = set()
         self._tainted_lock = threading.Lock()
+        # pi agent.ts 的两条队列：steering 在回合间插入，followUp 在自然收尾后插入。
         self._steering_inbox = {}
+        self._follow_up_inbox = {}
         self._steering_lock = threading.Lock()
         self._interrupt_stream = {}
         self._active_goals = {}
@@ -616,7 +736,8 @@ class AgentHarness:
             if event:
                 event.set()
         with self._steering_lock:
-            self._steering_inbox.setdefault(session, []).append(steering_text)
+            queue = self._steering_inbox.setdefault(session, PendingMessageQueue())
+            queue.enqueue(steering_text)
         log("Harness", "steering.injected", session=session, text=steering_text)
         return True
 
@@ -663,7 +784,7 @@ class AgentHarness:
             for p in t.get("result", {}).get("changed_files", []):
                 if p not in this_turn_files and resolve_file(p, scope).is_file():
                     this_turn_files.append(p)
-            if t.get("tool") in ("write_file", "edit_file") and t.get("result", {}).get("ok"):
+            if t.get("tool") in ("write", "edit") and t.get("result", {}).get("ok"):
                 p = t.get("result", {}).get("path") or t.get("arguments", {}).get("file_path") or ""
                 if p and p not in this_turn_files:
                     this_turn_files.append(p)
@@ -763,7 +884,8 @@ class AgentHarness:
             self._active_goals[session] = kwargs.get("user_prompt", args[0] if args else "")
             self._interrupt_stream[session] = __import__("threading").Event()
         with self._steering_lock:
-            self._steering_inbox[session] = []
+            self._steering_inbox[session] = PendingMessageQueue()
+            self._follow_up_inbox[session] = PendingMessageQueue()
         self._local.cancel = event
         # 权限身份（当前发送者QQ号）随本轮任务走，工具执行时统一从这里取，
         # 不从模型输出或会话文本里推断。
@@ -773,7 +895,7 @@ class AgentHarness:
         self._local.timings = {"route_ms": 0, "model_ms": 0, "tool_ms": 0, "review_ms": 0,
                                "model_calls": 0, "review_calls": 0}
         log("Harness", "start", session=session)
-        # 轮次文件台账：技能/命令直接写盘的 mp4、gif、图片不经过 write_file，
+        # 轮次文件台账：技能/命令直接写盘的 mp4、gif、图片不经过 write，
         # 只能靠「轮初清单 + 轮末对比」才能被回滚看见。
         turn_tracked = False
         if track_files:
@@ -827,6 +949,7 @@ class AgentHarness:
                 self._interrupt_stream.pop(session, None)
             with self._steering_lock:
                 self._steering_inbox.pop(session, None)
+                self._follow_up_inbox.pop(session, None)
 
     def _run(
         self,
@@ -855,6 +978,8 @@ class AgentHarness:
         on_text_reset=None,
         model_override=None,
         actor="",
+        speaker=None,
+        user_message_at=None,
     ):
         from core.config import load_config
 
@@ -872,7 +997,7 @@ class AgentHarness:
         from core.qq_authority import tool_access
         actor = getattr(self._local, "actor", "") or actor
         decision_context = dict(decision_context, channel=channel,
-                                local_tools_allowed=bool(tool_access(scope, "execute_command", actor=actor) and not readonly), readonly=readonly)
+                                local_tools_allowed=bool(tool_access(scope, "bash", actor=actor) and not readonly), readonly=readonly)
         # 固定动作与技能路由共用这份精简上下文：完整版 9.5KB 里 5.2KB 是媒体
         # 清单和会话摘要，"这句话能不能用预设动作直接满足"读不到它们。
         from core.decision_context import lite_context
@@ -944,8 +1069,16 @@ class AgentHarness:
         # 顺序必须是"用户输入 → 记忆条目"。
         # 反过来的话（记忆先入历史）去重会命中记忆条目，把同一句话再追加一遍，
         # Web 端切会话时就会看到用户命令打印两次（旧 bug）。
-        if needs_user_prompt_append(history, user_prompt):
-            append({"role": "user", "content": user_prompt})
+        #
+        # 落库那份带 `[时间] 昵称(QQ号)：` 抬头：群聊里几个人混着说，历史交给模型
+        # 时若没有归属，它只能把上一条当成当前说话人。运行期的 user_prompt 不动，
+        # Jev 分类、任务目标、引导注入都不该被抬头污染。时间优先用消息自带的
+        # 时间戳（补发/重放的消息保留原始时刻），没有才取本轮时刻。
+        user_entry = stamped_user_entry(
+            user_prompt, speaker, channel=channel, target=str(target or ""),
+            at=user_message_at)
+        if needs_user_prompt_append(history, user_entry["content"]):
+            append(user_entry)
         if recall:
             entry = memory_entry(recall, last_meta(history, KIND_MEMORY))
             if entry:
@@ -958,10 +1091,27 @@ class AgentHarness:
             """
             return append({"role": "user", "content": text, "meta": {"kind": KIND_NOTICE}})  # noqa: E501
 
-        def apply_pending_steerings():
+        def steering_messages():
+            """pi 的 ``getSteeringMessages``：只 peek，消费点唯一在 apply_pending_steerings。"""
             with self._steering_lock:
-                pending_steers = list(self._steering_inbox.get(session_id, []))
-                self._steering_inbox[session_id] = []
+                queue = self._steering_inbox.setdefault(session_id, PendingMessageQueue())
+                return list(queue.peek())
+
+        def follow_up_messages():
+            """pi 的 ``getFollowUpMessages``：自然收尾后才交付的排队消息。"""
+            with self._steering_lock:
+                queue = self._follow_up_inbox.get(session_id)
+                return list(queue.drain()) if queue else []
+
+        def apply_pending_steerings():
+            """pi 的 ``getSteeringMessages`` 消费点：drain 队列并注入一条 user 引导。"""
+            with self._steering_lock:
+                queue = self._steering_inbox.setdefault(session_id, PendingMessageQueue())
+                pending_steers = list(queue.drain())
+            # 队列消费掉之后，pi 的 pendingMessages 也该同步清空，否则内层循环
+            # 条件会一直被一条已经注入过的引导撑着。
+            if pending_steers:
+                loop.pending_messages = []
             if not pending_steers:
                 return False
             combined = "\n".join(pending_steers).strip()
@@ -987,6 +1137,9 @@ class AgentHarness:
                     on_steering_applied(combined)
                 except Exception:
                     pass
+            # 一道引导进来，就欠模型"一个动作"。轮到它收尾时还是一步没动，
+            # 说明引导被当成了耳旁风——按 pi 的 finishTurn 语义再要一个请求。
+            steer_state.update(awaiting_action=True, content=combined, retry_left=1)
             log("Harness", "steering.applied", session=session_id, steering=combined)
             return True
         from core.context_builder import (
@@ -1017,7 +1170,8 @@ class AgentHarness:
         # Discovery is complete; all authority checks happen in _execute_tool.
         permitted = {t["function"]["name"] for t in HARNESS_TOOLS}
         self._local.readonly = readonly
-        tools = list(HARNESS_TOOLS)
+        # 工具名与 pi 完全一致：read/bash/edit/write 就是内部实现名，没有别名层。
+        tools = HARNESS_TOOLS
         # 技能目录只随技能集合变化，用稳定排序保证同一集合渲染结果逐字节一致。
         # 它属于冻结 section：进 system 前缀能被整段命中；放进尾部则每轮工具调用都要
         # 重新 prefill（实测约 2.4k tokens，直接贡献数秒 TTFT）。
@@ -1027,13 +1181,23 @@ class AgentHarness:
         system, system_fp = SYSTEM_PROMPT_CACHE.render(
             scope=scope,
             channel=channel,
-            selected_tools=[t["function"]["name"] for t in tools],
+            selected_tools=[t["function"]["name"] for t in HARNESS_TOOLS],
             skills=catalog,
         )
 
         reviews = 0
         review_retries = 0
         connection_retries = 0
+        # 服务端报过超长之后，它实际能装多少就有了一个上界（那次请求的估算值）。
+        # 这个数比配置里的 context_window 可信：配置可能压根没跟着换模型改。
+        overflow_ceiling = 0
+        overflow_retries = 0
+        # pet / qq 没有"手动挑模型"的入口，主模型 404/5xx 时自动换配置里的备用
+        # 模型顶上；web 上用户可能特意选了某个模型，偷偷换掉反而违背他的选择。
+        allow_model_fallback = (
+            channel in ("pet", "qq_private", "qq_group")
+            or session_id.startswith(("pet:", "qq:"))
+        )
 
         def stream_reset(reason):
             """已展示的草稿被作废（重试/改写）时通知界面，避免新旧文本混在一起。"""
@@ -1134,18 +1298,42 @@ class AgentHarness:
                 fast_tool = None
         self._local.timings["route_ms"] = round((time.monotonic() - route_started) * 1000)
         log("Harness", "route", session=session_id, route=fast_tool or "vlm", policy="selective")
-        available_tools = [t for t in HARNESS_TOOLS if t["function"]["name"] in permitted]
+        available_tools = [
+            t for t in HARNESS_TOOLS if t["function"]["name"] in permitted
+        ]
         # 本次 run 内每个只读调用的执行次数与文件版本；见 guard_repeated_call。
         repeat_calls = {}
         repeated_notices = set()
+        # 同一工具连续失败了几次（参数可以不同）。这是「参数没重复、但一直在原地
+        # 打转」的那一类空转，签名判重抓不到它。
+        failure_streak = {"tool": "", "count": 0}
         # 循环不设固定步数：在"没有工具调用、也没有 steering
         # 消息"时自然结束，靠的是模型不再要工具，而不是数到第几轮。这里照同一
         # 原则，max_turns 退化为可选安全阀（0 = 不限），用来兜住坏提示词下
         # 真会空转整夜的情况。
         hard_limit = int(cfg["runtime"].get("max_turns", self.max_turns) or 0)
-        for turn in itertools.count():
-            if hard_limit and turn >= hard_limit:
-                break
+        # 实时引导的队列状态，对齐 pi 的 steeringQueue / deepseek-harness 的 inbox：
+        # awaiting_action 表示"这道引导还没换来任何一个动作"，retry_left 保证
+        # 同一道引导只追一次，不会把死循环拖进 max_turns。
+        steer_state = {"awaiting_action": False, "content": "", "retry_left": 0}
+
+        # 主循环骨架 = pi 的 runLoop（core/agent_loop.py）：内外双层 while、
+        # pendingMessages / hasMoreToolCalls、finishTurn 决策、steering/followUp
+        # 两条队列。下面的循环体仍是 miniBot 原有的业务阶段，行为不变。
+        def loop_emit(event, payload=None):
+            fields = {
+                key: value for key, value in (payload or {}).items()
+                if key in ("turn", "turns", "exhausted")
+            }
+            log("Harness", "loop." + event, session=session_id, **fields)
+
+        loop = AgentLoop(
+            get_steering_messages=steering_messages,
+            get_follow_up_messages=follow_up_messages,
+            emit=loop_emit,
+            max_turns=hard_limit,
+        )
+        for turn in loop.iter_turns():
             if self._cancelled():
                 return self._abort_reply(session_id)
             apply_pending_steerings()
@@ -1175,6 +1363,10 @@ class AgentHarness:
 
             messages = assemble()
             budget = cfg["vlm"]["context_window"] - cfg["vlm"]["max_tokens"]
+            if overflow_ceiling:
+                # 服务端已经用报错说明"配置里那个窗口是假的"，此后一律按实测
+                # 上界判定，别再相信配置——否则每轮都会先超一次再压一次。
+                budget = min(budget, overflow_ceiling)
             soft = min(budget, cfg["vlm"]["context_window"] * cfg["vlm"]["compaction_threshold_ratio"])
             estimate = compactor.estimate_tokens(messages, tools)
             if estimate >= soft:
@@ -1187,18 +1379,25 @@ class AgentHarness:
                 # 之后 begin_turn() 重新快照，让新摘要立刻生效。
                 log("Harness", "context.hard_compact", session=session_id, step=turn + 1,
                     estimate=estimate, budget=budget)
-                compactor._run_compaction_worker(history)
+                compactor._run_compaction_worker(history, budget_override=budget)
                 compactor.begin_turn()
                 messages = assemble()
                 messages = compactor.trim_old_outputs(messages)
                 estimate = compactor.estimate_tokens(messages, tools)
+                if estimate > budget:
+                    # 压缩和裁剪都救不回来，说明不是"历史太多"而是"某一条太大"
+                    # （整份文件、一次巨量搜索结果都算）。就地截短，保证这次能发。
+                    log("Harness", "context.shrink_oversized", session=session_id, step=turn + 1,
+                        estimate=estimate, budget=budget)
+                    messages = compactor.shrink_oversized(messages, budget)
+                    estimate = compactor.estimate_tokens(messages, tools)
             if estimate > budget:
                 log("Harness", "context.overflow", session=session_id, step=turn + 1,
                     estimate=estimate, budget=budget,
                     system_chars=len(system), history_chars=sum(len(str(m.get("content"))) for m in messages),
                     messages=len(messages))
                 reply = "上下文超过当前模型配置的容量；原始历史已保留。请提高正确的context_window配置，或缩小本次输入。"
-                append({"role": "assistant", "content": reply})
+                append(stamped_entry({"role": "assistant", "content": reply}))
                 return reply
             image = None
             is_fast = fast_tool is not None
@@ -1226,8 +1425,13 @@ class AgentHarness:
                 cancel_event = getattr(self._local, "cancel", None)
 
                 def open_stream():
-                    """兼容不接受 cancel_event 的 Brain 实现，优先带上取消信号。"""
+                    """兼容不接受 cancel_event / allow_fallback 的 Brain 实现。"""
                     attempts = (
+                        {
+                            "model_override": model_override,
+                            "cancel_event": cancel_event,
+                            "allow_fallback": allow_model_fallback,
+                        },
                         {"model_override": model_override, "cancel_event": cancel_event},
                         {"model_override": model_override},
                         {},
@@ -1256,6 +1460,9 @@ class AgentHarness:
             streamed_live = False
             pending_text = []
             last_flush = 0.0
+            # 被引导打断的候选不是交付内容：这一轮流到一半就作废，必须重新请求，
+            # 不能顺手当成"模型没要工具"去收尾（那正是引导空转的来源）。
+            interrupted_for_steering = False
 
             def flush_text(force=False):
                 """把累积的文本增量实时推给界面：50ms 节流，但收尾时强制冲刷，绝不丢尾字。"""
@@ -1288,6 +1495,7 @@ class AgentHarness:
                         flush_text(force=True)
                         stream_reset("已被新的方向修正打断，正在按新指令重新生成")
                         apply_pending_steerings()
+                        interrupted_for_steering = True
                         break
                     kind, data = next(generator)
                     if self._cancelled():
@@ -1329,7 +1537,11 @@ class AgentHarness:
                         if on_tool_delta:
                             try:
                                 from core.streaming_parser import parse_tool_delta
-                                parsed = parse_tool_delta(data.get("name", ""), data.get("arguments_so_far", ""), scope=scope)
+                                parsed = parse_tool_delta(
+                                    data.get("name", ""),
+                                    data.get("arguments_so_far", ""),
+                                    scope=scope,
+                                )
                                 enriched = {**data, **parsed}
                             except Exception:
                                 enriched = data
@@ -1352,6 +1564,9 @@ class AgentHarness:
             # 模型流因用户停止而提前结束：不要走核验/重试/落库，也不要冒充正常回复。
             if self._cancelled():
                 return self._abort_reply(session_id)
+            if interrupted_for_steering:
+                # 引导已经写进历史，回主循环重新请求一次模型，由它按新方向生成。
+                continue
             fast_tool = None
             model_elapsed_ms = round((time.monotonic() - model_started) * 1000)
             if not is_fast:
@@ -1370,7 +1585,47 @@ class AgentHarness:
             if stream_error:
                 error_text = "".join(text).strip()
                 reply = error_text or "模型连接失败，请稍后重试。"
-                if connection_retries < 1:
+                # 服务端明确判"超长"：这不是网络问题，原样重发只会再撞一次。
+                # 先压一遍历史再发——压的尺度看**这次失败请求的估算值**，不看配置里
+                # 的 context_window（配置可能比服务端真实窗口大，按它压等于没压）。
+                # 压不动的（单条巨型消息）由下一轮的硬上限分支截短兜底。
+                if overflow_retries < 2 and is_context_overflow(error_text):
+                    overflow_retries += 1
+                    failed_tokens = compactor.estimate_tokens(messages, tools)
+                    # 上限要分两段算：人设 + 工具清单是压不掉的固定前缀，历史才是
+                    # 能压的部分。直接把"失败请求的一半"当上限，等于要求把固定前缀
+                    # 也砍一半，压到什么程度都达不到，只会白丢历史再报同一个错。
+                    fixed_tokens = compactor.estimate_tokens(
+                        [{"role": "system", "content": system}], tools)
+                    history_tokens = max(0, failed_tokens - fixed_tokens)
+                    ceiling = fixed_tokens + max(1500, history_tokens // (2 ** overflow_retries))
+                    overflow_ceiling = min(overflow_ceiling, ceiling) if overflow_ceiling else ceiling
+                    log("Harness", "context.server_overflow", session=session_id, step=turn + 1,
+                        attempt=overflow_retries, failed_tokens=failed_tokens,
+                        fixed_tokens=fixed_tokens, history_tokens=history_tokens,
+                        ceiling=overflow_ceiling, error=error_text[:200])
+                    compacted = compactor.compact_for_overflow(history, failed_tokens)
+                    if not compacted and history_tokens <= 1500:
+                        # 历史里没有可压的余量，超的是固定前缀本身或单条消息；
+                        # 重发同一个请求只会再撞一次墙，照实报错。
+                        log("Harness", "context.overflow_unfixable", session=session_id,
+                            step=turn + 1, failed_tokens=failed_tokens, fixed_tokens=fixed_tokens)
+                        append(stamped_entry({"role": "assistant", "content": reply}))
+                        return reply
+                    compactor.begin_turn()
+                    stream_reset("上下文超过服务端上限，已压缩历史后重试")
+                    if on_status_change:
+                        try:
+                            on_status_change("上下文超限，已压缩历史，正在重试...")
+                        except Exception:
+                            pass
+                    continue
+                # 备用模型已经轮过一遍（HTTP 404/5xx）仍然失败时别再原地重试：
+                # 同样的请求再打一遍只会再失败一遍，还让用户多等一整条模型链。
+                exhausted = bool(
+                    allow_model_fallback and re.search(r"HTTP\s*\d{3}", error_text)
+                )
+                if connection_retries < 1 and not exhausted:
                     connection_retries += 1
                     log("Harness", "connection.retry", session=session_id, step=turn + 1, reason="模型连接或流中断，直接重试一次；不压缩上下文")
                     stream_reset("模型连接中断，正在重试")
@@ -1381,10 +1636,13 @@ class AgentHarness:
                             pass
                     time.sleep(1)
                     continue
-                append({"role": "assistant", "content": reply})
+                append(stamped_entry({"role": "assistant", "content": reply}))
                 return reply
             else:
                 connection_retries = 0
+                # 压过之后这次发成功了，说明历史已经瘦下来；后面某一步又撑爆
+                # （比如刚读了一整份大文件）应当还能再压，不该被上一笔账卡住。
+                overflow_retries = 0
             if not calls:
                 candidate_reply = "".join(text)
                 media_refs = re.findall(r"media://((?:img|vid|aud)_[A-Za-z0-9]+)", candidate_reply)
@@ -1403,9 +1661,9 @@ class AgentHarness:
                         append_notice("上一模型回复中的媒体引用未通过实际缓存校验，尚未交付。不得编造media_ref或声称已经生成。请依据当前媒体引用和可用技能（见工具目录）重新处理，或调用register_media登记真实文件；可先list_media。没有权限或生成失败时明确说明，不要继续给无效媒体链接。")
                         continue
                     reply = "媒体处理未完成：返回的媒体引用不可用，没有可发送的结果。请重试或重新上传。"
-                    append({"role": "assistant", "content": reply})
+                    append(stamped_entry({"role": "assistant", "content": reply}))
                     return reply
-            message = {"role": "assistant", "content": "".join(text) or None}
+            message = stamped_entry({"role": "assistant", "content": "".join(text) or None})
             if reasoning_chunks:
                 message["reasoning_content"] = "".join(reasoning_chunks)
             if calls:
@@ -1413,6 +1671,8 @@ class AgentHarness:
                 # 宣称完成"：那会丢掉正常的过程说明，也拖慢每一个中间步骤。
                 message["tool_calls"] = calls
                 append(message)
+                # 动过手了，这道引导的"欠账"清掉，后面收尾不再追。
+                steer_state["awaiting_action"] = False
             if calls and on_intermediate and "".join(text).strip():
                 try:
                     progress = (message.get('content') or '').strip()
@@ -1420,6 +1680,30 @@ class AgentHarness:
                 except Exception as exc:
                     log("Harness", "intermediate.error", session=session_id, error=str(exc))
             if not calls:
+                # 收尾条件对齐 pi 的 `while (hasMoreToolCalls || pendingMessages.length > 0)`
+                # 和 dsh 的 `if (turnEnds && inbox.nextStep.length === 0) break`：
+                # 队列里还有引导就先喂进去多跑一个 step，不看模型说了什么，只看队列空没空。
+                if apply_pending_steerings():
+                    continue
+                if steer_state["awaiting_action"] and steer_state["retry_left"] > 0:
+                    # 引导已经进上下文、模型却一步没动就要收尾（pi 的 finishTurn 返回
+                    # continue 那一档）。只追一次，追不到就让它走。
+                    steer_state["awaiting_action"] = False
+                    steer_state["retry_left"] -= 1
+                    log("Harness", "steering.not_executed", session=session_id, step=turn + 1,
+                        steering=steer_state["content"][:120])
+                    if on_status_change:
+                        try:
+                            on_status_change("引导还没被执行，再推一轮")
+                        except Exception:
+                            pass
+                    append_notice(
+                        "【引导未执行】用户刚给了新的方向修正，你还没调用任何工具就要收尾。\n"
+                        f"用户原话：「{steer_state['content']}」\n"
+                        "要执行就现在调用工具动手，别再复述计划；若你判断用户是要你停止，"
+                        "直接说一句「好，停」并结束。"
+                    )
+                    continue
                 action, final_reply = finish_turn("".join(text) or "模型没有返回有效回答。")
                 if action == "continue":
                     continue
@@ -1431,11 +1715,15 @@ class AgentHarness:
                     # 仍要把定稿推给界面（前端以 full 覆盖当前段，不会拼接重复）。
                     on_text_chunk(reply, reply)
                 return reply
+            # pi 的 executeToolCalls 产物：本轮 toolResult 消息，交给 finishTurn 上下文。
+            tool_results = []
             for call in calls:
                 if self._cancelled():
                     # 工具批次执行中按停止：立刻中止，未执行的部分不再补跑。
                     return self._abort_reply(session_id)
                 tool_started = time.monotonic()
+                # 模型给的就是实现名（read/bash/edit/write），直接进执行链：
+                # 权限、核验、压缩、jev、历史与测试看到的是同一个名字。
                 name = call.get("function", {}).get("name", "")
                 try:
                     args = json.loads(call["function"].get("arguments") or "{}")
@@ -1482,6 +1770,9 @@ class AgentHarness:
                             result.pop(k, None)
 
                     clean_tool_result = dict(result)
+                    # terminate 只是给主循环判死用的开关，不进模型上下文：
+                    # 它既不是模型能用的参数，每轮多带一个字段也是白烧 token。
+                    clean_tool_result.pop("terminate", None)
                     if on_tool_result:
                         try:
                             on_tool_result(name, clean_tool_result)
@@ -1493,7 +1784,7 @@ class AgentHarness:
                     clean_tool_result = dict(result)
                 self._local.timings["tool_ms"] += round((time.monotonic() - tool_started) * 1000)
                 record = repeat_calls.get(signature)
-                if record is not None and result.get("ok") and name == "read_file":
+                if record is not None and result.get("ok") and name == "read":
                     # 记下"读到哪了"，重复被拦时才能给出具体续读位置而不是空劝。
                     record["last"] = {"next_start": result.get("next_start_line")}
                 if not result.get("ok") and not tools:
@@ -1556,43 +1847,83 @@ class AgentHarness:
                         ensure_ascii=False,
                         default=lambda o: f"<bytes {len(o)}>" if isinstance(o, bytes) else str(o),
                     )
-                append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                if name in STABLE_READ_TOOLS:
-                    record = repeat_calls.get(signature) or {}
-                    if record.get("count", 0) >= DUPLICATE_ABORT_AT:
-                        # 同一只读调用重复到第 6 次：提示已经给过三轮，再轮下去只是把
-                        # max_turns 耗在空转上。如实收尾，把决定权交回用户。
-                        log("Harness", "tool.duplicate_abort", session=session_id,
-                            tool=name, signature=signature[:200], step=turn + 1)
-                        reply = (f"我在同一个操作上空转了 {record['count']} 次：反复以相同参数调用 "
-                                 f"{name}，结果始终没有变化，已停止本轮以免继续消耗时间。"
-                                 f"可以告诉我具体需要文件/结果中的哪一部分，或换个方式处理。")
-                        append({"role": "assistant", "content": reply})
-                        task_state["status"] = "unverified"
-                        self.memory.save_task_state(session_id, task_state)
-                        return reply
+                tool_results.append(
+                    append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                )
+                if result.get("terminate"):
+                    # 对齐 pi 的 block + terminate：判死循环就在这里停，不再把剩下的
+                    # 轮次耗在同一件事上——每一次空转都是一次完整的模型请求。
+                    count = (repeat_calls.get(signature) or {}).get("count", 0)
+                    log("Harness", "tool.duplicate_abort", session=session_id,
+                        tool=name, signature=signature[:200], step=turn + 1)
+                    reply = (f"我在同一个操作上空转了 {count} 次：反复以相同参数调用 "
+                             f"{name}，结果始终没有变化，已停止本轮以免继续消耗时间。"
+                             f"可以告诉我具体需要结果中的哪一部分，或换个方式处理。")
+                    append(stamped_entry({"role": "assistant", "content": reply}))
+                    task_state["status"] = "unverified"
+                    self.memory.save_task_state(session_id, task_state)
+                    return reply
+                if result.get("ok") or result.get("duplicate"):
+                    failure_streak.update(tool="", count=0)
+                elif failure_streak.get("tool") == name:
+                    failure_streak["count"] = int(failure_streak.get("count") or 0) + 1
+                else:
+                    failure_streak.update(tool=name, count=1)
                 if result.get("ok") and name == "activate_skill":
                     # 技能目录已固化在 system 前缀中，本轮内不再重排；
                     # activate_skill 的返回结果本身已包含技能信息。
                     # 下一轮 run 会以新的稳定排序重建 system 前缀。
                     pass
+            # 参数完全不同也一直在失败的，走这一条：够到上限就收尾，够到提醒线
+            # 就先说一次，别让模型用同一种思路把轮次烧干净。
+            streak = int(failure_streak.get("count") or 0)
+            if streak >= CONSECUTIVE_FAILURE_ABORT_AT:
+                log("Harness", "tool.failure_abort", session=session_id,
+                    tool=failure_streak.get("tool"), count=streak, step=turn + 1)
+                reply = (f"`{failure_streak.get('tool')}` 已经连续 {streak} 次失败，"
+                         f"再用同样的思路重试大概率还是同样的结果，已停止本轮。"
+                         f"可以先说明卡在哪一步，或换个方向验证。")
+                append(stamped_entry({"role": "assistant", "content": reply}))
+                task_state["status"] = "unverified"
+                self.memory.save_task_state(session_id, task_state)
+                return reply
+            if streak == CONSECUTIVE_FAILURE_NOTICE_AT:
+                append_notice(
+                    f"【连续失败提醒】{failure_streak.get('tool')} 已经连续 {streak} 次失败。"
+                    "先判断是环境/参数问题还是思路问题：能换方法就换，换不了就把失败原因"
+                    "如实告诉用户，不要继续用同样的方式重试。"
+                )
             # 只读调用的提示已经写在工具结果里；这里再补一次系统级提醒，因为小模型
             # 常常读完工具输出就忘。每个签名只提醒一次，避免自己变成刷屏源。
             stalled = [
                 f"{sig.split(':', 1)[0]} × {rec['count']}"
                 for sig, rec in repeat_calls.items()
-                if rec.get("count", 0) >= DUPLICATE_BLOCK_AT and sig not in repeated_notices
+                if rec.get("count", 0) >= _duplicate_thresholds(sig.split(":", 1)[0])[1]
+                and sig not in repeated_notices
             ]
             if stalled:
                 repeated_notices.update(
                     sig for sig, rec in repeat_calls.items()
-                    if rec.get("count", 0) >= DUPLICATE_BLOCK_AT)
+                    if rec.get("count", 0) >= _duplicate_thresholds(sig.split(":", 1)[0])[1])
                 append_notice("【重复调用提醒】以下调用以完全相同的参数重复执行了多次："
                        + "、".join(stalled)
                        + "。如果结果没有变化，重复同样的调用不会带来新信息：请换参数"
                          "（如 start_line）、换工具，或直接用已经拿到的结果继续下一步；"
                          "如果是在确认某处改动是否生效，请直接查看该结果本身而不是重跑。")
             compactor.update_usage(usage.get("prompt_tokens", 0), history)
+            # pi 的 finishTurn / lastCompletedTurn 回写：本轮带 tool results 结束，
+            # 决策是 continue；没有工具调用的轮次在上面已由 finish_turn() 完成
+            # 交付并 return，不会走到这里。骨架据此决定内外层循环是否继续。
+            loop.note_turn(
+                turn_context=TurnContext(
+                    message=message,
+                    tool_results=tool_results,
+                    context=messages,
+                    new_messages=history,
+                ),
+                has_more_tool_calls=bool(calls),
+                decision=FinishTurnDecision(action="continue"),
+            )
         limit = hard_limit or "∞"
         checkpoint = {"original_goal": task_goal[:6000], "latest_request": user_prompt[:2000],
                       "last_tools": [{"tool": t["tool"], "ok": t["result"].get("ok"), "error": str(t["result"].get("error", ""))[:300]} for t in trace[-8:]],
@@ -1601,7 +1932,7 @@ class AgentHarness:
         task_state["status"] = "awaiting_input"
         self.memory.save_task_state(session_id, task_state)
         reply = f"已达到本次任务 {limit} 轮上限，进度和工具结果已保存。发送“继续”可接着执行，也可以补充或调整要求。"
-        append({"role": "assistant", "content": reply})
+        append(stamped_entry({"role": "assistant", "content": reply}))
         return reply
 
     def _dispatch_tool(
@@ -1619,7 +1950,7 @@ class AgentHarness:
         status = getattr(self._local, "status", None)
         if status:
             label = {
-                "execute_command": "正在运行命令",
+                "bash": "正在运行命令",
                 "execute_skill": "正在执行技能",
                 "capture_screen": "正在查看屏幕/核验网页",
                 "list_skills": "正在查询可用技能",
@@ -1632,7 +1963,7 @@ class AgentHarness:
         log("Harness", "tool.start", session=session_id, tool=name, arguments=args)
         try:
             before_sources = None
-            if name in {"execute_command", "execute_skill"}:
+            if name in {"bash", "execute_skill"}:
                 from core.verification import source_snapshot
                 from core.workspace import workspace_for
                 before_sources = source_snapshot(workspace_for(scope))
@@ -1675,23 +2006,24 @@ class AgentHarness:
         from core.skill_manager import validate_args
 
         if permitted is None:
-            permitted = {t["function"]["name"] for t in HARNESS_TOOLS}
+            # 内部兼容工具（execute_skill）也在这条链上，模型侧仍只看 HARNESS_TOOLS。
+            permitted = {t["function"]["name"] for t in ALL_TOOL_DEFS}
         if self._cancelled():
             return {"ok": False, "error": "任务已取消"}
         if name not in permitted:
             return {"ok": False, "error": "当前来源没有此工具权限"}
         from core.qq_authority import tool_access
-        if getattr(self._local, "readonly", False) and name not in {"read_file", "capture_screen", "list_media", "get_media", "list_skills", "read_history", "read_chat_history"} and not (name == "manage_permissions" and args.get("action") == "list"):
-            return {"ok": False, "error_code": "READ_ONLY", "retryable": False, "error": "本次任务只读，命令和技能都不能执行。改用 capture_screen 看屏幕、read_file 读文件、read_history 读历史来核实，并说明你实际看到的依据；看不到就说看不到，不要猜。"}
+        if getattr(self._local, "readonly", False) and name not in {"read", "capture_screen", "list_media", "get_media", "list_skills", "read_history", "read_chat_history"} and not (name == "manage_permissions" and args.get("action") == "list"):
+            return {"ok": False, "error_code": "READ_ONLY", "retryable": False, "error": "本次任务只读，命令和技能都不能执行。改用 capture_screen 看屏幕、read 读文件、read_history 读历史来核实，并说明你实际看到的依据；看不到就说看不到，不要猜。"}
         is_web = (channel == "web" or session_id.startswith("web:"))
         if not is_web and not tool_access(scope, name, args, actor=actor):
             return {"ok": False, "error_code": "PERMISSION_DENIED", "tool": name, "retryable": False,
                     "skill_name": args.get("skill_name") if isinstance(args, dict) else None,
-                    "error": "执行前权限校验拒绝，操作尚未执行。请向用户说明具体缺少的工具/技能权限，可请主人用自然语言授权；不要编造执行成功。"}
+                    "error": "执行前权限校验拒绝，操作尚未执行。请向用户说明具体缺少的工具权限，可请主人用自然语言授权；不要编造执行成功。"}
         spec = next(
             (
                 t["function"]["parameters"]
-                for t in HARNESS_TOOLS
+                for t in ALL_TOOL_DEFS
                 if t["function"]["name"] == name
             ),
             None,
@@ -1728,6 +2060,28 @@ class AgentHarness:
                 return {"ok": True, "restarting": True, "reason": reason,
                         "message": "已受理重启请求：本条回复发出后进程会优雅停机，启动器会重新拉起 MiniBot。"}
             from core.workspace import resolve_file, workspace_for
+            if name == "forget_meme":
+                from core.meme import chat_key_from_scope, get_meme_manager
+                manager = get_meme_manager()
+                target = str(args.get("target") or "last")
+                if target == "last":
+                    return manager.forget_last(chat_key_from_scope(scope))
+                if target == "media":
+                    from core.media_store import MediaStore
+                    ref = str(args.get("media_ref") or "")
+                    if not ref:
+                        raise ValueError("target=media 需要 media_ref，先用 list_media 查")
+                    try:
+                        manifest, data = MediaStore().get(ref, scope)
+                    except (KeyError, ValueError) as exc:
+                        raise ValueError(f"取不到该媒体：{exc}") from exc
+                    result = manager.forget_by_image(
+                        data, reason=f"用户要求删除（{manifest.get('label') or ref}）")
+                    result["media_ref"] = ref
+                    return result
+                if not args.get("file_path"):
+                    raise ValueError("target=path 需要 file_path")
+                return manager.forget(path=str(args["file_path"]))
             if name in ("list_media", "get_media", "register_media"):
                 from core.media_store import MAX_BYTES, MediaStore
                 store = MediaStore()
@@ -1736,6 +2090,9 @@ class AgentHarness:
                 if name == "get_media":
                     manifest, _ = store.get(args["media_ref"], scope)
                     result = {"ok": True, "kind": store.kind_of(manifest), **manifest}
+                    # 技能脚本需要真实媒体数据时，模型先用本工具拿到本机路径，
+                    # 再把路径作为参数传给脚本；Base64 由脚本内部生成，不进上下文。
+                    result["file_path"] = str(store.path(args["media_ref"], scope)).replace("\\", "/")
                     if manifest["mime"].startswith("image/"):
                         result["_image"] = store.preview(args["media_ref"], scope)
                     return result
@@ -1746,13 +2103,29 @@ class AgentHarness:
                     raise ValueError("媒体文件超过100MB上限")
                 asset = store.add(path.read_bytes(), scope, origin="registered", label=path.name)
                 return {"ok": True, "kind": store.kind_of(asset), **asset}
-            if name == "execute_command":
+            if name == "bash":
                 command = args["command"]
+                # cwd 是白名单语义值，不是任意路径：技能脚本命令相对项目根，
+                # 普通命令相对会话工作空间，避免借参数跳出工作目录。
+                requested_cwd = args.get("cwd", "workspace")
+                if requested_cwd not in ("workspace", "project"):
+                    return {"ok": False, "error": "cwd 只能是 workspace 或 project"}
+                if requested_cwd == "project":
+                    from core.workspace import PROJECT_ROOT
+                    run_cwd = str(PROJECT_ROOT)
+                else:
+                    run_cwd = str(workspace_for(scope))
                 assessment = assess_command(
                     command, is_tainted=self.is_tainted(session_id)
                 )
                 if not assessment["allowed"]:
                     return {"ok": False, "error": assessment["reason"]}
+                # PowerShell 5.1 会吞掉内联 JSON 的双引号；只在拼 shell 命令时
+                # 做引号适配，command 原值仍用于安全评估、日志和任务元数据。
+                shell_command = (
+                    _protect_inline_skill_arguments(command)
+                    if os.name == "nt" else command
+                )
                 cmd = (
                     [
                         "powershell.exe",
@@ -1765,7 +2138,7 @@ class AgentHarness:
                         "$ErrorActionPreference='Continue';"
                         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new();$OutputEncoding=[Console]::OutputEncoding;"
                         "[System.Net.WebRequest]::DefaultWebProxy=[System.Net.WebProxy]::new();"
-                        + command + "; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                        + shell_command + "; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
                     ]
                     if os.name == "nt"
                     else command
@@ -1777,7 +2150,7 @@ class AgentHarness:
                 task = tm.start_task(
                     cmd,
                     name=f"cmd:{command[:40]}",
-                    cwd=str(workspace_for(scope)),
+                    cwd=run_cwd,
                     shell=os.name != "nt",
                     metadata={"command": command, "scope": scope},
                 )
@@ -1796,7 +2169,7 @@ class AgentHarness:
                     import threading
                     threading.Thread(target=_watch_cancel, daemon=True).start()
                 return tm.wait_task(task.task_id, timeout_sec=timeout_val)
-            if name == "read_file":
+            if name == "read":
                 fp_lower = str(args.get("file_path", "")).lower()
                 sensitive_patterns = (
                     "config.json",
@@ -1844,7 +2217,7 @@ class AgentHarness:
                     "has_more": not eof,
                     "truncated": size >= 12000,
                 }
-            if name == "write_file":
+            if name == "write":
                 p = resolve_file(args["file_path"], scope)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 before_content = p.read_text(encoding="utf-8") if p.exists() else None
@@ -1867,7 +2240,7 @@ class AgentHarness:
                     # 全文就在本次调用的 content 参数里，不回传 diff。
                     "diff": "",
                 }
-            if name == "edit_file":
+            if name == "edit":
                 p = resolve_file(args["file_path"], scope)
                 if not p.exists():
                     return {"ok": False, "error": f"文件不存在: {args['file_path']}"}
@@ -1875,7 +2248,7 @@ class AgentHarness:
                 target = args["target"]
                 replacement = args["replacement"]
                 if target not in before_content:
-                    return {"ok": False, "error": "文件中未找到精确匹配的目标文本 target，请先调用 read_file 查看文件内容"}
+                    return {"ok": False, "error": "文件中未找到精确匹配的目标文本 target，请先调用 read 查看文件内容"}
                 after_content = before_content.replace(target, replacement, 1)
                 p.write_text(after_content, encoding="utf-8")
                 from core.checkpoint import get_checkpoint_manager

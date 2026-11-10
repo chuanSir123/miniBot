@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import base64
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from test_core import Fixture
@@ -22,8 +23,7 @@ class PersonaAndMemeTests(Fixture):
                                ("第一句。喵。第二句！", ["第一句。喵。", "第二句！"]),
                                ("好。收到啦！", ["好。收到啦！"]),
                                ("完成。（提示。）", ["完成。", "（提示。）"])):
-            with patch.object(channel, "_send", new_callable=AsyncMock, return_value=True) as send, patch("channels.napcat_channel.asyncio.sleep", new_callable=AsyncMock), patch("channels.napcat_channel.get_meme_manager") as memes:
-                memes.return_value.choose_meme.return_value = None
+            with patch.object(channel, "_send", new_callable=AsyncMock, return_value=True) as send, patch("channels.napcat_channel.asyncio.sleep", new_callable=AsyncMock):
                 asyncio.run(channel.send_reply_segments(event, text))
             self.assertEqual([c.args[2] for c in send.call_args_list], expected)
 
@@ -82,6 +82,10 @@ class PersonaAndMemeTests(Fixture):
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
 GIF_BYTES = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!" + b"\x00" * 12
 JPEG_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 32
+# 真正能解码的 1×1 PNG：MediaStore 会校验图片可解析，假头字节过不了入库。
+REAL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
 
 
 class MemeLibraryTests(Fixture):
@@ -102,6 +106,116 @@ class MemeLibraryTests(Fixture):
             )
         manager.rebuild_tag_summary()
         return path
+
+    def test_chat_key_from_scope_matches_the_channel_wording(self):
+        """channel 记的是 group:123，工具层拿到的是 qq_group_123；对不上就永远找不到。"""
+        from core.meme import chat_key_from_scope
+
+        self.assertEqual(chat_key_from_scope("qq_group_123"), "group:123")
+        self.assertEqual(chat_key_from_scope("qq:group:123"), "group:123")
+        self.assertEqual(chat_key_from_scope("qq_private_456"), "user:456")
+        self.assertEqual(chat_key_from_scope("qq:group:123:user:9"), "group:123")
+        self.assertEqual(chat_key_from_scope("main"), "")
+
+    def test_forget_last_drops_record_file_and_tag(self):
+        """「刚发的那张删掉」：记录、文件、标签汇总一起清，且不许再被采集回来。"""
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            path = self._add(manager, PNG_BYTES, ["卖萌"])
+            manager.note_sent("group:1", path)
+
+            result = manager.forget_last("group:1")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["matched_by"], "path")
+            self.assertTrue(result["file_removed"])
+            self.assertFalse(Path(path).exists())
+            self.assertEqual(manager.stats()["total"], 0)
+            self.assertEqual({item["tag"] for item in manager.tag_summary()}, set())
+            # 只删不拦，群友把它再发一遍就自己长回来了
+            self.assertIsNone(manager.add_from_bytes(PNG_BYTES, "test"))
+            # 冷却队列也要摘掉，否则"刚发的那张"指向一个已经不存在的文件
+            self.assertEqual(manager.last_sent("group:1"), "")
+
+    def test_forget_by_image_leaves_other_memes_alone(self):
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            keep = self._add(manager, PNG_BYTES, ["卖萌"])
+            drop = self._add(manager, GIF_BYTES, ["大笑"])
+
+            result = manager.forget_by_image(GIF_BYTES, "这张别发了")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["matched_by"], "hash")
+            self.assertFalse(Path(drop).exists())
+            self.assertTrue(Path(keep).exists())
+            self.assertEqual(manager.stats()["total"], 1)
+
+    def test_forget_by_image_recognises_a_reencoded_copy(self):
+        """保存后重发会重新编码，字节全变；按画面认才删得掉。"""
+        try:
+            import io
+
+            from PIL import Image, ImageDraw
+        except ImportError:
+            self.skipTest("需要 Pillow 才能验证画面比对")
+
+        def art(seed):
+            image = Image.new("RGB", (120, 120), (240, 240, 240))
+            draw = ImageDraw.Draw(image)
+            for i in range(6):
+                draw.line([(0, i * seed * 7 % 120), (120, i * seed * 13 % 120)],
+                          fill=(i * seed * 37 % 255, i * seed * 61 % 255, i * seed * 97 % 255),
+                          width=5)
+            return image
+
+        from core.meme import MemeManager
+
+        original, recoded = io.BytesIO(), io.BytesIO()
+        art(3).save(original, format="PNG")
+        art(3).save(recoded, format="JPEG", quality=68)
+        self.assertNotEqual(original.getvalue(), recoded.getvalue())
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            self._add(manager, original.getvalue(), ["卖萌"])
+
+            result = manager.forget_by_image(recoded.getvalue(), "这张别发了")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["matched_by"], "phash")
+            self.assertEqual(manager.stats()["total"], 0)
+            # 同一个重编码版本再发回来同样进不来
+            self.assertIsNone(manager.add_from_bytes(recoded.getvalue(), "test"))
+
+    def test_forget_by_image_never_trusts_a_degenerate_fingerprint(self):
+        """纯色图的 dHash 全是 0，两张不同颜色的图指纹一样；宁可删不掉也不能删错。"""
+        try:
+            import io
+
+            from PIL import Image
+        except ImportError:
+            self.skipTest("需要 Pillow 才能验证画面比对")
+
+        def solid(color):
+            buffer = io.BytesIO()
+            Image.new("RGB", (80, 80), color).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            manager.add_from_bytes(solid((200, 20, 20)), "test")
+
+            result = manager.forget_by_image(solid((20, 20, 200)), "别的颜色")
+
+            self.assertEqual(result["matched_by"], "none")
+            self.assertEqual(manager.stats()["total"], 1)
 
     def test_collect_keeps_container_ext_and_use_count(self):
         from core.meme import MemeManager
@@ -190,18 +304,48 @@ class MemeLibraryTests(Fixture):
                               return_value={"点赞": 0.48, "开心": 0.42, "none": 0.92}):
                 self.assertIsNone(manager.choose_meme("转好了吗", "转好了，在 D 盘"))
 
-    def test_low_scores_stay_below_the_floor(self):
-        """全部标签都只是弱沾边 -> 不发（宁缺毋滥）。"""
+    def test_low_scores_still_send_a_meme(self):
+        """分数低不再拦发布：发不发只由 none 决定，标签分只影响选哪张。"""
         from core.meme import MemeManager
         from core.jev import JevClient
 
         with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
             manager = self._manager()
-            self._add(manager, PNG_BYTES, ["疑惑"])
+            showed = self._add(manager, PNG_BYTES, ["疑惑"])
 
             with patch.object(JevClient, "score_meme_tags",
                               return_value={"疑惑": 0.30, "none": 0.10}):
-                self.assertIsNone(manager.choose_meme("这报错啥意思", "参数类型不对"))
+                self.assertEqual(manager.choose_meme("这报错啥意思", "参数类型不对"), showed)
+
+    def test_matches_with_any_of_the_top_three_tags(self):
+        """只命中 Jev 排第三的标签也要发——旧实现只认第一名，这里会整轮沉默。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            third = self._add(manager, JPEG_BYTES, ["委屈", "叹气"])
+
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"可爱": 0.92, "抱抱": 0.88, "委屈": 0.81,
+                                            "none": 0.05}):
+                self.assertEqual(manager.choose_meme("我不开心", "抱抱，怎么啦"), third)
+
+    def test_first_ranked_tag_outweighs_the_backups(self):
+        """前三名都参与，但第一名权重最高：平分时不该被备选标签翻盘。"""
+        from core.meme import MemeManager
+        from core.jev import JevClient
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            primary = self._add(manager, PNG_BYTES, ["抱抱", "委屈"])
+            backup = self._add(manager, JPEG_BYTES, ["可爱"])
+
+            # 抱抱第一、委屈第二、可爱第三：前两张图都只靠自己名字里的标签
+            with patch.object(JevClient, "score_meme_tags",
+                              return_value={"抱抱": 0.85, "委屈": 0.84, "可爱": 0.83,
+                                            "none": 0.05}):
+                self.assertEqual(manager.choose_meme("别难过", "抱抱你"), primary)
 
     def test_jev_failure_falls_back_to_primary_tag_order(self):
         """Jev 抛错就退回首位标签排序，而不是不发或乱发。"""
@@ -303,26 +447,103 @@ class MemeLibraryTests(Fixture):
             self.assertNotIn(paths[0], cooled)            # 最早的已被挤出去
 
 
-    def test_meme_sent_at_most_once_per_turn(self):
-        channel = NapCatChannel()
-        event = {"user_id": 1, "message_type": "private"}
-        with patch("channels.napcat_channel.get_meme_manager") as memes:
-            memes.return_value.choose_meme.return_value = __file__
-            first = asyncio.run(channel._pick_meme_for_turn(event, "好呀"))
-            second = asyncio.run(channel._pick_meme_for_turn(event, "好呀"))
-        self.assertEqual(first, __file__)
-        self.assertIsNone(second)
-        self.assertEqual(memes.return_value.choose_meme.call_count, 1)
+class MemeAfterTextTests(Fixture):
+    """表情包在正文发完之后单独发一条，正文不出现任何 media:// 占位。"""
 
-    def test_meme_decision_stops_after_two_tries(self):
+    def _manager(self):
+        from core import meme as meme_module
+
+        with patch.object(meme_module.MemeManager, "_ensure_tagger", lambda self: None):
+            return meme_module.MemeManager(meme_dir=self.root / "memes",
+                                           db_path=self.root / "memes.db")
+
+    def _patched(self, manager, picked):
+        from core import meme as meme_module
+
+        return (
+            patch.object(meme_module, "get_meme_manager", return_value=manager),
+            patch.object(meme_module.MemeManager, "choose_meme", return_value=picked),
+        )
+
+    def test_pick_returns_ref_in_scope_without_touching_text(self):
+        from core.meme import pick_meme_asset
+        from core.media_store import MediaStore
+
+        manager = self._manager()
+        path = manager.add_from_bytes(REAL_PNG, "test")
+        self.assertIsNotNone(path)
+
+        pick_patch, score_patch = self._patched(manager, path)
+        with pick_patch, score_patch:
+            picked = pick_meme_asset("主人辛苦啦喵～", "我不开心", "qq:group:123", "group:123")
+
+        self.assertTrue(picked["ref"].startswith("img_"))
+        # 占位符只在发送时按 media_ref 临时拼，不会回写到正文
+        self.assertNotIn("media://", picked.get("path", ""))
+        asset, _ = MediaStore().get(picked["ref"], "qq:group:123")
+        self.assertEqual(asset["media_ref"], picked["ref"])
+        # 冷却记在挑中时：下一轮不会重复挑同一张
+        self.assertIn(path, manager._cooldown_paths("group:123"))
+
+    def test_pick_skips_failure_text_and_replies_that_already_carry_media(self):
+        from core.meme import pick_meme_asset
+
+        manager = self._manager()
+        path = manager.add_from_bytes(REAL_PNG, "test")
+        pick_patch, score_patch = self._patched(manager, path)
+        with pick_patch, score_patch as score:
+            self.assertEqual(pick_meme_asset("【模型接口错误：HTTP 520。】", "在吗", "qq:group:1"), {})
+            self.assertEqual(
+                pick_meme_asset("已经做好啦\n![图片](media://img_0123456789abcdef)", "在吗", "qq:group:1"), {})
+            self.assertEqual(pick_meme_asset("", "在吗", "qq:group:1"), {})
+        score.assert_not_called()
+
+    def test_channel_sends_image_as_its_own_message_after_text(self):
+        manager = self._manager()
+        path = manager.add_from_bytes(REAL_PNG, "test")
         channel = NapCatChannel()
-        event = {"user_id": 1, "message_type": "private"}
-        with patch("channels.napcat_channel.get_meme_manager") as memes:
-            memes.return_value.choose_meme.return_value = None
-            for _ in range(3):
-                asyncio.run(channel._pick_meme_for_turn(event, "好呀"))
-        # 进度一次 + 终稿一次，之后不再问 Jev
-        self.assertEqual(memes.return_value.choose_meme.call_count, 2)
+        event = {"message_type": "group", "group_id": 123, "user_id": 7,
+                 "_parsed": {"direct_text": "我不开心"}}
+        records = []
+
+        with patch.object(channel, "_send_segments", new_callable=AsyncMock, return_value=True) as send, \
+                patch("channels.napcat_channel.pick_meme_asset",
+                      return_value={"path": path, "ref": "img_0123456789abcdef"}), \
+                patch("channels.napcat_channel.record_meme_in_history",
+                      side_effect=lambda *a: records.append(a)), \
+                patch("channels.napcat_channel.asyncio.sleep", new_callable=AsyncMock), \
+                patch("channels.qq_reply._media_ref_segment",
+                      return_value={"type": "image", "data": {"file": "file:///tmp/meme.png"},
+                                    "_media": {"media_ref": "img_0123456789abcdef"}}):
+            asyncio.run(channel._send_meme_after_text(event, "主人辛苦啦喵～"))
+
+        # 一条独立的图片消息，不是拼在正文里的链接
+        segments = send.call_args.args[2]
+        self.assertEqual([s["type"] for s in segments], ["image"])
+        self.assertNotIn("media://", str(segments))
+        self.assertEqual(send.call_args.kwargs["asset_scope"], "qq:group:123")
+        # 图片发出去了才记历史，role=assistant
+        self.assertEqual(records, [("qq:group:123", "img_0123456789abcdef")])
+
+    def test_meme_is_sent_at_most_once_per_turn(self):
+        channel = NapCatChannel()
+        event = {"message_type": "private", "user_id": 1}
+        with patch.object(channel, "_send_segments", new_callable=AsyncMock, return_value=True), \
+                patch("channels.napcat_channel.pick_meme_asset", return_value={}) as pick, \
+                patch("channels.napcat_channel.asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(channel._send_meme_after_text(event, "好呀"))
+            asyncio.run(channel._send_meme_after_text(event, "好呀"))
+        self.assertEqual(pick.call_count, 1)
+
+    def test_history_record_marks_role_assistant(self):
+        from core.meme import record_meme_in_history
+
+        session = "qq:group:123"
+        with patch("core.memory.MiniMemory", return_value=self.memory):
+            self.assertTrue(record_meme_in_history(session, "img_0123456789abcdef"))
+        history, _ = self.memory.get_history(session)
+        saved = [m for m in history if m.get("role") == "assistant"][-1]
+        self.assertEqual(saved["content"], "![图片](media://img_0123456789abcdef)")
 
 
 class SelectMemeScoreTests(Fixture):
@@ -428,6 +649,39 @@ class SelectMemeScoreTests(Fixture):
         client = JevClient(base_url="http://127.0.0.1:1", api_key="")
         client.decide_raw = lambda *a, **k: self.fail("没有 key 就不该发请求")
         self.assertIsNone(client.score_meme_tags("在吗", "在的", ["卖萌"]))
+
+    def test_rank_meme_tags_returns_top_three(self):
+        """Jev 的产出契约：按分排序的前三个标签，而不是一个。"""
+        client = self._client()
+        client.score_meme_tags = lambda *a, **k: {
+            "可爱": 0.4, "抱抱": 0.93, "委屈": 0.71, "大笑": 0.2, "none": 0.04}
+
+        top, _scores = client.rank_meme_tags("我不开心", "抱抱", ["可爱", "抱抱", "委屈", "大笑"])
+        self.assertEqual(top, ["抱抱", "委屈", "可爱"])
+
+    def test_rank_meme_tags_sends_when_none_loses(self):
+        """分再低也不拦发布：none 没赢就得给三个标签出来。"""
+        client = self._client()
+        client.score_meme_tags = lambda *a, **k: {"疑惑": 0.3, "无语": 0.2, "none": 0.1}
+
+        top, _scores = client.rank_meme_tags("报错啥意思", "参数不对", ["疑惑", "无语"])
+        self.assertEqual(top, ["疑惑", "无语"])
+
+    def test_rank_meme_tags_suppresses_when_none_wins(self):
+        """none 得分最高就是「这条别发表情」，不给标签。"""
+        client = self._client()
+        client.score_meme_tags = lambda *a, **k: {"点赞": 0.48, "开心": 0.42, "none": 0.92}
+
+        top, scores = client.rank_meme_tags("转好了吗", "转好了", ["点赞", "开心"])
+        self.assertEqual(top, [])
+        self.assertEqual(scores.get("none"), 0.92)
+
+    def test_rank_meme_tags_returns_none_when_unscored(self):
+        """拿不到分（未配置/失败）不等于「不该发」，要让调用方走降级。"""
+        client = self._client()
+        client.score_meme_tags = lambda *a, **k: None
+
+        self.assertIsNone(client.rank_meme_tags("在吗", "在的", ["卖萌"]))
 
 if __name__ == "__main__":
     unittest.main()

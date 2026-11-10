@@ -256,7 +256,7 @@ class ModelWireTests(Fixture):
                                                 "index": 0,
                                                 "id": "c",
                                                 "function": {
-                                                    "name": "write_file",
+                                                    "name": "write",
                                                     "arguments": "{",
                                                 },
                                             }
@@ -455,7 +455,7 @@ class ModelWireTests(Fixture):
             response = MagicMock()
             response.__enter__.return_value = response
             response.status = 200
-            partial = b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write_file","arguments":"{"}}]}}]}\n'
+            partial = b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write","arguments":"{"}}]}}]}\n'
             response.readline.side_effect = ([partial, TimeoutError("The read operation timed out")]
                                              if phase == "partial" else TimeoutError("The read operation timed out"))
             with patch("core.brain._open_request") as opening, patch("core.brain.log") as logs:
@@ -857,6 +857,37 @@ class QQWireTests(Fixture):
         self.assertFalse(thread.is_alive())
 
 
+class NapCatRestartHandoffTests(Fixture):
+    """/restart 只重启本体：NapCat 进程所有权要能交接给下一个实例。"""
+
+    def _manager(self):
+        manager = NapCatManager(self.root / "napcat")
+        manager.napcat_dir.mkdir(parents=True, exist_ok=True)
+        return manager
+
+    def test_adopt_takes_over_a_live_napcat(self):
+        manager = self._manager()
+        manager._remember_owner(os.getpid())
+        adopted = self._manager()
+        self.assertTrue(adopted.adopt())
+        self.assertEqual(adopted._owned_pid, os.getpid())
+        # 接管来的实例没有 Popen 句柄，不能被当成“自己拉起的进程”重复清理
+        self.assertIsNone(adopted.process)
+
+    def test_detach_keeps_ownership_for_the_next_instance(self):
+        manager = self._manager()
+        manager._remember_owner(os.getpid())
+        manager.detach()
+        self.assertIsNone(manager.process)
+        self.assertTrue(manager._owner_state.exists())
+
+    def test_stop_clears_ownership(self):
+        manager = self._manager()
+        manager._remember_owner(999999)
+        manager.stop()
+        self.assertFalse(manager._owner_state.exists())
+
+
 class NapCatBootstrapTests(Fixture):
     def prepare(self):
         manager = NapCatManager(self.root / "napcat")
@@ -873,14 +904,17 @@ class NapCatBootstrapTests(Fixture):
         config.save_config({"channels": {"napcat": {"qq_path": str(executable)}}})
         return manager, executable
 
-    def test_native_command_preserves_environment_and_positional_login_id(self):
+    def test_native_command_never_forces_quick_login(self):
+        """带 QQ 号位置参数会被启动器拼成 QQ 的 `-q`：实测会卡在快速登录里不出二维码。"""
         manager, executable = self.prepare()
         original = os.environ.copy()
         command, env = manager._build_command("123456")
-        self.assertEqual(len(command), 4)
+        self.assertEqual(len(command), 3)
         self.assertEqual(command[1], str(executable.resolve()))
-        self.assertEqual(command[-1], "123456")
+        self.assertNotIn("123456", command)
         self.assertNotIn("-q", command)
+        self.assertNotIn("ACCOUNT", env)
+        self.assertNotIn("NAPCAT_QUICK_ACCOUNT", env)
         self.assertEqual(os.environ, original)
         self.assertTrue(Path(env["NAPCAT_LOAD_PATH"]).is_file())
         self.assertEqual(

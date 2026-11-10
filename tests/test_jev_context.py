@@ -28,7 +28,7 @@ def bloated_task_state():
         "verification": {"mode": "dynamic"},
         "file_changes": [{"path": f"f{i}.html", "added": 10, "removed": 1, "diff": "d" * 12000}
                          for i in range(10)],
-        "last_tools": [{"tool": "write_file", "ok": True, "result_preview": "x" * 800}
+        "last_tools": [{"tool": "write", "ok": True, "result_preview": "x" * 800}
                        for _ in range(50)],
         "artifacts": ["a"] * 40,
     }

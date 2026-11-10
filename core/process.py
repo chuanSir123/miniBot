@@ -6,24 +6,56 @@ import threading
 import time
 
 
-def terminate_tree(proc):
-    if proc.poll() is not None:
+def pid_alive(pid):
+    """判断进程是否还活着（跨平台）。"""
+    if not pid:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return True
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pid(pid):
+    """按 PID 结束整棵进程树，用于手上没有 Popen 句柄的“遗留进程”。"""
+    if not pid:
         return
     if os.name == "nt":
         subprocess.run(
-            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
             timeout=5,
         )
-    else:
-        import signal
+        return
+    import signal
 
+    try:
+        os.killpg(int(pid), signal.SIGKILL)
+    except OSError:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.kill(int(pid), signal.SIGKILL)
+        except OSError:
             pass
+
+
+def terminate_tree(proc):
+    if proc.poll() is not None:
+        return
+    terminate_pid(proc.pid)
 
 
 def clean_environment(base_env=None):

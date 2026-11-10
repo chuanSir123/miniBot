@@ -68,9 +68,9 @@ class CancelTests(Fixture):
                     yield
                 return ('', [
                     {'id': 'c1', 'type': 'function',
-                     'function': {'name': 'read_file', 'arguments': '{"file_path":"a.txt"}'}},
+                     'function': {'name': 'read', 'arguments': '{"file_path":"a.txt"}'}},
                     {'id': 'c2', 'type': 'function',
-                     'function': {'name': 'read_file', 'arguments': '{"file_path":"b.txt"}'}},
+                     'function': {'name': 'read', 'arguments': '{"file_path":"b.txt"}'}},
                 ], {})
 
         harness = self._harness(ToolBrain())

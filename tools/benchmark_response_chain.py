@@ -102,7 +102,7 @@ def main():
                         fixture = {'ok': True, 'skills': [], 'total': 0} if name == 'list_skills' else {'ok': True, 'output': 'benchmark fixture content'}
                         messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(fixture)})
                     final = model(brain, messages)
-                expected = {'noarg': 'list_skills', 'parameterized': 'read_file'}.get(case)
+                expected = {'noarg': 'list_skills', 'parameterized': 'read'}.get(case)
                 names = [c.get('function', {}).get('name') for c in calls]
                 row = {'repeat': repeat, 'case': case, 'mode': mode, 'route': route,
                        'jev_sec': round(jev_sec, 3), 'total_sec': round(time.monotonic() - start, 3),

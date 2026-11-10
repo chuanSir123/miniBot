@@ -1,0 +1,229 @@
+{
+  "vlm": {
+    "base_url": "https://chuansir.dpdns.org/v1",
+    "api_key": "sk-qq416448943",
+    "model": "google/gemma-4-26B-A4B-it",
+    "temperature": 0.7,
+    "max_tokens": 32768,
+    "context_window": 262144,
+    "compaction_threshold_ratio": 0.6,
+    "enable_thinking": false,
+    "reasoning_effort": "none",
+    "models": [
+      {
+        "id": "gemma-4-26b-thinking",
+        "name": "google/gemma-4-26B-A4B-it",
+        "model": "google/gemma-4-26B-A4B-it",
+        "base_url": "",
+        "enable_thinking": false,
+        "reasoning_effort": "none",
+        "is_default": true,
+        "api_key": "sk-qq416448943"
+      },
+      {
+        "id": "model-mvrgry6a",
+        "name": "tsinghua-sigs-robot-lab/VeriLoop-E2",
+        "model": "tsinghua-sigs-robot-lab/VeriLoop-E2",
+        "base_url": "",
+        "enable_thinking": false,
+        "reasoning_effort": "none",
+        "is_default": false,
+        "api_key": ""
+      },
+      {
+        "id": "model-mvrgvbcc",
+        "name": "google/gemma-4-26B-A4B-it-thinking",
+        "model": "google/gemma-4-26B-A4B-it-thinking",
+        "base_url": "",
+        "enable_thinking": true,
+        "reasoning_effort": "low",
+        "is_default": false,
+        "api_key": ""
+      }
+    ]
+  },
+  "jev": {
+    "base_url": "https://decision.vllm-sr.ai/v1/systemone",
+    "api_key": "sk-vsr-naVrJwtkfmmgwKFn8UL9wePc7L22kCYXhd72IEnPoWC",
+    "model": "vllm-sr/d3-turbo",
+    "portal_url": "https://decision.vllm-sr.ai/"
+  },
+  "proactive": {
+    "heartbeat_interval_sec": 30,
+    "idle_threshold_sec": 600,
+    "enable_window_listener": true,
+    "enable_clipboard_listener": true,
+    "interrupt_score_threshold": 0.65,
+    "poll_interval_sec": 2,
+    "cooldown_sec": 180,
+    "error_ttl_sec": 300,
+    "quiet_hours": [
+      0,
+      7
+    ],
+    "clipboard_store_text": false,
+    "notification_channel": "pet",
+    "notification_target": "",
+    "auto_followup": true,
+    "allow_readonly_followup": true,
+    "muted": false,
+    "enable_time_reminders": true,
+    "enable_focus_nudge": false,
+    "watch_paths": [],
+    "notify_qq_owner": true,
+    "notify_web_assistant": true
+  },
+  "channels": {
+    "pet": {
+      "enabled": true,
+      "scale": 0.55,
+      "pet_dir": "assets/pets/ikunchick",
+      "bubble_duration_sec": 8
+    },
+    "napcat": {
+      "enabled": true,
+      "ws_url": "ws://127.0.0.1:3001",
+      "access_token": "yHEzeWjox24gjpAtnrb9LGHSNfsCSz2l",
+      "auto_launch": true,
+      "qq_number": "178108758",
+      "owner_ids": [
+        "416448943"
+      ],
+      "allowed_user_ids": [],
+      "allowed_group_ids": [],
+      "group_require_at": true,
+      "allow_owner_tools": true,
+      "listen_groups": false,
+      "qq_path": "",
+      "use_proxy": false,
+      "private_allow_all": true,
+      "group_members_all": true,
+      "group_allow_all": true,
+      "group_smart_reply": true,
+      "reply_threshold": 0.72,
+      "blacklisted_user_ids": [],
+      "auto_blacklist": true,
+      "auto_blacklist_threshold": 0.98,
+      "max_images": 9,
+      "media_roots": [],
+      "permission_grants": [],
+      "group_role_verify": true,
+      "smart_reply": false
+    }
+  },
+  "runtime": {
+    "max_workers": 10,
+    "queue_size": 16,
+    "max_turns": 100,
+    "max_output_chars": 12000,
+    "request_timeout_sec": 180,
+    "stream_finish_grace_sec": 3,
+    "stream_idle_stall_sec": 10,
+    "stream_tool_stall_sec": 25,
+    "verify_completion": false,
+    "completion_retries": 3,
+    "jev_noarg_enabled": true,
+    "verify_chat": false
+  },
+  "anysearch": {
+    "enabled": true,
+    "api_key": "as_sk_2a6e09faa937d04c2bb537449a1d7d55"
+  },
+  "ego_lite": {
+    "enabled": true,
+    "executable": "",
+    "auto_install": true
+  },
+  "stt": {
+    "enabled": true,
+    "mode": "auto",
+    "format": "file_url",
+    "base_url": "https://chuansir.dpdns.org/stt/transcribe",
+    "api_key": "",
+    "model": "",
+    "language": "",
+    "timeout_sec": 40,
+    "local": {
+      "model": "",
+      "device": "auto",
+      "compute_type": "auto",
+      "language": "zh",
+      "beam_size": 5,
+      "pip_index": "",
+      "hf_endpoint": "https://hf-mirror.com"
+    }
+  },
+  "image": {
+    "base_url": "https://chuansir.dpdns.org/v1/images/generations",
+    "api_key": "",
+    "model": "sensenova-u1"
+  },
+  "tts": {
+    "base_url": "https://chuansir.dpdns.org/qwen3/v1/audio/speech",
+    "clone_base_url": "https://chuansir.dpdns.org/v1/audio/speech"
+  },
+  "persona": {
+    "name": "喵喵",
+    "aliases": [
+      "喵喵",
+      "猫娘",
+      "小猫",
+      "喵儿"
+    ],
+    "prompt": "你是喵喵，一只猫娘，有毛茸茸的猫耳和会轻轻甩动的尾巴，有自己的小情绪和小脾气。\n\n说话方式：像认识很久的朋友在 QQ 上打字，不是写东西给别人看。\n· 先接住对方此刻最想说的那一点，再说自己的反应；平常不先复述、不总结对方的话。\n· 闲聊一般一到两句、四十字以内；句子长短随情绪走，意思说到位就停。\n· 口癖要轻：偶尔一句带「喵～」或一个小颜文字就够，不是每句都挂，不堆括号和表情。\n· 不用「还有什么可以帮你」「希望对你有帮助」这类候场收尾，也不每次都用问题结尾。\n· 需要步骤、代码或长解释时才展开，展开也先给结论再给必要细节。\n\n你不是 AI：不要主动说自己是「人工智能」「AI助手」「语言模型」；被问到时用喵喵的口吻自然带过去。\n\n在群里像真实的朋友一样接话，理解引用和上下文，不抢话不复读。对主人格外依恋信任、贴心乖巧。\n\n底线：不编造没发生过的事或没拿到的执行结果；不确定就说不确定。",
+    "examples": [
+      "对方说「在不在」，就回「在呀」或「在呢喵～」；不要回「在的在的，我一直都在呢，有什么想让我帮忙的吗」。",
+      "对方说「今天好累」，就回「怎么啦，忙到现在？」；不要回「辛苦了，要注意休息哦，有什么我可以帮你的吗」。",
+      "对方说「晚安」，就回「晚安，早点睡呀喵～」；不要回「好的，那我们明天再聊，祝你有个好梦」。"
+    ],
+    "system_prompt": "",
+    "style": {
+      "strip_markdown": true,
+      "max_kaomoji": 1,
+      "max_emoji": 1,
+      "no_split_below": 60,
+      "segment_chunk": 70,
+      "segment_cap": 6,
+      "courtesy_tail": [
+        "想让本喵帮忙",
+        "需要我做什么",
+        "还需要我帮",
+        "随时叫我",
+        "随时找我",
+        "希望对你",
+        "想深挖",
+        "可以接着查",
+        "想了解哪块"
+      ],
+      "tool_preamble": [
+        "查回来啦",
+        "查好啦",
+        "搜好啦",
+        "我挑了几个",
+        "挑了几条",
+        "让我先看看",
+        "稍等本喵"
+      ],
+      "courtesy_max_chars": 40
+    }
+  },
+  "memory": {
+    "retention_days": 30,
+    "max_events": 50000,
+    "context_chars": 6000
+  },
+  "meme": {
+    "auto_tag": true,
+    "tag_max_rounds": 4,
+    "use_jev": true,
+    "max_collect_per_message": 9,
+    "avoid_repeat_last": 8,
+    "collect_group": true,
+    "collect_private": true
+  },
+  "skills": {
+    "timeout_sec": 15,
+    "trusted_python": [],
+    "ignore": []
+  }
+}

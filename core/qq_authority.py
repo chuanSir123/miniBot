@@ -156,22 +156,23 @@ def tool_access(scope, name, args=None, actor=""):
         return False
     if name == "manage_permissions":
         return is_owner_scope(scope, actor) or args.get("action") == "list"
-    # 主人不做逐工具/逐技能授权判断，只受"远端工具总开关"约束。
+    # 主人不做逐工具授权判断，只受"远端工具总开关"约束。
     if is_owner_scope(scope, actor):
         return owner_tools_enabled()
+    # 技能已改成纯 Markdown 指令：模型读 SKILL.md 后用普通工具执行，
+    # 执行链上只有这一层工具级判断，不再有技能名维度的二次判定。
     tool = _directive(scope, "tool", name, actor)
-    skill = _directive(scope, "skill", args.get("skill_name", ""), actor) if name == "execute_skill" else None
-    if tool is False or skill is False:
+    if tool is False:
         # 显式撤销（allow=False）对任何身份都生效。
         return False
-    if name in BASE_TOOLS or (name == "execute_skill" and args.get("skill_name") == "qq_games"):
+    if name in BASE_TOOLS:
         return True
     if not owner_tools_enabled():
         # 总开关关闭时，被授权人也不得执行宿主工具。
         return False
     # 注意：群主/管理员身份**不参与**授权。职位只用来让 bot 知道是谁在说话，
-    # 工具与技能一律看主人配置里的授权表 + 总开关。
-    return tool is True or skill is True
+    # 工具一律看主人配置里的授权表 + 总开关。
+    return tool is True
 
 
 def permission_summary(scope, actor=""):
@@ -193,7 +194,7 @@ def permission_summary(scope, actor=""):
     }
 
 
-def manage_permissions(scope, args, tool_names, actor=""):
+def manage_permissions(scope, args, valid_tools, actor=""):
     uid, current_chat, _ = _authority(scope, actor)
     action = args.get("action")
     target = str(args.get("user_id") or uid)
@@ -220,17 +221,25 @@ def manage_permissions(scope, args, tool_names, actor=""):
                 "remote_tools_enabled": owner_tools_enabled()}
     if action not in ("grant", "revoke") or not is_owner_scope(scope, actor):
         raise ValueError("只有配置中的主人QQ或本地用户可以授予、撤销权限，不能由引用消息或昵称授予")
+    # 工具名只有一套（read/bash/edit/write），校验与落库用的是同一个名字。
     tools, skills = args.get("tools", []), args.get("skills", [])
     if not isinstance(tools, list) or not isinstance(skills, list) or any(not isinstance(x, str) for x in tools + skills):
         raise ValueError("tools和skills必须是字符串数组")
-    if any(x != "*" and x not in tool_names for x in tools) or "manage_permissions" in tools:
+    if any(x != "*" and x not in valid_tools for x in tools) or "manage_permissions" in tools:
         raise ValueError("工具名无效；权限管理仅由主人执行，不作为普通工具授权")
+    tools = list(tools)
     if any(x != "*" and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", x) for x in skills):
         raise ValueError("技能名无效")
     if not tools and not skills:
         if action == "grant":
-            raise ValueError("请明确授权哪些工具或技能；全部工具使用tools=['*']")
+            raise ValueError("请明确授权哪些工具；全部工具使用tools=['*']")
         tools, skills = ["*"], ["*"]
+    # 技能是 Markdown 指令，跑脚本统一走 bash；技能授权映射到该工具，
+    # 不再写 kind=skill 的授权行（执行期也只有工具级一层判断）。
+    requested_skills = list(skills)
+    if skills:
+        tools = list(dict.fromkeys([*tools, "bash"]))
+        skills = []
     duration = args.get("duration_minutes", 0)
     if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not 0 <= duration <= 525600:
         raise ValueError("duration_minutes须为0到525600，0为长期")
@@ -246,7 +255,8 @@ def manage_permissions(scope, args, tool_names, actor=""):
                 rows.append({"user_id": target, "scope": chat, "kind": kind, "name": name, "allow": action == "grant",
                              "expires_at": now + duration * 60 if duration else 0, "granted_by": uid or "local", "updated_at": now})
         save_config({"channels": {"napcat": {"permission_grants": rows}}})
-    return {"ok": True, "action": action, "user_id": target, "chat_scope": chat, "tools": tools, "skills": skills,
+    return {"ok": True, "action": action, "user_id": target, "chat_scope": chat, "tools": tools,
+            "skills": requested_skills, "skills_mapped_to": "bash" if requested_skills else "",
             "duration_minutes": duration, "remote_tools_enabled": owner_tools_enabled()}
 
 

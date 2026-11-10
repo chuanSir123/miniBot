@@ -23,7 +23,7 @@ def build_trace(task_state):
         tool = item.get("tool")
         entry = {"tool": tool, "arguments": {"command": item.get("target", "")},
                  "result": {"ok": item.get("ok", False), "output": item.get("result_preview", "")}}
-        if tool in ("write_file", "edit_file") and item.get("ok"):
+        if tool in ("write", "edit") and item.get("ok"):
             entry["result"]["path"] = item.get("target", "")
             entry["result"]["changed_files"] = [item.get("target", "")]
         trace.append(entry)

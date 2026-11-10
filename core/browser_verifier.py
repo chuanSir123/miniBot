@@ -23,13 +23,31 @@ from core.workspace import resolve_file, workspace_for
 
 
 def find_browser_executable() -> Optional[str]:
-    """Find system Chromium-based browser (Chrome or Edge)."""
-    candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
+    """Find system Chromium-based browser (Chrome or Edge).
+
+    Install roots come from the environment (PROGRAMFILES / PROGRAMFILES(X86) /
+    LOCALAPPDATA) instead of a hardcoded drive path, so the same code works on
+    machines where Chrome is per-user installed or Windows lives on another drive.
+    """
+    layouts = {
+        "Google": ("Chrome", "Application", "chrome.exe"),
+        "Microsoft": ("Edge", "Application", "msedge.exe"),
+    }
+    candidates: List[str] = []
+    bases = [os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"),
+             os.environ.get("PROGRAMW6432"), os.environ.get("LOCALAPPDATA")]
+    if os.name == "nt":
+        # 服务/精简环境里 PROGRAMFILES 可能没设，按系统盘补回标准目录。
+        # 盘符要带分隔符，否则 join("C:", "Program Files") 会变成盘符相对路径。
+        drive = os.path.splitdrive(os.environ.get("WINDIR") or "C:\\Windows")[0] or "C:"
+        drive = drive + os.sep
+        bases += [os.path.join(drive, "Program Files"), os.path.join(drive, "Program Files (x86)"),
+                  os.path.join(os.path.expanduser("~"), "AppData", "Local")]
+    for base in bases:
+        if not base:
+            continue
+        for vendor, tail in layouts.items():
+            candidates.append(os.path.join(base, vendor, *tail))
     for c in candidates:
         if os.path.exists(c):
             return c
@@ -37,6 +55,12 @@ def find_browser_executable() -> Optional[str]:
         p = shutil.which(name)
         if p:
             return p
+    # macOS / Linux 常见安装位置，别人换平台也能直接跑。
+    for c in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+              "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
+        if os.path.exists(c):
+            return c
     return None
 
 

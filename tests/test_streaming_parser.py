@@ -30,9 +30,9 @@ class TestStreamingParser(unittest.TestCase):
         self.assertEqual(extract_partial_field(json_part, "file_path"), "game.py")
         self.assertEqual(extract_partial_field(json_part, "content"), 'import sys\nprint("hi")')
 
-    def test_parse_tool_delta_write_file(self):
+    def test_parse_tool_delta_write(self):
         partial = '{"file_path": "test.html", "content": "<!DOCTYPE html>\\n<html>\\n<head>\\n  <title>Test</title>\\n'
-        parsed = parse_tool_delta("write_file", partial, scope="main")
+        parsed = parse_tool_delta("write", partial, scope="main")
         self.assertTrue(parsed["is_file_op"])
         self.assertEqual(parsed["file_path"], "test.html")
         self.assertEqual(parsed["action"], "create")
@@ -40,9 +40,9 @@ class TestStreamingParser(unittest.TestCase):
         self.assertEqual(parsed["lines_deleted"], 0)
         self.assertIn("<title>Test</title>", parsed["snippet"])
 
-    def test_parse_tool_delta_edit_file(self):
+    def test_parse_tool_delta_edit(self):
         partial = '{"file_path": "test.py", "target": "line1\\nline2\\n", "replacement": "line_new1\\nline_new2\\nline_new3\\n'
-        parsed = parse_tool_delta("edit_file", partial, scope="main")
+        parsed = parse_tool_delta("edit", partial, scope="main")
         self.assertTrue(parsed["is_file_op"])
         self.assertEqual(parsed["file_path"], "test.py")
         self.assertEqual(parsed["action"], "edit")
@@ -50,9 +50,9 @@ class TestStreamingParser(unittest.TestCase):
         self.assertEqual(parsed["lines_added"], 4)
         self.assertIn("line_new3", parsed["snippet"])
 
-    def test_parse_tool_delta_write_file(self):
+    def test_parse_tool_delta_write(self):
         partial = '{"file_path": "skills/calc/SKILL.md", "content": "# 技能\\n正文\\n"}'
-        parsed = parse_tool_delta("write_file", partial, scope="main")
+        parsed = parse_tool_delta("write", partial, scope="main")
         self.assertTrue(parsed["is_file_op"])
         self.assertEqual(parsed["file_path"], "skills/calc/SKILL.md")
         self.assertEqual(parsed["lines_added"], 3)

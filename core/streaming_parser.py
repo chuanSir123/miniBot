@@ -2,7 +2,7 @@
 """Streaming Parser for Tool Call Arguments.
 
 Enables real-time parsing of streaming JSON arguments from LLM/VLM tool calls,
-such as write_file and edit_file, allowing diff-style dynamic line counters
+such as write and edit, allowing diff-style dynamic line counters
 (+X, -Y) and live code snippet previews before the tool call completes.
 """
 import re
@@ -92,10 +92,10 @@ def parse_tool_delta(tool_name: str, partial_args: str, scope: str = "main") -> 
 
     tool_lower = tool_name.lower()
 
-    if tool_lower in ("write_file", "edit_file"):
+    if tool_lower in ("write", "edit"):
         result["is_file_op"] = True
 
-        if tool_lower == "write_file":
+        if tool_lower == "write":
             file_path = extract_partial_field(partial_args, "file_path") or extract_partial_field(partial_args, "path")
             content = extract_partial_field(partial_args, "content")
             result["file_path"] = file_path
@@ -125,7 +125,7 @@ def parse_tool_delta(tool_name: str, partial_args: str, scope: str = "main") -> 
                 except Exception:
                     pass
 
-        elif tool_lower == "edit_file":
+        elif tool_lower == "edit":
             file_path = extract_partial_field(partial_args, "file_path") or extract_partial_field(partial_args, "path")
             target_text = extract_partial_field(partial_args, "target")
             repl_text = extract_partial_field(partial_args, "replacement")
@@ -141,7 +141,7 @@ def parse_tool_delta(tool_name: str, partial_args: str, scope: str = "main") -> 
             elif target_text:
                 result["snippet"] = "\n".join(target_text.split("\n")[-5:])
 
-    elif tool_lower == "execute_command":
+    elif tool_lower == "bash":
         result["action"] = "command"
         cmd = extract_partial_field(partial_args, "command")
         result["snippet"] = cmd

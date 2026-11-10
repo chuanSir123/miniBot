@@ -139,7 +139,7 @@ class CompactionTests(Fixture):
                     {
                         "id": "call1",
                         "type": "function",
-                        "function": {"name": "read_file", "arguments": "{}"},
+                        "function": {"name": "read", "arguments": "{}"},
                     }
                 ],
             }
@@ -271,6 +271,64 @@ class HarnessTests(Fixture):
         self.assertIn("data:image/jpeg;base64,", payload)
         self.assertIn("sticky", payload)
 
+    def test_qq_turn_is_stored_with_time_speaker_and_qq(self):
+        """聊天记录每条都要能看出「谁、什么时候说的」。
+
+        落库的用户条目正文带 `[时间] 昵称(QQ号)：` 抬头（meta 投影时会被剥掉，
+        模型只看得到正文），助手自己那条至少要在 meta 里留时间。
+        """
+        class Brain:
+            def stream_chat_and_tools(self, messages, tools=None):
+                yield ("text_delta", "记着了。")
+                return ("记着了。", [], {})
+
+        speaker = {"user_id": "456", "nickname": "阿明", "group_card": "群名片",
+                   "group_role_label": "群主", "is_owner": True}
+        self.assertEqual(
+            self.harness(Brain()).run("在吗", session_id="qq:group:88:user:456",
+                                      scope="qq:group:88", channel="qq_group",
+                                      target="88", speaker=speaker,
+                                      user_message_at=1762300000),
+            "记着了。")
+
+        history, _ = self.memory.get_history("qq:group:88:user:456")
+        user = [m for m in history if m.get("role") == "user"][-1]
+        # 落库用的是消息自带的时间戳，不是"这轮跑起来的时刻"。
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(1762300000))
+        self.assertEqual(user["content"], f"[{stamp}] 〔群主〕群名片(456)：在吗")
+        self.assertEqual(user["meta"]["qq"], "456")
+        self.assertEqual(user["meta"]["nickname"], "群名片")
+        self.assertEqual(user["meta"]["channel"], "qq_group")
+        self.assertIn("at", user["meta"])
+        assistant = [m for m in history if m.get("role") == "assistant"][-1]
+        self.assertIn("at", assistant["meta"])
+
+    def test_same_utterance_is_not_stored_twice_when_history_carries_stamp(self):
+        """带抬头落库之后，同一条输入不能被判成"新的一句"再追加一次。"""
+        from core.harness import needs_user_prompt_append
+        from core.transcript import stamped_user_entry, user_utterance_text
+
+        entry = stamped_user_entry("再讲一遍", {"user_id": "456", "nickname": "阿明"})
+        self.assertTrue(entry["content"].endswith("阿明(456)：再讲一遍"))
+        self.assertEqual(user_utterance_text(entry["content"]), "再讲一遍")
+        self.assertFalse(needs_user_prompt_append([entry], "再讲一遍"))
+        # 落库那份带抬头，也要和刚落库的条目比得出来（harness 传的就是带抬头的那份）。
+        self.assertFalse(needs_user_prompt_append([entry], entry["content"]))
+        self.assertTrue(needs_user_prompt_append([entry], "换一句"))
+
+        class Brain:
+            def stream_chat_and_tools(self, messages, tools=None):
+                yield ("text_delta", "嗯。")
+                return ("嗯。", [], {})
+
+        harness = self.harness(Brain())
+        for _ in range(2):                       # 同一句话连着来两次，历史里只该有一条
+            harness.run("再讲一遍", session_id="qq:group:88:user:456",
+                        scope="qq:group:88", channel="qq_group",
+                        speaker={"user_id": "456", "nickname": "阿明"})
+        history, _ = self.memory.get_history("qq:group:88:user:456")
+        self.assertEqual(len([m for m in history if m.get("role") == "user"]), 1)
+
     def test_same_read_repeated_is_blocked_and_turn_ends_honestly(self):
         """同一个文件用同样参数反复读：第 2 次提醒，第 3 次不再执行，第 6 次如实收尾。
 
@@ -295,7 +353,7 @@ class HarnessTests(Fixture):
                         "id": f"c{self.calls}",
                         "type": "function",
                         "function": {
-                            "name": "read_file",
+                            "name": "read",
                             "arguments": json.dumps({"file_path": "notes.txt"}),
                         },
                     }],
@@ -322,15 +380,15 @@ class HarnessTests(Fixture):
         target = self.root / "notes.txt"
         target.write_text("first", encoding="utf-8")
         seen = {}
-        signature = call_signature("read_file", {"file_path": str(target)})
+        signature = call_signature("read", {"file_path": str(target)})
         for _ in range(3):
-            guard_repeated_call("read_file", {"file_path": str(target)}, signature, seen, "main", 0)
+            guard_repeated_call("read", {"file_path": str(target)}, signature, seen, "main", 0)
         self.assertTrue(guard_repeated_call(
-            "read_file", {"file_path": str(target)}, signature, seen, "main", 0)[0])
+            "read", {"file_path": str(target)}, signature, seen, "main", 0)[0])
 
         target.write_text("second version, longer", encoding="utf-8")
         blocked, _ = guard_repeated_call(
-            "read_file", {"file_path": str(target)}, signature, seen, "main", 0)
+            "read", {"file_path": str(target)}, signature, seen, "main", 0)
         self.assertIsNone(blocked)
 
     def test_side_effecting_tool_is_never_blocked_for_same_arguments(self):
@@ -338,14 +396,59 @@ class HarnessTests(Fixture):
         from core.harness import call_signature, guard_repeated_call
 
         seen = {}
-        signature = call_signature("execute_command", {"command": "python -m pytest -q"})
+        signature = call_signature("bash", {"command": "python -m pytest -q"})
         for _ in range(6):
             blocked, notice = guard_repeated_call(
-                "execute_command", {"command": "python -m pytest -q"}, signature, seen, "main", 0)
+                "bash", {"command": "python -m pytest -q"}, signature, seen, "main", 0)
             self.assertIsNone(blocked)
             self.assertEqual("", notice)
 
-    def test_read_file_tells_where_to_continue(self):
+    def test_stateful_query_is_blocked_later_than_file_read(self):
+        """列表类查询宽一档：登记完媒体再列一遍是连贯动作，不能一上来就当空转拦。"""
+        from core.harness import (
+            DUPLICATE_STATEFUL_ABORT_AT,
+            DUPLICATE_STATEFUL_BLOCK_AT,
+            call_signature,
+            guard_repeated_call,
+        )
+
+        seen = {}
+        args = {"limit": 9}
+        signature = call_signature("list_media", args)
+        outcomes = [
+            guard_repeated_call("list_media", args, signature, seen, "main", 0)
+            for _ in range(DUPLICATE_STATEFUL_ABORT_AT)
+        ]
+        self.assertTrue(all(blocked is None for blocked, _ in outcomes[:DUPLICATE_STATEFUL_BLOCK_AT - 1]))
+        self.assertIsNotNone(outcomes[DUPLICATE_STATEFUL_BLOCK_AT - 1][0])
+        # 第一次被拦只是退回提示，还不到收尾
+        self.assertFalse(outcomes[DUPLICATE_STATEFUL_BLOCK_AT - 1][0]["terminate"])
+        self.assertTrue(outcomes[DUPLICATE_STATEFUL_ABORT_AT - 1][0]["terminate"])
+
+    def test_duplicate_block_only_terminates_at_the_abort_threshold(self):
+        """对齐 pi 的 block + terminate：先给机会改，够到上限才收尾。"""
+        from core.harness import (
+            DUPLICATE_ABORT_AT,
+            DUPLICATE_BLOCK_AT,
+            call_signature,
+            guard_repeated_call,
+        )
+
+        seen = {}
+        signature = call_signature("get_media", {"media_ref": "m1"})
+        first_block = None
+        last_block = None
+        for _ in range(DUPLICATE_ABORT_AT):
+            blocked, _notice = guard_repeated_call(
+                "get_media", {"media_ref": "m1"}, signature, seen, "main", 0)
+            if blocked is not None and first_block is None:
+                first_block = blocked
+            last_block = blocked
+        self.assertEqual(DUPLICATE_BLOCK_AT, 3)
+        self.assertFalse(first_block["terminate"])
+        self.assertTrue(last_block["terminate"])
+
+    def test_read_tells_where_to_continue(self):
         """读到行数/字符窗口末尾时给出续读位置：没有这个线索，模型只能原样再读一遍。"""
         from core.workspace import workspace_for
         workspace = workspace_for("main")
@@ -353,18 +456,18 @@ class HarnessTests(Fixture):
         (workspace / "long.txt").write_text(
             "".join(f"line{i}\n" for i in range(30)), encoding="utf-8")
         harness = self.harness(None)
-        first = harness._dispatch_tool("read_file", {"file_path": "long.txt", "max_lines": 10})
+        first = harness._dispatch_tool("read", {"file_path": "long.txt", "max_lines": 10})
         self.assertEqual(first["start_line"], 1)
         self.assertEqual(first["next_start_line"], 11)
         self.assertTrue(first["has_more"])
         second = harness._dispatch_tool(
-            "read_file", {"file_path": "long.txt", "start_line": 11, "max_lines": 10})
+            "read", {"file_path": "long.txt", "start_line": 11, "max_lines": 10})
         self.assertEqual(second["next_start_line"], 21)
 
     def test_permission_enforced_even_model_calls_hidden_tool(self):
         h = self.harness(None)
         result = h._dispatch_tool(
-            "write_file",
+            "write",
             {"file_path": str(self.root / "bad"), "content": "x"},
             permitted={"list_reminders"},
         )
@@ -398,7 +501,7 @@ class HarnessTests(Fixture):
         path = self.root / "large"
         path.write_text("x" * 1000000)
         result = self.harness(None)._dispatch_tool(
-            "read_file", {"file_path": str(path)}
+            "read", {"file_path": str(path)}
         )
         self.assertTrue(result["ok"])
         self.assertLessEqual(len(result["output"]), 12000)
@@ -413,7 +516,7 @@ class HarnessTests(Fixture):
                         {
                             "id": "c",
                             "function": {
-                                "name": "write_file",
+                                "name": "write",
                                 "arguments": json.dumps(
                                     {"file_path": str(target), "content": "bad"}
                                 ),
@@ -504,6 +607,214 @@ class ProactiveTests(Fixture):
         p.state["idle_sec"] = 1
         e._tick(config.load_config()["proactive"])
         self.assertTrue(e._last_state["returned"])
+
+    def test_duration_claim_must_stay_on_period(self):
+        """「盯某个页面看了 N 分钟」一律拦下，只放行「在电脑前坐了 N 分钟」。
+
+        窗口标题只能说明哪个程序在最前面，截图只能说明此刻屏幕上是什么，
+        两者都推不出"你盯着某个东西看了多久"，这类归因是主动消息里最容易编的一句。
+        """
+        from core.proactive import assertion_grounded
+
+        self.assertFalse(
+            assertion_grounded("主人盯企业微信里那张「商户信息查询失败」的截图看快 70 分钟啦")
+        )
+        self.assertFalse(assertion_grounded("你在当前窗口停留了 70 分钟"))
+        self.assertTrue(
+            assertion_grounded("主人在电脑前坐了 70 分钟啦，这段时间主要在写代码 40 分钟")
+        )
+
+    def test_period_breakdown_tracks_foreground_time(self):
+        """按窗口累计这一轮专注期的时长：换窗口不清零，人离开的时间不算。"""
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        for _ in range(5):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        for _ in range(3):
+            e._record_window_time(("WXWork.exe", "企业微信"), 120, 0, 600, False)
+        e._record_window_time(("WXWork.exe", "企业微信"), 120, 900, 600, False)
+        self.assertEqual(
+            e._period_breakdown(), "写代码·question-bank 10 分钟、企业微信 6 分钟"
+        )
+
+    def test_rest_reminder_line_comes_from_model(self):
+        """久坐文案原样取模型那句；没写成就不发，不拿模板顶。"""
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        for _ in range(5):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        state = {"active_minutes": 70, "period_summary": e._period_breakdown()}
+        line = "主人，question-bank 一口气啃了 70 分钟，中途还溜去 Redmine 摸了个单——起来走两步、喝口水嘛～"
+        e.rest_callback = lambda s, p: line
+        self.assertEqual(e._compose_rest(state), line)
+        # 模型这轮没写成：不发，也不编一句顶上
+        e.rest_callback = lambda s, p: ""
+        self.assertEqual(e._compose_rest(state), "")
+        e.rest_callback = None
+        self.assertEqual(e._compose_rest(state), "")
+
+    def test_period_shape_gives_form_not_numbers(self):
+        """久坐文案的素材是形态，不是分钟数：拿到数字它就会念出来。"""
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        for _ in range(10):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        focused = e._period_shape()
+        self.assertIn("基本一直停在", focused)
+        self.assertNotIn("分钟", focused)
+
+        # 切换次数才是"碎"的证据：时长分布只能说谁占得多，说不出一直在跳。
+        for name in ("WXWork.exe", "chrome.exe", "explorer.exe"):
+            for _ in range(5):
+                e._record_window_time((name, name), 120, 0, 600, False)
+        e._switch_count = 25
+        scattered = e._period_shape()
+        self.assertIn("来回跳", scattered)
+        self.assertNotIn("分钟", scattered)
+
+    def test_no_sedentary_nudge_during_meal_window(self):
+        """饭点内不谈久坐：中午坐着等外卖，「起来走两步」是句废话。"""
+        import datetime as dt
+        from core import proactive as proactive_mod
+
+        class Noon(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 4, 12, 0)
+
+        p = FakePerception()
+        p.state["idle_sec"] = 0
+        e = ProactiveEngine(self.memory, p, FakeJev(), None, None, lambda *a, **k: True)
+        for _ in range(5):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        e._active_start = time.time() - 50 * 60
+        cfg = config.load_config()["proactive"]
+        cfg["quiet_hours"] = [0, 0]
+        cfg["enable_time_reminders"] = True
+        with patch.object(proactive_mod.datetime, "datetime", Noon):
+            e._tick(cfg)
+        self.assertEqual(e._last_state.get("meal_period"), "lunch")
+        self.assertIsNone(e._last_state.get("period_shape"))
+
+        # 同一个状态下把饭点提醒关掉，久坐提醒照常成立。
+        cfg["enable_time_reminders"] = False
+        with patch.object(proactive_mod.datetime, "datetime", Noon):
+            e._tick(cfg)
+        self.assertTrue(e._last_state.get("period_shape"))
+
+    def test_user_turn_silences_proactive(self):
+        """刚聊完天就别插嘴：人正等着你接上一句，这时候推久坐提醒就是两台机器各说各的。"""
+        decide_calls = []
+
+        class Jev:
+            def is_configured(self):
+                return True
+
+            def decide(self, *args, **kwargs):
+                decide_calls.append(1)
+                return {"intervene": 0}
+
+        p = FakePerception()
+        p.state["idle_sec"] = 0
+        e = ProactiveEngine(self.memory, p, Jev(), None, None, lambda *a, **k: True)
+        for _ in range(5):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        e._active_start = time.time() - 50 * 60
+        cfg = config.load_config()["proactive"]
+        cfg["quiet_hours"] = [0, 0]
+
+        e.note_user_turn()
+        e._tick(cfg)
+        self.assertEqual(decide_calls, [])
+
+        # 把对话时间推远，久坐提醒照常进入判定。
+        e._last_user_turn = time.time() - 3600
+        e._tick(cfg)
+        self.assertEqual(len(decide_calls), 1)
+
+    def test_care_postures_share_daily_budget(self):
+        """久坐、饭点、深夜共用一个日预算，不然三个计时器加起来还是一天催四五次。"""
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        cfg = {"daily_care_limit": 2}
+        self.assertTrue(e._care_budget_left(cfg))
+        e._care_spend()
+        e._care_spend()
+        self.assertFalse(e._care_budget_left(cfg))
+
+    def test_repeated_care_line_is_dropped(self):
+        """同一句关心不连发两遍：日预算挡得住次数，挡不住"每次都说一样的话"。"""
+        sent = []
+        e = ProactiveEngine(
+            self.memory,
+            FakePerception(),
+            FakeJev(),
+            None,
+            None,
+            lambda text, posture, *a, **k: sent.append(text) or True,
+        )
+        line = "主人，这一阵切来切去的，脖子该僵了——起来走两步、喝口水嘛～"
+        self.assertTrue(e._deliver(line, "sedentary_rest_reminder", {}))
+        # 一字不差的第二遍：拦掉
+        self.assertFalse(e._deliver(line, "sedentary_rest_reminder", {}))
+        # 只换了几个字的复读：同样拦掉
+        self.assertFalse(
+            e._deliver("主人，这一阵切来切去的，脖子该僵了——快起来走两步、喝口水嘛～",
+                       "sedentary_rest_reminder", {})
+        )
+        self.assertEqual(len(sent), 1)
+        # 换了个落点就放行
+        self.assertTrue(
+            e._deliver("外卖还没到吧？趁这会儿起来站一下～", "sedentary_rest_reminder", {})
+        )
+
+    def test_rest_compose_skips_when_it_would_repeat(self):
+        """写出来的跟上一句雷同：这一轮干脆不说，而不是再念一遍。"""
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        for _ in range(5):
+            e._record_window_time(
+                ("idea64.exe", "question-bank – A.java [all]"), 120, 0, 600, False
+            )
+        state = {"active_minutes": 70, "period_shape": e._period_shape()}
+        first = "主人，坐了一上午了，起来走两步、喝口水嘛～"
+        e.rest_callback = lambda s, p: first
+        self.assertEqual(e._compose_rest(state), first)
+        e._remember_care(first)
+        # 模型被要求换角度，结果还是复读上一句
+        self.assertEqual(e._compose_rest(state), "")
+        # 写手能拿到的素材里有"上一轮说过的话"
+        seen = {}
+        e.rest_callback = lambda s, p: seen.update(s) or "刚过两点，起来站一下吧～"
+        e._compose_rest(state)
+        self.assertEqual(seen.get("avoid_text"), first)
+
+    def test_recent_talk_sees_web_session(self):
+        """主人在网页里说"点了外卖"，久坐提醒那边得看得见。
+
+        以前只读 main:pet，而网页对话落在 web:* 会话里，
+        于是提醒永远只能谈窗口分布，接不住他正关心的事。
+        """
+        e = ProactiveEngine(self.memory, FakePerception(), FakeJev(), None, None)
+        self.memory.append_message(
+            "web:main:default", {"role": "user", "content": "嗯嗯，点了外卖"}
+        )
+        self.memory.append_message(
+            "main:pet", {"role": "assistant", "content": "好呀～"}
+        )
+        # 主动提醒自己的文案会话不算"主人说过的话"
+        self.memory.append_message(
+            "local:proactive:nudge", {"role": "assistant", "content": "起来动动"}
+        )
+        talk = e._recent_talk(self.memory)
+        self.assertIn("点了外卖", talk)
+        self.assertIn("主人：", talk)
+        self.assertNotIn("起来动动", talk)
 
 
 class SkillTests(Fixture):
@@ -665,7 +976,7 @@ class AdditionalRegressionTests(Fixture):
         )
         target = self.root / "private"
         result = h._dispatch_tool(
-            "write_file",
+            "write",
             {"file_path": str(target), "content": "x"},
             scope="qq:private:123",
         )
@@ -699,7 +1010,7 @@ class AdditionalRegressionTests(Fixture):
                     {
                         "id": "unfinished",
                         "type": "function",
-                        "function": {"name": "read_file", "arguments": "{}"},
+                        "function": {"name": "read", "arguments": "{}"},
                     }
                 ],
             },
@@ -876,7 +1187,7 @@ class BudgetTests(Fixture):
             SkillManager(self.root / "skills"),
         )
         result = h._dispatch_tool(
-            "execute_command", {"command": "Write-Output '中文输出'"}
+            "bash", {"command": "Write-Output '中文输出'"}
         )
         self.assertTrue(result["ok"])
         self.assertIn("中文输出", result["output"])

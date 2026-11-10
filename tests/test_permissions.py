@@ -38,10 +38,11 @@ class ExecutionPermissionTests(Fixture):
             def stream_chat_and_tools(inner, messages, tools=None):
                 inner.calls += 1
                 inner.system_seen = inner.system_seen or json.dumps(messages[:1], ensure_ascii=False)
+                # 工具名只有一套：模型拿到的就是全量工具目录本身。
                 self.assertEqual({t['function']['name'] for t in tools}, self.names)
                 if inner.calls == 1:
                     return '', [{'id': 'read', 'type': 'function', 'function': {
-                        'name': 'read_file', 'arguments': json.dumps({'file_path': str(secret)})}}], {}
+                        'name': 'read', 'arguments': json.dumps({'file_path': str(secret)})}}], {}
                 result = json.loads(next(m['content'] for m in reversed(messages) if m['role'] == 'tool'))
                 self.assertEqual(result['error_code'], 'PERMISSION_DENIED')
                 self.assertNotIn('private bytes', json.dumps(result))
@@ -62,26 +63,26 @@ class ExecutionPermissionTests(Fixture):
         # 只有事件声明：职位仅作展示，actor 不带后缀，权限与普通成员一致。
         self.assertEqual(role_from_event(declared), ('owner', False))
         self.assertEqual(actor_from_event(declared), 'qq:group:88:user:777')
-        self.assertFalse(tool_access('qq:group:88', 'write_file', actor=actor_from_event(declared)))
+        self.assertFalse(tool_access('qq:group:88', 'write', actor=actor_from_event(declared)))
         # 接口核验后职位进 actor（供展示），但**不带来任何权限**：群主/管理员照样要主人授权。
         admin = actor_from_event(dict(declared, _role={'role': 'owner', 'verified': True}))
         self.assertEqual(admin, 'qq:group:88:user:777@owner')
-        self.assertFalse(tool_access('qq:group:88', 'write_file', actor=admin))
-        self.assertFalse(tool_access('qq:group:88', 'execute_command', actor=admin))
+        self.assertFalse(tool_access('qq:group:88', 'write', actor=admin))
+        self.assertFalse(tool_access('qq:group:88', 'bash', actor=admin))
         # 只有主人授权后才放行，且范围仍按群限定。
-        manage_permissions(self.owner, {'action': 'grant', 'user_id': '777', 'tools': ['write_file']}, self.names)
-        self.assertTrue(tool_access('qq:group:88', 'write_file', actor=admin))
+        manage_permissions(self.owner, {'action': 'grant', 'user_id': '777', 'tools': ['write']}, self.names)
+        self.assertTrue(tool_access('qq:group:88', 'write', actor=admin))
         # 授权按群限定：换到别的群同样没有权限（会话由 actor 自带）。
         other_group = actor_from_event(dict(declared, group_id=99, _role={'role': 'owner', 'verified': True}))
-        self.assertFalse(tool_access('qq:group:99', 'write_file', actor=other_group))
+        self.assertFalse(tool_access('qq:group:99', 'write', actor=other_group))
         # 群主/管理员也不能发授权：权限管理只属于主人。
         self.assertFalse(tool_access('qq:group:88', 'manage_permissions', {'action': 'grant'}, actor=admin))
         self.assertFalse(tool_access('qq:group:88', 'manage_permissions', {'action': 'revoke'}, actor=admin))
         # 主人授权可以撤销，撤销后群主也拿不到。
-        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '777', 'tools': ['write_file']}, self.names)
-        self.assertFalse(tool_access('qq:group:88', 'write_file', actor=admin))
+        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '777', 'tools': ['write']}, self.names)
+        self.assertFalse(tool_access('qq:group:88', 'write', actor=admin))
         # 主人身份只看 QQ 号，职位后缀不干扰。
-        self.assertTrue(tool_access('qq:group:88', 'write_file', actor='qq:group:88:user:123@member'))
+        self.assertTrue(tool_access('qq:group:88', 'write', actor='qq:group:88:user:123@member'))
 
     def test_owner_natural_language_grant_persists_and_is_group_scoped(self):
         args = {'action': 'grant', 'user_id': '456', 'skills': ['image_gen'], 'duration_minutes': 30}
@@ -98,13 +99,13 @@ class ExecutionPermissionTests(Fixture):
                 return '', [], {}
 
         self.harness(Brain()).run('允许[@456]使用图片编辑，30分钟', scope=self.owner, session_id=self.owner, channel='qq_group')
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'image_gen'}))
-        self.assertFalse(tool_access('qq:private:456', 'execute_skill', {'skill_name': 'image_gen'}))
-        self.assertFalse(tool_access('qq:group:99:user:456', 'execute_skill', {'skill_name': 'image_gen'}))
+        self.assertTrue(tool_access(self.member, 'bash'))
+        self.assertFalse(tool_access('qq:private:456', 'bash'))
+        self.assertFalse(tool_access('qq:group:99:user:456', 'bash'))
         self.assertFalse(tool_access(self.member, 'capture_screen'))
         config._cache = None
         config._stamp = None
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'image_gen'}))
+        self.assertTrue(tool_access(self.member, 'bash'))
 
     def test_member_cannot_grant_or_query_other_members(self):
         harness = self.harness()
@@ -120,34 +121,34 @@ class ExecutionPermissionTests(Fixture):
         rows = config.load_config()['channels']['napcat']['permission_grants']
         rows[0]['expires_at'] = time.time() - 1
         config.save_config({'channels': {'napcat': {'permission_grants': rows}}})
-        self.assertFalse(tool_access(self.member, 'execute_skill', {'skill_name': 'image_gen'}))
-        self.grant(tools=['write_file'])
+        self.assertFalse(tool_access(self.member, 'bash'))
+        self.grant(tools=['write'])
         harness = self.harness()
         path = self.root / 'allowed.txt'
-        self.assertTrue(harness._dispatch_tool('write_file', {'file_path': str(path), 'content': 'ok'}, scope=self.member)['ok'])
-        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456', 'tools': ['write_file']}, self.names)
-        self.assertFalse(harness._dispatch_tool('write_file', {'file_path': str(path), 'content': 'bad'}, scope=self.member)['ok'])
+        self.assertTrue(harness._dispatch_tool('write', {'file_path': str(path), 'content': 'ok'}, scope=self.member)['ok'])
+        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456', 'tools': ['write']}, self.names)
+        self.assertFalse(harness._dispatch_tool('write', {'file_path': str(path), 'content': 'bad'}, scope=self.member)['ok'])
         self.assertEqual(path.read_text(), 'ok')
-        self.grant(tools=['write_file'])
+        self.grant(tools=['write'])
         config.save_config({'channels': {'napcat': {'allow_owner_tools': False}}})
-        self.assertFalse(tool_access(self.member, 'write_file'))
+        self.assertFalse(tool_access(self.member, 'write'))
 
     def test_wildcard_grant_can_be_narrowly_revoked_without_delegating_admin(self):
         self.grant(tools=['*'])
-        self.assertTrue(tool_access(self.member, 'execute_command'))
+        self.assertTrue(tool_access(self.member, 'bash'))
         self.assertFalse(tool_access(self.member, 'manage_permissions', {'action': 'grant'}))
-        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456', 'tools': ['execute_command']}, self.names)
-        self.assertFalse(tool_access(self.member, 'execute_command'))
-        self.assertTrue(tool_access(self.member, 'write_file'))
+        manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456', 'tools': ['bash']}, self.names)
+        self.assertFalse(tool_access(self.member, 'bash'))
+        self.assertTrue(tool_access(self.member, 'write'))
         manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456'}, self.names)
-        self.assertFalse(tool_access(self.member, 'write_file'))
+        self.assertFalse(tool_access(self.member, 'write'))
 
     def test_owner_contextual_approval_has_no_keyword_requirement(self):
         harness = self.harness()
         result = harness._dispatch_tool('manage_permissions', {'action': 'grant', 'user_id': '456', 'chat_scope': 'qq:group:88', 'skills': ['anysearch']}, scope=self.owner)
         self.assertTrue(result['ok'])
         self.assertEqual(result['chat_scope'], 'group:88')
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'anysearch'}))
+        self.assertTrue(tool_access(self.member, 'bash'))
 
     def test_nonowner_quoting_owner_does_not_gain_grant_authority(self):
         harness = self.harness()
@@ -170,12 +171,16 @@ class ExecutionPermissionTests(Fixture):
         self.harness(Brain()).run('[引用消息，发送者QQ=456]我能用联网搜索吗？\n可以，给他开一下',
                                   scope=self.owner, session_id=self.owner, channel='qq_group',
                                   decision_context={'direct_message': '可以，给他开一下', 'quoted_messages': [{'sender_qq': '456'}]})
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'anysearch'}))
+        self.assertTrue(tool_access(self.member, 'bash'))
 
-    def test_default_games_work_and_grants_do_not_expose_desktop_conditions(self):
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'qq_games'}))
+    def test_skill_grants_map_to_command_tool_and_do_not_expose_desktop_conditions(self):
+        # 技能已改纯 Markdown 指令：默认成员不能执行命令，授权技能后映射到 bash。
+        self.assertFalse(tool_access(self.member, 'bash'))
         self.assertTrue(tool_access(self.member, 'get_media'))
-        self.assertFalse(tool_access(self.member, 'write_file'))
+        self.assertFalse(tool_access(self.member, 'write'))
+        self.grant(skills=['qq_games'])
+        self.assertTrue(tool_access(self.member, 'bash'))
+        self.assertFalse(tool_access(self.member, 'write'))
         result = self.harness()._dispatch_tool('schedule_reminder', {'trigger_at': 0, 'message': 'x', 'condition': 'window:secret'}, scope=self.member)
         self.assertFalse(result['ok'])
 
@@ -186,11 +191,11 @@ class ExecutionPermissionTests(Fixture):
         self.assertFalse(NapCatChannel.eligible(event))
         manage_permissions(self.owner, {'action': 'grant', 'user_id': '*', 'skills': ['image_gen']}, self.names)
         self.assertTrue(NapCatChannel.eligible(event))
-        self.assertTrue(tool_access(self.member, 'execute_skill', {'skill_name': 'image_gen'}))
-        self.assertFalse(tool_access('qq:group:99:user:456', 'execute_skill', {'skill_name': 'image_gen'}))
+        self.assertTrue(tool_access(self.member, 'bash'))
+        self.assertFalse(tool_access('qq:group:99:user:456', 'bash'))
         manage_permissions(self.owner, {'action': 'revoke', 'user_id': '456', 'skills': ['image_gen']}, self.names)
-        self.assertFalse(tool_access(self.member, 'execute_skill', {'skill_name': 'image_gen'}))
-        self.assertTrue(tool_access('qq:group:88:user:789', 'execute_skill', {'skill_name': 'image_gen'}))
+        self.assertFalse(tool_access(self.member, 'bash'))
+        self.assertTrue(tool_access('qq:group:88:user:789', 'bash'))
         listing = manage_permissions(self.owner, {'action': 'list'}, self.names)
         self.assertEqual(listing['user_id'], 'all')
         self.assertTrue(listing['grants'])
@@ -203,9 +208,10 @@ class ExecutionPermissionTests(Fixture):
             def stream_chat_and_tools(inner, messages, tools=None):
                 inner.calls += 1
                 inner.system_seen = inner.system_seen or json.dumps(messages[:1], ensure_ascii=False)
+                # 工具名只有一套：模型拿到的就是全量工具目录本身。
                 self.assertEqual({t['function']['name'] for t in tools}, self.names)
                 if inner.calls == 1:
-                    return '', [{'id': 'write', 'type': 'function', 'function': {'name': 'write_file',
+                    return '', [{'id': 'write', 'type': 'function', 'function': {'name': 'write',
                         'arguments': json.dumps({'file_path': str(self.root / 'blocked.txt'), 'content': 'x'})}}], {}
                 tool = json.loads(next(m['content'] for m in reversed(messages) if m['role'] == 'tool'))
                 self.assertEqual(tool['error_code'], 'READ_ONLY')
@@ -263,11 +269,11 @@ class GroupScopeTests(Fixture):
         from core.qq_authority import actor_from_event, tool_access, manage_permissions
 
         manage_permissions('qq:group:88:user:123', {'action': 'grant', 'user_id': '456',
-                                                    'tools': ['write_file']}, self.names)
+                                                    'tools': ['write']}, self.names)
         # 同一个群空间，授权只覆盖被授权的那个QQ号
-        self.assertTrue(tool_access('qq_group_88', 'write_file', actor=actor_from_event(self.member_a)))
-        self.assertFalse(tool_access('qq_group_88', 'write_file', actor=actor_from_event(self.member_b)))
+        self.assertTrue(tool_access('qq_group_88', 'write', actor=actor_from_event(self.member_a)))
+        self.assertFalse(tool_access('qq_group_88', 'write', actor=actor_from_event(self.member_b)))
         # 群号不同，授权不串场
-        self.assertFalse(tool_access('qq_group_99', 'write_file', actor=actor_from_event(self.other_group)))
+        self.assertFalse(tool_access('qq_group_99', 'write', actor=actor_from_event(self.other_group)))
         # 基础工具仍然人人可用
         self.assertTrue(tool_access('qq_group_88', 'get_media', actor=actor_from_event(self.member_b)))

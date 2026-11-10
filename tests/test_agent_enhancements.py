@@ -230,7 +230,7 @@ class AgentEnhancementsTest(unittest.TestCase):
         dummy_config = self.root / "config.json"
         dummy_config.write_text("{\"vlm\": {}}", encoding="utf-8")
         self.assertFalse(harness.is_tainted("session_1"))
-        harness._execute_tool("read_file", {"file_path": str(dummy_config)}, session_id="session_1")
+        harness._execute_tool("read", {"file_path": str(dummy_config)}, session_id="session_1")
         self.assertTrue(harness.is_tainted("session_1"))
 
 

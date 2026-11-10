@@ -8,9 +8,10 @@ svg_to_mp4: 将 HTML/SVG 动画页面转成 MP4 视频。
    动画时间严格按帧推进；run_for 只接受 int 毫秒，用累计取整保证平均帧间隔恰为 1/fps
    （30fps 时序列为 33,34,33,33,34,...ms）；无 clock API 时回退真实时间 sleep。
 2. ffmpeg 按指定 fps 合成 MP4；编码器自动回退 libx264 -> libopenh264 -> mpeg4
-   （本机 D:\github\Aibote\ffmpeg.exe 编译时禁用了 libx264，必须回退）。
+   （不同机器上的 ffmpeg 编译选项不一样，禁用了 libx264 的必须回退）。
 3. ffprobe 验证 duration/size/codec/width/height/r_frame_rate 并随结果返回。
 """
+import glob
 import json
 import os
 import shutil
@@ -31,9 +32,6 @@ PARAMETERS = {
     "required": ["file_path"],
     "additionalProperties": False,
 }
-
-FFMPEG_CANDIDATES = [r"D:\github\Aibote\ffmpeg.exe", "ffmpeg"]
-FFPROBE_CANDIDATES = [r"D:\ffmpeg-7.1.1-full_build\bin\ffprobe.exe", "ffprobe"]
 
 # 截图子进程脚本（在独立 Python 中执行，确保能 import playwright）
 _CAPTURE_SCRIPT = r"""
@@ -100,27 +98,65 @@ if __name__ == "__main__":
 """
 
 
+def _project_root():
+    return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+
+
+def _tool_candidates(name):
+    """按「环境变量 > PATH > 项目内置 > 常见安装目录」列出 ffmpeg/ffprobe 候选。
+
+    ffmpeg 每家装的位置都不一样，写死盘符必然只能在本机跑：
+    要临时指定可设 MINIBOT_FFMPEG / MINIBOT_FFPROBE（或 FFMPEG_BINARY / FFPROBE_BINARY）。
+    """
+    exe = name + ".exe" if os.name == "nt" else name
+    root = _project_root()
+    candidates = [
+        os.environ.get("MINIBOT_" + name.upper(), ""),
+        os.environ.get(name.upper() + "_BINARY", ""),
+        shutil.which(name) or "",
+        os.path.join(root, "tools", "bin", exe),
+        os.path.join(root, "tools", "ffmpeg", "bin", exe),
+        os.path.join(root, "tools", exe),
+    ]
+    # 常见安装位置：ffmpeg 官网压出来的是 <根>\ffmpeg\bin\ffmpeg.exe。
+    bases = [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES"),
+             os.environ.get("PROGRAMFILES(X86)")]
+    if os.name == "nt":
+        # 精简环境里 PROGRAMFILES 可能没设，按系统盘补回标准目录。
+        # 盘符要带分隔符，否则 join("C:", "Program Files") 会变成盘符相对路径。
+        drive = os.path.splitdrive(os.environ.get("WINDIR") or "C:\\Windows")[0] or "C:"
+        drive = drive + os.sep
+        bases += [os.path.join(drive, "Program Files"), os.path.join(drive, "Program Files (x86)"),
+                  os.path.join(os.path.expanduser("~"), "AppData", "Local"), drive]
+    for base in bases:
+        if not base:
+            continue
+        candidates += [os.path.join(base, "ffmpeg", "bin", exe),
+                       os.path.join(base, "ffmpeg", exe)]
+    return [c for c in candidates if c]
+
+
 def _find_tool(candidates):
     for c in candidates:
-        if c in ("ffmpeg", "ffprobe"):
-            if shutil.which(c):
-                return c
-        elif os.path.isfile(c):
+        if os.path.isfile(c) or shutil.which(c):
             return c
     return None
 
 
 def _find_python_with_playwright():
-    """探测装了 playwright 的 Python 解释器。"""
-    candidates = [
-        sys.executable,
-        shutil.which("python"),
-        shutil.which("python3"),
-        r"C:\users\admin\appdata\local\programs\python\python310\python.exe",
-    ]
+    """探测装了 playwright 的 Python 解释器（不写死用户名下的安装路径）。"""
+    candidates = [os.environ.get("MINIBOT_PYTHON") or os.environ.get("PLAYWRIGHT_PYTHON"),
+                  sys.executable, shutil.which("python"), shutil.which("python3")]
+    for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES"),
+                 os.environ.get("PROGRAMFILES(X86)")):
+        if not base:
+            continue
+        candidates += sorted(glob.glob(os.path.join(base, "Programs", "Python", "Python3*", "python.exe")), reverse=True)
+        candidates += sorted(glob.glob(os.path.join(base, "Python3*", "python.exe")), reverse=True)
+    candidates += ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"]
     seen = set()
     for py in candidates:
-        if not py or py in seen:
+        if not py or py in seen or not os.path.isfile(py):
             continue
         seen.add(py)
         try:
@@ -168,10 +204,11 @@ def execute(context):
     if not os.path.isfile(file_path):
         return {"ok": False, "error": "文件不存在: %s" % file_path}
 
-    ffmpeg = _find_tool(FFMPEG_CANDIDATES)
+    ffmpeg_candidates, ffprobe_candidates = _tool_candidates("ffmpeg"), _tool_candidates("ffprobe")
+    ffmpeg = _find_tool(ffmpeg_candidates)
     if not ffmpeg:
-        return {"ok": False, "error": "未找到 ffmpeg（尝试过: %s）" % ", ".join(FFMPEG_CANDIDATES)}
-    ffprobe = _find_tool(FFPROBE_CANDIDATES)
+        return {"ok": False, "error": "未找到 ffmpeg（可用 MINIBOT_FFMPEG 指定路径；尝试过: %s）" % ", ".join(ffmpeg_candidates)}
+    ffprobe = _find_tool(ffprobe_candidates)
 
     out = args.get("output") or (os.path.splitext(file_path)[0] + ".mp4")
     if not os.path.isabs(out):
@@ -269,3 +306,12 @@ def execute(context):
 DESCRIPTION = '把 HTML/SVG 动画页面转成 MP4 视频。主人要求"SVG/HTML动画转MP4/录制成视频/导出视频"时调用本技能。内部用 Playwright 无头 Chromium + 虚拟时钟逐帧截图（时间精确推进，平均帧间隔恰为1/fps），ffmpeg 编码器自动回退（libx264→libopenh264→mpeg4，兼容禁用libx264的ffmpeg），最后 ffprobe 验证时长/分辨率/编码/帧率并返回结果。截图在独立 Python 子进程中执行（自动探测装了 playwright 的解释器），避免宿主进程缺模块。'
 
 PARAMETERS = {'type': 'object', 'properties': {'file_path': {'type': 'string', 'description': 'HTML/SVG动画文件路径（绝对或相对Harness工作空间）'}, 'duration_sec': {'type': 'number', 'description': '录制时长秒数，默认12', 'default': 12}, 'fps': {'type': 'integer', 'description': '帧率，默认30', 'default': 30}, 'width': {'type': 'integer', 'description': '视口宽度，默认1280', 'default': 1280}, 'height': {'type': 'integer', 'description': '视口高度，默认800', 'default': 800}, 'output': {'type': 'string', 'description': '输出MP4路径，默认输入文件名+.mp4'}}, 'required': ['file_path'], 'additionalProperties': False}
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

@@ -22,6 +22,10 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.db"
 # 换来确定性：宁可在 DB 上排队几毫秒，也不要随机丢一次写入。
 _DB_LOCK = threading.RLock()
 
+# 会话语种：私聊只带 QQ 号，群聊可能带发送者后缀（qq:group:1:user:2）。
+_PRIVATE_SESSION = re.compile(r"qq:private:(\d+)")
+_GROUP_SESSION = re.compile(r"qq:group:(\d+)(?::user:\d+)?")
+
 
 def keywords(text):
     words = re.findall(r"[a-zA-Z0-9_]{2,}|[\u4e00-\u9fff]+", text.lower())
@@ -160,19 +164,70 @@ class MiniMemory:
         with self._get_conn() as db:
             return [dict(row) for row in db.execute("SELECT * FROM qq_blacklist ORDER BY created_at DESC LIMIT 200")]
 
+    def session_scopes(self, session_id):
+        """会话 id 反推它写入过的记忆 scope，兼容历史上的多种别名写法。
+
+        同一路对话实际用过不同 scope：主人私聊写过 "main"，也写过
+        "qq:private:<uid>" / "qq_private_<uid>"；群聊有 "qq_group_<gid>"、
+        "qq:group:<gid>"、"qq:group:<gid>:user:<uid>"。按 split(":")[1] 猜
+        只能命中其中一种，清完必然有残留，所以统一在这里收敛。
+
+        返回 (精确 scope 列表, 群内个人 scope 的 LIKE 前缀)。
+        """
+        sid = (session_id or "").strip()
+        if not sid:
+            return [], ""
+        scopes = {sid}
+        private = _PRIVATE_SESSION.fullmatch(sid)
+        if private:
+            scopes.add(f"qq_private_{private[1]}")
+            from core.qq_authority import is_owner_scope
+            if is_owner_scope(sid):
+                scopes.add("main")
+            return sorted(scopes), ""
+        group = _GROUP_SESSION.fullmatch(sid)
+        if group:
+            scopes.add(f"qq_group_{group[1]}")
+            return sorted(scopes), f"qq:group:{group[1]}:user:%"
+        if sid in ("local:pet", "main:pet"):
+            return sorted(scopes | {"main"}), ""
+        if sid.startswith("web:"):
+            parts = sid.split(":")
+            if len(parts) > 1 and parts[1]:
+                scopes.add(parts[1])
+        return sorted(scopes), ""
+
     def clear_session(self, session_id: str):
-        """物理清空指定会话的全部历史记录、归档消息、摘要与任务状态。"""
+        """物理清空指定会话的历史记录、归档消息、摘要与事件流水。
+
+        只清 messages/archived/summaries 是不够的：下一轮 recall_for_turn 仍会
+        从 events_v2 取"最近 6 条事件"，把清空前的对话当成新内容重新追加进历史，
+        于是 /clear 之后模型还记得刚聊过什么。这里把同 scope 的事件与 chat 转录
+        一并清掉；facts 刻意保留——那是用户明确要求记住的内容。
+        """
+        scopes, prefix = self.session_scopes(session_id)
+        if not scopes:
+            return
+        where = "scope IN (%s)" % ",".join("?" for _ in scopes)
+        params = list(scopes)
+        if prefix:
+            where += " OR scope LIKE ?"
+            params.append(prefix)
         with self._get_conn() as db:
             for table in ("messages_v2", "archived_messages_v2", "summaries_v2"):
                 try:
                     db.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
                 except Exception:
                     pass
-        scope = session_id.split(":")[1] if ":" in session_id else "main"
+            if self.has_fts:
+                rowids = [r[0] for r in db.execute(f"SELECT id FROM events_v2 WHERE {where}", params)]
+                db.executemany("DELETE FROM events_fts_v2 WHERE rowid=?", [(i,) for i in rowids])
+            for table in ("events_v2", "chat_messages", "chat_summaries"):
+                db.execute(f"DELETE FROM {table} WHERE {where}", params)
         self.save_task_state(session_id, {
             "original_goal": "新对话",
             "status": "awaiting_input",
-            "scope": scope,
+            "scope": "main" if "main" in scopes else scopes[0],
         })
 
     def qq_strike(self, user_id):

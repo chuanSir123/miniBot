@@ -10,10 +10,12 @@ import tempfile
 import urllib.parse
 import urllib.request
 from io import BytesIO
+from functools import lru_cache
 from pathlib import Path
 from core.network import direct_opener
 from core.config import load_config
 from core.console import log
+from core.media_store import sniff_media
 
 
 def segments(value):
@@ -52,6 +54,50 @@ def _check_url(url):
         raise ValueError("不读取内网附件地址")
 
 
+def _documents_dirs():
+    """本机「文档」目录的候选路径。
+
+    QQ 把图片/表情缓存放在「文档\\Tencent Files」下，但「文档」可能被重定向到
+    OneDrive、别的盘，中文系统的目录名还叫「文档」。只按 home/Documents 拼，
+    换台机器就整条链路读不到图，所以先问系统要真实的文档目录。
+    """
+    dirs = []
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                dirs.append(Path(os.path.expandvars(winreg.QueryValueEx(key, "Personal")[0])))
+        except OSError:
+            pass
+    home = Path.home()
+    dirs += [home/"Documents", home/"文档", home/"OneDrive"/"Documents", home/"OneDrive"/"文档"]
+    dirs += sorted(home.glob("OneDrive*/Documents")) + sorted(home.glob("OneDrive*/文档"))
+    return dirs
+
+
+@lru_cache(maxsize=1)
+def _default_roots():
+    """允许读取本地附件的目录白名单（不含配置里追加的 media_roots）。"""
+    roots = [Path(__file__).resolve().parents[1]/"tools"/"napcat", Path(tempfile.gettempdir())]
+    for documents in _documents_dirs():
+        roots += [documents/"Tencent Files", documents/"TencentFiles"]
+    for env in ("LOCALAPPDATA", "APPDATA"):
+        base = os.environ.get(env)
+        if base:
+            roots.append(Path(base)/"Tencent")
+    home = Path.home()
+    roots += [home/"AppData"/"Local"/"Tencent", home/"AppData"/"Roaming"/"Tencent"]
+    unique = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return tuple(unique)
+
+
 class _Redirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _check_url(newurl)
@@ -60,6 +106,10 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
 
 def media_bytes(source, kind, trusted_path=False):
     limit = 5_000_000 if kind == "image" else 12_000_000
+    # 本地缓存是 OneBot 自己落盘的受信文件。QQ 收到的动画表情存成 .suf（内容其实是 GIF），
+    # 十几兆很常见，按网络下载的限额卡会把整类表情包挡在门外。
+    local_limit = 12_000_000
+    size_limit = limit
     if source.startswith("base64://"):
         source = f"data:{kind}/{'png' if kind=='image' else 'mpeg'};base64,"+source[9:]
     if source.startswith("data:"):
@@ -82,21 +132,29 @@ def media_bytes(source, kind, trusted_path=False):
         source = urllib.request.url2pathname(urllib.parse.urlsplit(source).path) if source.startswith("file:") else source
         path = Path(source).expanduser().resolve()
         cfg = load_config()["channels"]["napcat"]
-        home = Path.home()
-        roots = [Path(__file__).resolve().parents[1]/"tools"/"napcat", Path(tempfile.gettempdir()),
-                 home/"Documents"/"Tencent Files", home/"Documents"/"TencentFiles",
-                 home/"OneDrive"/"Documents"/"Tencent Files", home/"OneDrive"/"Tencent Files",
-                 home/"AppData"/"Local"/"Tencent", home/"AppData"/"Roaming"/"Tencent"]
+        roots = list(_default_roots())
         roots += [Path(os.path.expandvars(x)).expanduser() for x in cfg.get("media_roots", [])]
         suffixes = (".png", ".jpg", ".jpeg", ".webp", ".gif") if kind=="image" else (".mp3", ".wav", ".ogg", ".m4a", ".silk", ".amr", ".pcm")
-        if path.suffix.lower() not in suffixes or not any(path.is_relative_to(root.resolve()) for root in roots):
-            raise ValueError("OneBot 附件缓存不在已配置 media_roots 范围")
+        if not any(path.is_relative_to(root.resolve()) for root in roots):
+            log("QQ", "media.outside_roots", path=str(path), kind=kind)
+            raise ValueError(f"附件缓存不在允许目录内（{path.name}）")
+        size_limit = local_limit
         with path.open("rb") as stream:
-            data = stream.read(limit+1)
-        mime = mimetypes.guess_type(str(path))[0] or (kind+"/mpeg")
+            data = stream.read(size_limit+1)
+        # 扩展名不可信：QQ 的动画表情一律落成 .suf，按后缀判断会把整类表情包拒掉。
+        # 一律先按文件头识别，认不出来（.silk/.amr 这类语音缓存）才退回扩展名。
+        detected, sniffed = sniff_media(data)
+        if detected is None:
+            if path.suffix.lower() not in suffixes:
+                raise ValueError(f"附件类型不支持（{path.suffix or '无后缀'}）")
+            mime = mimetypes.guess_type(str(path))[0] or (kind+"/mpeg")
+        elif detected != kind:
+            raise ValueError(f"附件内容不是{kind}（{path.name}）")
+        else:
+            mime = sniffed or mimetypes.guess_type(str(path))[0] or (kind+"/mpeg")
     else:
         raise ValueError("附件需要由 OneBot 解析为 URL 或受信任缓存路径")
-    if not data or len(data)>limit:
+    if not data or len(data)>size_limit:
         raise ValueError("附件为空或超过大小限制")
     return data, mime
 

@@ -2,7 +2,7 @@
 Workspace Checkpoint & Diff Tracking Engine for MiniBot Harness.
 Provides:
 1. Turn-by-turn and message-level file state snapshots.
-   - 文本变更：write_file / edit_file 记录 before/after 全文（可出 diff 卡片）。
+   - 文本变更：write / edit 记录 before/after 全文（可出 diff 卡片）。
    - 二进制/媒体变更：技能（ffmpeg、image_gen 等）直接写盘，工具层拿不到内容，
      改由每轮开始扫描工作空间清单、轮末二次扫描对比得出「新建 / 修改 / 删除」。
 2. Code rollback: Reverts workspace files and conversation history to any prior message state.
@@ -32,7 +32,7 @@ _SKIP_DIRS = {
 }
 
 # 需要「改动前留底」的二进制/媒体类型。
-# 文本文件由 write_file / edit_file 的 before_content 负责，不需要额外拷贝；
+# 文本文件由 write / edit 的 before_content 负责，不需要额外拷贝；
 # 媒体文件常常被技能原地覆盖（同名输出），只能在轮次开始前先存一份前像。
 _BACKUP_SUFFIXES = {
     ".mp4", ".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".ico", ".svg",
@@ -247,7 +247,7 @@ class CheckpointManager:
 
         for p in created:
             if p in tracked:
-                continue  # write_file 已经用 before_content=NULL 记过，回滚会删
+                continue  # write 已经用 before_content=NULL 记过，回滚会删
             rows.append((session_id, scope, message_id, rel_of(p), p, "created", after_files[p][1], None, now))
         for p in modified:
             if p in tracked:

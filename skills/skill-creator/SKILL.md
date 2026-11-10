@@ -85,38 +85,117 @@ skill-name/
 
 #### MiniBot runtime contract (this repository)
 
-This project executes skills through `execute_skill` in a plain Python subprocess.
-It is **not** Claude Code, so the following are mandatory and override the generic
-anatomy above:
+In this project a skill is a **plain Markdown instruction document**, not a callable
+tool. The model reads `SKILL.md` with `read`, then follows the instructions using
+ordinary tools (`bash`, `write`, ...). It is **not** Claude Code, and
+there is no skill-execution tool, so the following are mandatory and override the
+generic anatomy above:
 
-1. **Entry script** — executable skills must declare it in frontmatter:
+1. **SKILL.md** — frontmatter carries only `name` and `description`; the body is the
+   full instruction set. Document exactly how the work is done, including any command
+   the model should run. A skill that needs no script is instructions-only and is
+   simply read and followed.
 
    ```yaml
    ---
    name: my-skill
    description: what it does and when to use it
-   entry: scripts/my_skill.py
    ---
    ```
 
-   The file lives at `skills/<name>/scripts/<name>.py` and must expose
-   `def execute(context): ...` returning a dict or string. A skill with no `entry`
-   is instructions-only: `execute_skill(name)` just returns the SKILL.md body.
-2. **Parameters** — put the JSON Schema in `skills/<name>/parameters.json`
-   (`{"type": "object", "properties": {...}, "required": [...]}`). It is validated
-   before the script runs, so a bad argument fails fast instead of corrupting output.
+2. **Running a script** — every skill ships its own executable script in
+   `skills/<name>/scripts/`. The model reads SKILL.md and decides which script
+   to run; there is **no central runner** and no skill-name dispatch.
+
+   ```
+   python skills/system-status/scripts/system_status.py --arguments '{}'
+   ```
+
+   Paths are relative to the project root: call `bash` with `cwd=project`,
+   then copy the command verbatim and change only the script path and the JSON.
+   Never hard-code a machine-specific absolute path into SKILL.md.
+   Each script ends with a `__main__` block that calls `core.skill_cli.main`;
+   that helper parses `--arguments` / `--scope`, builds the context, and prints
+   one line of JSON. Put the parameter schema in `skills/<name>/parameters.json`.
+   Scripts live in `skills/<name>/scripts/`, never in `core/`.
+3. **Media inputs** — never put Base64 in a command line. The model calls
+   `get_media` with a `media_ref` first; that tool returns a local `file_path`.
+   Pass the path as a file parameter (`reference_files`, `image_files`, ...);
+   the script reads the file and builds the data URL itself.
+4. **Discovery** — `<skills>` in the system prompt lists every skill with an
+   absolute `<location>`. Read it with `read`; `list_skills` only queries
+   the catalog. Saving SKILL.md is enough — the catalog refreshes automatically.
+
+### Copy-paste template for a new MiniBot skill
+
+Create `skills/<name>/SKILL.md` with `write`. **Instructions-only skill**:
+
+   ```markdown
+   ---
+   name: daily-brief
+   description: 用一句话概括今天要做的事。当用户说"今日简报/今天做什么"时使用。
+   ---
+
+   # daily-brief
+
+   1. 用 `read_chat_history` 取最近 20 条消息。
+   2. 用 `list_reminders` 取今天的提醒。
+   3. 合并成一句话，40 字以内，不要标题。
+   ```
+
+**Script skill** — add `skills/<name>/scripts/<name>.py`,
+`skills/<name>/parameters.json`, and an `entry` line plus the exact command in
+SKILL.md:
+
+   ```markdown
+   ---
+   name: daily-brief
+   description: 生成今日简报。当用户说"今日简报/今天做什么"时使用。
+   entry: scripts/daily_brief.py
+   ---
+
+   ## 运行方式
+
+   本技能是纯 Markdown 指令：先 `read` 读完本文件，再用 `bash` 跑下面的命令
+   （传 `cwd=project`，路径相对项目根目录）：
+
+       python skills/daily-brief/scripts/daily_brief.py --arguments '{}'
+
+   ## 参数
+
+   - `date` (string, 可选)：指定日期，默认今天。
+   ```
+
+   ```python
+   # skills/daily-brief/scripts/daily_brief.py
+   def execute(context):
+       args = context.get("args") or {}
+       return {"ok": True, "output": "简报：" + str(args.get("date", "今天"))}
+
+
+   if __name__ == "__main__":
+       import sys
+       from pathlib import Path
+       sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+       from core.skill_cli import main
+       raise SystemExit(main(execute))
+   ```
+
+Rules: one directory per skill, frontmatter needs `name` + `description`, the
+body must spell out the exact command with a real absolute path (no placeholders),
+and scripts stay under `scripts/`. Verify by running the command once.
 
 Runtime facts for anything you write:
 
 - Windows host: PowerShell syntax for shell work; Python may use forward slashes.
-- Scripts run in an isolated subprocess under a timeout (`skills.timeout_sec`,
-  default 15s). Long work belongs in a background task, not a blocking call.
+- The runner executes scripts in an isolated subprocess under a timeout
+  (`skills.timeout_sec`, default 15s). Long work goes to `bash` with
+  `background=true`, not a blocking call.
 - **No `claude` CLI and no sub-agent spawning.** The eval sections below
   ("Running and evaluating test cases", blind comparison) cannot run here —
-  verify by calling `execute_skill` yourself and reading the real output instead.
-- Never write a skill as a flat file (`skills/foo.py`): such files require an
-  explicit entry in `skills.trusted_python` and are otherwise loaded as untrusted.
-  Always use the `skills/<name>/` directory form.
+  verify by running the documented command yourself and reading the real output.
+- Never write a skill as a flat file (`skills/foo.py`): such files are not part of
+  the catalog. Always use the `skills/<name>/SKILL.md` directory form.
 
 #### Progressive Disclosure
 

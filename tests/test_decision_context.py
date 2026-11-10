@@ -1,11 +1,13 @@
 import asyncio
 import json
+import re
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from test_core import Fixture, FakePerception
 from core import config
-from core.decision_context import build_decision_context, record_qq_message, render_qq_turn_context
+from core.decision_context import (build_decision_context, persona_name, record_qq_message,
+                                   render_qq_turn_context)
 from core.qq_authority import actor_from_event
 from core.harness import AgentHarness
 from core.jev import JevClient
@@ -187,6 +189,24 @@ class DecisionContextTests(Fixture):
         self.assertIn('已略去较早的', text)         # 截断是逐行丢弃，不是切字符串
         self.assertTrue(text.startswith('当前QQ会话身份'))
         json.loads(json.dumps({'text': text}, ensure_ascii=False))  # 结构永远可序列化
+
+    def test_every_chat_record_carries_time_speaker_and_qq(self):
+        """近期群聊每行都要有「时间 + 昵称 + QQ号」；机器人自己那条署人设名。"""
+        record_qq_message(self.memory, dict(self.event, user_id=456, message_id=9,
+                                            sender={'nickname': '阿明', 'card': ''}), '群友说的话')
+        record_qq_message(self.memory, self.event, '机器人上一句', role='assistant')
+        rows, _ = self.memory.chat_pending('qq:group:88')
+        self.assertTrue(all(row.get('time') for row in rows))
+        self.assertTrue(all(row['speaker'].get('user_id') for row in rows))
+        text = render_qq_turn_context(self.context(), budget=6000)
+        # 当天只写时分，跨天补日期；事件时间戳是固定的老时间，走跨天分支。
+        self.assertRegex(text, r'#1 \[\d{2}-\d{2} \d{2}:\d{2}\] 阿明\(456\): 群友说的话')
+        # 机器人自己那条署 config.persona.name，不是「助手」这种功能词。
+        bot = persona_name()
+        self.assertRegex(text, r'#2 \[\d{2}:\d{2}\] ' + re.escape(bot) + r': 机器人上一句')
+        self.assertIn(f'{bot}是自己', text)
+        if bot != '助手':
+            self.assertNotIn('助手: 机器人上一句', text)
 
     def test_turn_context_marks_group_owner_and_admin(self):
         # 群主/管理员职位来自事件声明或接口核验，展示时都带〔职位〕标签。

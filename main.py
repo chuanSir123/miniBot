@@ -48,13 +48,13 @@ def _describe_tool(name, args):
         detail = str(detail or "").strip()
         return f"{title} · {detail}" if detail else title
 
-    if name == "execute_command":
+    if name == "bash":
         return join("运行了命令", str(args.get("command") or "")[:50])
-    if name == "read_file":
+    if name == "read":
         return join("读取了文件", basename(args.get("file_path") or args.get("path")))
-    if name == "write_file":
+    if name == "write":
         return join("写入了文件", basename(args.get("file_path") or args.get("path")))
-    if name == "edit_file":
+    if name == "edit":
         return join("编辑了文件", basename(args.get("file_path") or args.get("path")))
     if name == "capture_screen":
         return join("捕获了屏幕核验效果", str(args.get("reason") or "")[:40])
@@ -120,6 +120,7 @@ class MiniBotApp:
         self._restart_reason = ""
         self._restart_lock = threading.Lock()
         self._qt_app = None
+        self._stopped = False
         self.harness.on_restart = self.request_restart
         self.proactive = ProactiveEngine(
             self.memory,
@@ -132,6 +133,7 @@ class MiniBotApp:
             self._followup,
             self._verify_proactive,
             self._execute_scheduled_task,
+            self._write_rest_nudge,
         )
         self._unsubscribe = subscribe(self._config_changed)
 
@@ -214,6 +216,11 @@ class MiniBotApp:
                 selected_model = model
 
         norm_text = text.strip()
+        # 主人刚说过话：记一笔，主动提醒在接下来一段时间里让路。
+        # web 也要算——主动提醒同样会推到网页对话框里，主人在那边说完
+        # "喝了喝了"，这边还在催他喝水，读起来就是没在听。群聊不算。
+        if channel in ("pet", "web"):
+            self.proactive.note_user_turn()
         cmd = norm_text.lower()
         if cmd == "/cancel":
             self.harness.cancel_session(session)
@@ -398,7 +405,9 @@ class MiniBotApp:
                 ok = self.harness.inject_steering(session, text)
                 future = concurrent.futures.Future()
                 if ok:
-                    reply = f"🎯 [实时引导] 已将方向修正指令注入当前执行任务：\n“{text}”"
+                    # 只报一句「已进入引导」。原文带换行＋引号会被 split_chat_text
+                    # 切成两条气泡，而 harness 那边生效时还会再回显一次，三条就齐了。
+                    reply = "🎯 [实时引导] 收到，已插进当前任务，往新方向调整。"
                 else:
                     reply = "引导注入失败，请稍后重试。"
                 future.set_result(reply)
@@ -771,6 +780,17 @@ class MiniBotApp:
                         except Exception:
                             pass
 
+                # 聊天记录里的「谁说的」：QQ 侧的昵称/群名片/职位/QQ 号从这里带进去。
+                # 其他渠道（Web、桌宠、定时任务）没有这套身份，speaker 留空，正文不加抬头。
+                speaker = None
+                if isinstance(qq_event, dict) and channel in ("qq_private", "qq_group"):
+                    try:
+                        from core.decision_context import qq_identity
+
+                        speaker = qq_identity(qq_event)
+                    except Exception:
+                        speaker = None
+
                 reply = self.harness.run(
                     text,
                     on_text_chunk=on_text,
@@ -794,17 +814,25 @@ class MiniBotApp:
                     on_reasoning_complete=_wrapped_reasoning_complete,
                     on_text_reset=reset_text,
                     model_override=model_override,
+                    speaker=speaker,
+                    user_message_at=(qq_event or {}).get("time") if isinstance(qq_event, dict) else None,
                     user_message_id=user_message_id,
                 )
-        self.memory.add_event("助手：" + reply, source="bot", scope=mem_scope)
+        self.memory.add_event(f"{load_config()['persona']['name']}：" + reply, source="bot", scope=mem_scope)
+        # 占位符（`![图片](media://img_x)`）只该活在聊天记录里，让下一轮模型知道
+        # 这条配了哪张图。气泡和「助理」是给人看的界面，一律剥掉；图片本身已经由
+        # 渠道按占位单独发出去了。
+        from core.media_store import strip_media_links
+
+        visible = strip_media_links(reply) if "media://" in (reply or "") else reply
         # 需求3：Web 端 main、Pet、QQ 主人的回复同步到 Pet 端发送（桌宠气泡播报）
         if is_pet_or_main and self.pet_widget:
-            self.pet_widget.finish_say_safe(reply, 3)
+            self.pet_widget.finish_say_safe(visible, 3)
         # 需求3：Web 端 main、Pet、QQ 主人回复同步记录到 Web main「助理」会话
         if self._mirrors_to_assistant(channel, is_owner):
             try:
                 from webui.server import sync_message_to_web_main
-                sync_message_to_web_main(self, "assistant", reply)
+                sync_message_to_web_main(self, "assistant", visible)
             except Exception:
                 pass
         print(
@@ -822,7 +850,7 @@ class MiniBotApp:
         )
         return reply
 
-    def _notify_qq(self, channel, target, message):
+    def _notify_qq(self, channel, target, message, session_id=""):
         """往 QQ 发一条通知；目标不在白名单里或 NapCat 未连接时静默跳过。"""
         if not self.napcat_channel:
             return False
@@ -843,7 +871,7 @@ class MiniBotApp:
         if not permitted:
             return False
         try:
-            return bool(self.napcat_channel.send_notification(channel, target, message))
+            return bool(self.napcat_channel.send_notification(channel, target, message, session_id))
         except Exception as exc:
             print("[Notification]", exc)
             return False
@@ -871,17 +899,23 @@ class MiniBotApp:
         pcfg = load_config()["proactive"]
         local_proactive = task.get("scope", "local") == "local"
         delivered = False
+        # 正文里可能有 media:// 占位（给聊天记录看的）。气泡、控制台、「助理」都是
+        # 给人看的界面，统一剥掉；真正的图片由 QQ 侧按占位单独发出去。
+        from core.media_store import strip_media_links
+
+        shown = strip_media_links(message)
 
         if task["channel"] == "pet":
             if self.pet_widget:
                 self.pet_widget.set_task_safe("主动提醒", "有新消息")
-                self.pet_widget.finish_say_safe(message, anim_action)
+                self.pet_widget.finish_say_safe(shown, anim_action)
                 delivered = True
             elif self.mode == "local":
-                print("[主动提醒] " + message)
+                print("[主动提醒] " + shown)
                 delivered = True
         elif task["channel"] in ("qq_private", "qq_group"):
-            delivered = self._notify_qq(task["channel"], task["target"], message)
+            delivered = self._notify_qq(task["channel"], task["target"], message,
+                                        task.get("session_id", ""))
 
         # 本地主动提醒再私聊主人一份：人不在电脑前时，桌宠气泡是看不见的。
         if local_proactive and pcfg.get("notify_qq_owner", True):
@@ -914,6 +948,15 @@ class MiniBotApp:
         "准备开口的判断：{claim}\n"
         "触发原因：{trigger}\n"
         "桌面状态：{state}\n\n"
+        "关于时长，先分清两个数，别混用：\n"
+        "- active_minutes：主人在电脑前累计待了多久。只跟「人有没有离开」有关，"
+        "换个程序、换个网页都不清零。\n"
+        "- window_minutes：当前这个窗口在最前面待了多久。它只知道哪个窗口在最前，"
+        "不知道主人在看里面哪一块内容。\n"
+        "两个数都不足以支撑「你在看某个东西看了多久」这句话：窗口标题只说明程序在最前，"
+        "截图只说明此刻屏幕上是什么，都推不出停留时长。\n"
+        "描述时长只能用「在电脑前坐了 N 分钟」这种整段时间的说法，"
+        "禁止把时长挂到某个窗口、某个页面、某张截图上。\n\n"
         "要求：\n"
         "1. 先核实再看结论。可以截图看屏幕、读文件、读历史，也可以跑只读命令"
         "（git status、dir、type 这类）确认现状；看到什么就以什么为准。\n"
@@ -943,7 +986,10 @@ class MiniBotApp:
                 "process",
                 "title",
                 "idle_sec",
+                # 全局在电脑前时长 vs 当前窗口停留时长，必须成对给出，
+                # 只给前者模型就会拿它去描述当前页面。
                 "active_minutes",
+                "window_minutes",
                 "local_time",
                 "trigger",
                 "meal_period",
@@ -1003,6 +1049,70 @@ class MiniBotApp:
             actor=task.get("actor", ""), allow_tools=True,
         )
 
+    # 久坐提醒的写作提示词。它不核实任何东西——素材本身就是代码算好的两个事实，
+    # 模型要做的是把"这段时间大概是什么样、主人心里正想着什么"说成一句有人味的短话。
+    # 故意不传单窗口的分钟数：给了它就会原样念出来（"微信占了二十四分钟"），
+    # 那不是关心，是替监控日志配音。
+    # 也不放完整的例句：以前那句"切来切去的，脖子该僵了——起来走两步、喝口水嘛"
+    # 就跟形态标签对得上，本地小模型直接把它当标准答案，一天照抄三遍。
+    REST_NUDGE_PROMPT = (
+        "【久坐提醒】主人已经在电脑前坐了 {minutes} 分钟，该起来活动一下、喝口水。\n"
+        "这段时间的大致形态：{shape}\n"
+        "刚才聊过的：\n{recent_talk}\n"
+        "上一轮你已经说过：{avoid_text}\n"
+        "现在时间：{local_time}\n\n"
+        "写一句提醒，要求：\n"
+        "1. 一句话，30 字以内。不解释、不分点、不写成汇报，不要加引号。\n"
+        "2. 先看「刚才聊过的」。主人心里悬着的事（在等外卖、在等构建、在查一个报错）"
+        "比坐姿重要：接得上就先把那件事接住，再顺一句让他动一动。\n"
+        "3. 接不上才说这段时间：换一个具体的入口——现在几点、是坐了一上午还是刚过午后、"
+        "手上这件事是什么。别每次都从「你切来切去」或「久坐伤身」起头。\n"
+        "4. 不许和「上一轮你已经说过」的那句意思一样、句式也一样。换个说法，换个落点。\n"
+        "5. 不许出现任何数字：坐了多少分钟、切了几次、开了几个窗口，都不许说。"
+        "你手上只有一个粗略形态，精确数字只能靠编，编出来的数字就是在播报监控数据。\n"
+        "6. 不许描述屏幕上有什么：你只看过窗口名字，没看过内容，"
+        "别说什么「盯着某个页面／某张截图」。\n\n"
+        "如果你实在想不出跟上一轮不一样的话，只输出 _SKIP_。宁可这一轮不说，"
+        "也不要把同一句关心再念一遍。"
+    )
+
+    def _write_rest_nudge(self, state, posture):
+        """久坐提醒的文案写手。返回空串就不发。
+
+        素材只有四样：在电脑前坐了多久、这段时间的形态标签、最近几轮对话、
+        上一轮说过的话。不给单窗口分钟数、不给当前窗口/截图，也不开工具：
+        这一轮它不是去观察，只是把已知的东西说成一句人话。
+        """
+        shape = state.get("period_shape") or ""
+        if not shape:
+            return ""
+        prompt = self.REST_NUDGE_PROMPT.format(
+            minutes=int(state.get("active_minutes", 0)),
+            shape=shape,
+            recent_talk=state.get("recent_talk") or "（没有，主人这段时间没跟你说话）",
+            avoid_text=state.get("avoid_text") or "（这是今天第一句，随便说）",
+            local_time=state.get("local_time", ""),
+        )
+        try:
+            reply = self.harness.run(
+                prompt,
+                "",
+                session_id="local:proactive:nudge",
+                scope="local",
+                channel="pet",
+                target="",
+                allow_tools=False,
+                readonly=True,
+            )
+        except Exception as exc:
+            print("[久坐文案]", exc)
+            return ""
+        reply = (reply or "").strip()
+        # 模型可以主动弃权：想不出跟前一句不同的话就别开口。
+        if "_SKIP_" in reply:
+            return ""
+        return reply
+
     def _followup(self, task, state):
         """跟进型主动消息：和普通主动提醒走同一套只读核实。"""
         if task["scope"] != "local":
@@ -1043,7 +1153,7 @@ class MiniBotApp:
             or self.memory.notification_preferences(scope)["muted"]
         ):
             return
-        from core.decision_context import build_decision_context
+        from core.decision_context import build_decision_context, qq_identity
         from core.qq_authority import actor_from_event
         actor = actor_from_event(event)
         decision_context = build_decision_context(self.memory, session, scope, event, actor=actor)
@@ -1078,6 +1188,8 @@ class MiniBotApp:
             readonly=True,
             actor=actor,
             decision_context=decision_context,
+            speaker=qq_identity(event) if isinstance(event, dict) else None,
+            user_message_at=event.get("time") if isinstance(event, dict) else None,
         )
         self._handle_proactive_notification(
             reply,
@@ -1208,13 +1320,19 @@ class MiniBotApp:
 
     def _start_napcat(self):
         from channels.napcat_channel import NapCatChannel
-        from channels.napcat_manager import NapCatManager
+        from channels.napcat_manager import NapCatManager, onebot_listening
 
         cfg = self.cfg["channels"]["napcat"]
         if cfg.get("auto_launch", True):
-            self.napcat_mgr = NapCatManager()
-            if not self.napcat_mgr.start(cfg.get("qq_number", "")):
-                raise RuntimeError("NapCat启动失败，请检查安装或使用外部NapCat")
+            if onebot_listening(cfg["ws_url"]):
+                # 上一次运行的 NapCat / 外部实例还在监听：接管它，绝不再拉一个 QQ。
+                self.napcat_mgr = NapCatManager()
+                if not self.napcat_mgr.adopt():
+                    self.napcat_mgr = None
+            else:
+                self.napcat_mgr = NapCatManager()
+                if not self.napcat_mgr.start(cfg.get("qq_number", "")):
+                    raise RuntimeError("NapCat启动失败，请检查安装或使用外部NapCat")
         self.napcat_channel = NapCatChannel(
             cfg["ws_url"], cfg["access_token"], self.submit_query, self._observe_qq, self.qq_policy
         )
@@ -1283,9 +1401,17 @@ class MiniBotApp:
             except Exception as exc:
                 log("App", "restart.quit_error", error=str(exc)[:200])
 
-    def stop(self):
-        if self._stop.is_set():
+    def stop(self, keep_napcat=None):
+        """收尾。keep_napcat=None 时按“是否正在重启”自动判断。
+
+        /restart 只重启 MiniBot 本体：NapCat / QQ 必须原地活着，否则每重启一次
+        就要重新扫码，而且强杀 QQ 会清掉免密登录凭证（passkey.json）。
+        """
+        if keep_napcat is None:
+            keep_napcat = self._restart_requested
+        if getattr(self, "_stopped", False):
             return
+        self._stopped = True
         self._stop.set()
         self._unsubscribe()
         self.harness.stop()
@@ -1293,7 +1419,10 @@ class MiniBotApp:
         if self.napcat_channel:
             self.napcat_channel.stop()
         if self.napcat_mgr:
-            self.napcat_mgr.stop()
+            if keep_napcat:
+                self.napcat_mgr.detach()
+            else:
+                self.napcat_mgr.stop()
         self.dispatcher.shutdown()
         if self.settings_server:
             self.settings_server.shutdown()

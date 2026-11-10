@@ -10,3 +10,12 @@ def execute(context):
     else:
         args = {k: v for k, v in (context or {}).items() if k != "_minibot"}
     return ego_execute(args)
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from core.skill_cli import main
+
+    raise SystemExit(main(execute))

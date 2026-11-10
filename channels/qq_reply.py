@@ -103,7 +103,7 @@ def media_segment(kind, source, event):
         from core.qq_authority import tool_access
         from core.decision_context import qq_scope
         actor_scope = qq_scope(event) + (":user:" + str(event.get("user_id", "")) if event.get("message_type") == "group" else "")
-        if event.get("message_type") not in ("private", "group") or not (tool_access(actor_scope, "read_file") or tool_access(actor_scope, "register_media")):
+        if event.get("message_type") not in ("private", "group") or not (tool_access(actor_scope, "read") or tool_access(actor_scope, "register_media")):
             raise ValueError("当前会话无权发送本机媒体文件")
         if urllib.parse.urlsplit(cfg["ws_url"]).hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("远程NapCat无法读取本机路径，请使用媒体URL")

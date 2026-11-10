@@ -208,7 +208,9 @@ def anysearch(args):
 def execute(name, args):
     if name == "qq_games":
         from core.qq_games import play
-        return play(args)
+        # 技能脚本通过环境变量把当前会话带进来，保证不同群各存一局游戏。
+        scope = os.environ.get("MINIBOT_SKILL_SCOPE") or "local:games"
+        return play(args, scope=f"qq:games:{scope}")
     if name == "anysearch":
         return anysearch(args)
     if name == "stt":

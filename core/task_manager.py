@@ -59,9 +59,13 @@ class BackgroundTask:
         self._tail_bytes = 0
 
         # Subprocess spawn
-        env_vars = env
+        env_vars = dict(env if env is not None else os.environ)
         if clean_env:
-            env_vars = clean_environment(env)
+            env_vars = clean_environment(env_vars)
+        # 中文 Windows 下 python 子进程 stdout 默认按 GBK(cp936) 输出，
+        # _drain_output 却按 UTF-8 读，中文会整段变成替换字符。统一让子进程
+        # 输出 UTF-8；PowerShell / cmd 自身的 GBK 报错由解码回退兜住。
+        env_vars.setdefault("PYTHONIOENCODING", "utf-8")
 
         flags = (
             {
@@ -116,7 +120,11 @@ class BackgroundTask:
     def _drain_output(self):
         try:
             for line in iter(self.proc.stdout.readline, b""):
-                text = line.decode("utf-8", errors="replace")
+                try:
+                    text = line.decode("utf-8")
+                except UnicodeDecodeError:
+                    # PowerShell / cmd 自己写的报错常是 GBK 字节，按 UTF-8 会全变问号。
+                    text = line.decode("gbk", errors="replace")
                 self._append_chunk(text)
         except Exception:
             pass

@@ -174,9 +174,48 @@ class MediaReferenceTests(Fixture):
         self.assertEqual(wrong[0]['type'], 'text')
         self.assertIn('附件发送失败', wrong[0]['data']['text'])
 
+    def test_notification_sends_media_separately_and_never_puts_ref_in_text(self):
+        """定时任务/主动提醒：占位符不上屏，图片单独发一条。
+
+        群里出现过「正文里跟着 ![图片](media://img_x) 原文、图片却没发」——推送
+        路径走的是纯文本 `_send`，根本没解析占位。这里把这条路径钉住。
+        """
+        ref = self.asset['media_ref']
+        text = '点赞好啦\n![图片](media://' + ref + ')'
+        channel = NapCatChannel()
+
+        async def run():
+            channel._loop = asyncio.get_running_loop()
+
+            async def acknowledge(raw):
+                payload = json.loads(raw)
+                channel._pending[payload['echo']].set_result(
+                    {'status': 'ok', 'retcode': 0, 'data': {'message_id': 7}})
+
+            channel._ws = AsyncMock()
+            channel._ws.send.side_effect = acknowledge
+            return await channel._send_notification_async('qq_private', '123', text)
+
+        self.assertTrue(asyncio.run(run()))
+        payloads = [json.loads(c.args[0]) for c in channel._ws.send.call_args_list]
+        segments = [m['params']['message'][0] for m in payloads]
+        self.assertEqual([s['type'] for s in segments], ['text', 'image'])
+        self.assertEqual(segments[0]['data']['text'], '点赞好啦')
+        self.assertNotIn('media://', segments[0]['data']['text'])
+        self.assertTrue(segments[1]['data']['file'].startswith('file:'))
+        # 媒体发送成功后要和消息 id 绑定，后续引用才能复用
+        self.assertEqual(self.store.list(self.scope, message_id='7')[0]['media_ref'], ref)
+
+    def test_strip_media_links_removes_placeholder_only(self):
+        from core.media_store import strip_media_links
+
+        self.assertEqual(strip_media_links('好耶\n![图片](media://img_x)\n'), '好耶')
+        self.assertEqual(strip_media_links('没有媒体的正文'), '没有媒体的正文')
+        self.assertEqual(strip_media_links(None), '')
+
     def test_workspace_relative_writes_and_register_preview_tools(self):
         harness = AgentHarness(None, FakeJev(), self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        result = harness._dispatch_tool('write_file', {'file_path': 'notes/output.txt', 'content': 'workspace'}, scope='local')
+        result = harness._dispatch_tool('write', {'file_path': 'notes/output.txt', 'content': 'workspace'}, scope='local')
         self.assertTrue(result['ok'])
         self.assertEqual((workspace_for('local') / 'notes/output.txt').read_text(), 'workspace')
         image = workspace_for('local') / 'sample.png'
@@ -345,12 +384,17 @@ class MediaReferenceTests(Fixture):
             def stream_chat_and_tools(inner, messages, tools=None):
                 inner.calls += 1
                 if inner.calls == 1:
-                    self.assertIn('execute_skill', [tool['function']['name'] for tool in tools])
-                    self.assertIn('execute_command', [tool['function']['name'] for tool in tools])
-                    self.assertIn('activate_skill', [tool['function']['name'] for tool in tools])
+                    # 技能已改纯 Markdown 指令：模型侧不再有技能执行工具。
+                    names = [tool['function']['name'] for tool in tools]
+                    self.assertNotIn('execute_skill', names)
+                    # 工具名与 pi 一致：schema 里就是实现名，没有别名层。
+                    self.assertIn('bash', names)
+                    self.assertIn('read', names)
+                    self.assertIn('edit', names)
+                    self.assertIn('write', names)
                     self.assertIn('image_gen', messages[0]['content'])
                     return '', [{'id': 'edit', 'type': 'function', 'function': {
-                        'name': 'execute_skill', 'arguments': json.dumps({'skill_name': 'image_gen', 'arguments': {'mode': 'edit'}})}}], {}
+                        'name': 'list_skills', 'arguments': '{}'}}], {}
                 yield 'text_delta', '已处理'
                 return '已处理', [], {}
 
@@ -363,12 +407,12 @@ class MediaReferenceTests(Fixture):
         harness.run('修改引用的图片', scope=scope, session_id=scope, channel='qq_group', allow_tools=MiniBotApp.identity(event)[4])
         tool_results = [json.loads(m['content']) for m in self.memory.get_history(scope)[0] if m['role'] == 'tool']
         self.assertTrue(tool_results[0]['ok'])
-        self.assertTrue(harness._dispatch_tool('write_file', {'file_path': 'owner.txt', 'content': 'x'}, scope=scope)['ok'])
-        self.assertFalse(harness._dispatch_tool('write_file', {'file_path': 'other.txt', 'content': 'x'}, scope='qq:group:88:user:456')['ok'])
+        self.assertTrue(harness._dispatch_tool('write', {'file_path': 'owner.txt', 'content': 'x'}, scope=scope)['ok'])
+        self.assertFalse(harness._dispatch_tool('write', {'file_path': 'other.txt', 'content': 'x'}, scope='qq:group:88:user:456')['ok'])
         self.assertFalse(harness._dispatch_tool('execute_skill', {'skill_name': 'image_gen'}, scope='qq:group:88:user:456')['ok'])
         config.save_config({'channels': {'napcat': {'allow_owner_tools': False}}})
         self.assertFalse(MiniBotApp.identity(event)[4])
-        self.assertFalse(harness._dispatch_tool('write_file', {'file_path': 'revoked.txt', 'content': 'x'}, scope=scope)['ok'])
+        self.assertFalse(harness._dispatch_tool('write', {'file_path': 'revoked.txt', 'content': 'x'}, scope=scope)['ok'])
         self.assertFalse(harness._dispatch_tool('execute_skill', {'skill_name': 'image_gen'}, scope=scope)['ok'])
 
     def test_fabricated_media_reply_is_not_reported_as_success(self):

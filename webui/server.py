@@ -1154,7 +1154,6 @@ class ConfigServerHandler(BaseHTTPRequestHandler):
                 self._set_headers(400)
                 self.wfile.write(json.dumps({"success": False, "error": "当前任务正在执行中，请先停止任务后再清空"}, ensure_ascii=False).encode("utf-8"))
                 return
-            scope = session_id.split(":")[1] if ":" in session_id else "main"
             app.memory.clear_session(session_id)
             if session_id.startswith("web:main") or session_id in ("local:pet", "web:main"):
                 app.memory.clear_session("local:pet")
@@ -1176,12 +1175,6 @@ class ConfigServerHandler(BaseHTTPRequestHandler):
                 # 置顶会话清空后要立刻把名字与置顶标记写回去，
                 # 否则下次刷新会退化成一条普通会话。
                 ensure_assistant_session(app)
-            else:
-                app.memory.save_task_state(session_id, {
-                    "original_goal": "新对话",
-                    "status": "awaiting_input",
-                    "scope": scope
-                })
             _turn_reset(session_id)
             broadcast_sse(session_id, "session_cleared", {"session_id": session_id})
             self._set_headers(200)
