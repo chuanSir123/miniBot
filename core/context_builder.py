@@ -45,7 +45,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from core import pi_prompt
 
@@ -76,7 +76,7 @@ TOOL_SNIPPETS: Dict[str, str] = {
     "get_media": "查单个媒体元数据与预览",
     "register_media": "把本机媒体文件登记为 media_ref",
     "forget_meme": "从表情库删掉不该再发的表情包，并记住它别再收录",
-    "manage_permissions": "按主人授权意图调整权限",
+    "manage_permissions": "查询/授予/撤销工具与技能权限（查询所有人可用，授予仅主人）",
     "restart_bot": "重启 MiniBot 本体进程（改完配置/技能后生效）",
     "schedule_reminder": "建持久化提醒或条件跟进",
     "list_reminders": "查当前提醒",

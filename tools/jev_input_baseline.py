@@ -72,17 +72,6 @@ def main():
         print("questions 顺序:", list(captured["questions"]))
         print("verdict:", verdict, " last_confidence:", jev.last_confidence)
 
-    # select_fixed_action
-    for prompt in ("发最后一张图", "把文件改一下"):
-        orig = jev.decide_raw
-        jev.decide_raw = spy
-        action = jev.select_fixed_action(prompt, context={"recent_media": [{"media_ref": "m1", "mime": "image/jpeg"}]})
-        jev.decide_raw = orig
-        print(f"\n=== select_fixed_action / {prompt} ===")
-        print("state 键顺序:", list(captured["state"]))
-        print("state:", json.dumps(captured["state"], ensure_ascii=False)[:300])
-        print("action:", action)
-
     # classify_steering_intent
     for prompt in ("继续", "另外查一下天气"):
         orig = jev.decide_raw

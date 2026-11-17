@@ -162,6 +162,7 @@ class TestWorkspaceAndSteering(unittest.TestCase):
         app.dispatcher = MagicMock()
         app._stop = threading.Event()
         app.pet_widget = None
+        app.proactive = MagicMock()
 
         # 1. Pet identity uses main workspace
         scope, session, channel, target, tools = app.identity(None)
@@ -182,15 +183,32 @@ class TestWorkspaceAndSteering(unittest.TestCase):
         self.assertEqual(scope, "qq_group_88888")
         self.assertEqual(session, "qq:group:88888")
 
-        # 4. Concurrency: When session is running, non-steering intent submits to async concurrent session
+        # 4. 会话在跑 + 非引导：默认排在同一会话后面（两份 harness 并发写同一份
+        #    历史/检查点会互相覆盖），busy_policy=async 时才另开 :async: 并发会话。
         app.harness.is_session_active.return_value = True
         with patch.object(app.jev, "classify_steering_intent", return_value="independent_task"):
             app.submit_query("今天天气怎么样", custom_scope="main", custom_session="web:main:1")
+            self.assertEqual(app.dispatcher.submit.call_args.args[0], "web:main:1")
+
+        from core.config import load_config
+        real_cfg = load_config()
+        async_cfg = {**real_cfg, "runtime": {**real_cfg.get("runtime", {}), "busy_policy": "async"}}
+        with (
+            patch("main.load_config", return_value=async_cfg),
+            patch.object(app.jev, "classify_steering_intent", return_value="independent_task"),
+        ):
+            app.submit_query("今天天气怎么样", custom_scope="main", custom_session="web:main:1")
             submitted_session = app.dispatcher.submit.call_args.args[0]
-            # Should be an async concurrent session ID!
             self.assertTrue(":async:" in submitted_session)
 
+        # 4b. 会话空闲时根本不问 Jev：两个分支落点相同，这次 HTTP 是纯等待。
+        app.harness.is_session_active.return_value = False
+        with patch.object(app.jev, "classify_steering_intent",
+                          side_effect=AssertionError("空闲时不该调用意图判定")):
+            app.submit_query("今天天气怎么样", custom_scope="main", custom_session="web:main:2")
+
         # 5. Steering: When session is running and intent is steering, injects steering directly
+        app.harness.is_session_active.return_value = True
         app.harness.inject_steering.return_value = True
         with patch.object(app.jev, "classify_steering_intent", return_value="steering"):
             fut = app.submit_query("不对，改一下端口为9000", custom_scope="main", custom_session="web:main:1")

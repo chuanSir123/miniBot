@@ -22,6 +22,10 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.db"
 # 换来确定性：宁可在 DB 上排队几毫秒，也不要随机丢一次写入。
 _DB_LOCK = threading.RLock()
 
+# 已经建过表的库（路径 → 是否有 FTS）。建表语句本身幂等，但整套 DDL + 探测
+# 没必要每个实例跑一遍；库文件被删掉时下面的 exists() 会让它重新建。
+_SCHEMA_READY = {}
+
 # 会话语种：私聊只带 QQ 号，群聊可能带发送者后缀（qq:group:1:user:2）。
 _PRIVATE_SESSION = re.compile(r"qq:private:(\d+)")
 _GROUP_SESSION = re.compile(r"qq:group:(\d+)(?::user:\d+)?")
@@ -43,6 +47,15 @@ class MiniMemory:
     def __init__(self, db_path=DB_PATH):
         self.db_path = str(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        # 建表是幂等 DDL，但整套 executescript + table_info 探测在同一个文件上只需跑
+        # 一次。meme.py / qq_games.py 会随手 new 一个 MiniMemory，重复跑就是白花几十毫秒。
+        with _DB_LOCK:
+            ready = _SCHEMA_READY.get(self.db_path)
+        if ready is not None and Path(self.db_path).exists():
+            self.has_fts = ready
+            from core.goals import GoalManager
+            self.goals = GoalManager(self)
+            return
         with self._get_conn() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -101,6 +114,8 @@ class MiniMemory:
                 self.has_fts = True
             except sqlite3.OperationalError:
                 self.has_fts = False
+        with _DB_LOCK:
+            _SCHEMA_READY[self.db_path] = bool(self.has_fts)
         from core.goals import GoalManager
         self.goals = GoalManager(self)
 
@@ -110,6 +125,10 @@ class MiniMemory:
             db = sqlite3.connect(self.db_path, timeout=10)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA busy_timeout=10000")
+            # WAL 下 synchronous=NORMAL 只丢"最后一次 checkpoint 之后"的事务，
+            # 不会损坏库；默认的 FULL 是每次 commit 一次 fsync，实测单条 insert
+            # 从 1~2ms 涨到 80ms。这个库存的是聊天历史和记忆，承受得住掉最后一条。
+            db.execute("PRAGMA synchronous=NORMAL")
             try:
                 with db:
                     yield db

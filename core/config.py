@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "vlm": {
@@ -58,6 +58,10 @@ DEFAULT_CONFIG["runtime"] = {
     "max_workers": 10,
     "queue_size": 16,
     "max_turns": 100,
+    # 会话正在跑任务时，又来了**一条不属于引导**的消息怎么办：
+    # queue = 排在正在跑的任务后面（同一会话一次只跑一件事，历史/检查点不会互相踩），
+    # async = 另开 :async: 会话并发跑（回应快，但两个 harness 会同时写同一份历史）。
+    "busy_policy": "queue",
     "max_output_chars": 12000,
     "request_timeout_sec": 45,
     # finish_reason 之后等待网关补发 usage/[DONE] 的收尾窗口秒数；
@@ -112,7 +116,7 @@ DEFAULT_CONFIG["persona"] = {
     "examples": [],
 }
 DEFAULT_CONFIG["runtime"].update({"verify_completion": True, "completion_retries": 3,
-                                  "jev_noarg_enabled": True, "verify_chat": False})
+                                  "verify_chat": False})
 DEFAULT_CONFIG["memory"] = {
     "retention_days": 30,
     "max_events": 50000,
@@ -121,9 +125,16 @@ DEFAULT_CONFIG["memory"] = {
 DEFAULT_CONFIG["meme"] = {
     # 入库时用 VLM 给图片打标签（没有自带标签、文件名也看不出来时才调）。
     "auto_tag": True,
-    # 分批上限：服务端单请求最多 64 个 question（含 none），所以一批给 63 个标签打分。
-    # 63 × 4 ≈ 250 个标签，够覆盖正常图库；再多该做的是标签归一，不是继续加批。
+    # 分批上限：noul 一个 question 只能问一个标签，服务端单请求最多 64 个 question
+    # （含 none），所以直打时一批 63 个标签。只在 jev_coarse_mode="noul" 时生效。
     "tag_max_rounds": 4,
+    # 表情包打分分两段：choice 粗排（一个 question 装 255 个标签）→ noul 精判候选 + none。
+    # choice 容量是 noul 的 4 倍且批内排序更干净；设成 "noul" 可退回旧的直打方式。
+    "jev_coarse_mode": "choice",
+    # 粗排每批保留几个候选进精判（255 个里通常只有个位数真相关）。
+    "jev_coarse_top_k": 6,
+    # 一个请求里装几个 choice question（255 × 4 = 1020 个标签/轮）。
+    "jev_coarse_questions": 4,
     # 关掉就退化成「标签字面出现在回复里才发」的保守模式。
     "use_jev": True,
     # 一条消息最多采集几张图入库（还受 channels.napcat.max_images 限制）。
@@ -133,6 +144,10 @@ DEFAULT_CONFIG["meme"] = {
     # 静默采集范围：群聊发的图、私聊发的图都会入库（来源标签分别记 group_stealer / private_stealer）。
     "collect_group": True,
     "collect_private": True,
+    # 打标专用 VLM，留空则回退到 vlm 段；多 key 轮询分摊单 key 30 次/分钟的限流。
+    "vlm_model": "",
+    "vlm_base_url": "",
+    "vlm_api_keys": [],
 }
 DEFAULT_CONFIG["skills"] = {
     "timeout_sec": 15,
@@ -162,7 +177,6 @@ DEFAULT_CONFIG["channels"]["napcat"].update(
         "allowed_user_ids": [],
         "allowed_group_ids": [],
         "group_require_at": True,
-        "allow_owner_tools": False,
         "listen_groups": False,
     }
 )
@@ -187,17 +201,17 @@ DEFAULT_CONFIG["channels"]["napcat"].update({
     "private_allow_all": True, "group_members_all": False, "group_allow_all": False,
     "group_smart_reply": True, "reply_threshold": 0.72,
     "blacklisted_user_ids": [], "auto_blacklist": True, "auto_blacklist_threshold": 0.98,
-    "max_images": 9, "media_roots": [], "permission_grants": [],
+    "max_images": 10, "media_roots": [], "permission_grants": [],
     # 群成员职位（群主/管理员/成员）：
     # group_role_verify —— 职位来自 get_group_member_info 核验，而不是只信事件字段。
     # 职位只用于让 bot 知道"这条是谁说的"，**不参与任何授权**：能否执行工具与技能
-    # 一律看主人配置里的授权表与 allow_owner_tools 总开关，只有主人能授权。
+    # 一律看主人配置里的授权表，默认不授权，只有主人能授予或撤销。
+    # permission_grants 的 user_id 可用 "*" 表示所有人，scope 可用 "all" 表示全局。
     "group_role_verify": True,
+    # auto_relogin —— 盯 QQ 登录态：被踢下线/票据失效后自动向 NapCat WebUI 重新
+    # 申请二维码并打印到控制台（NapCat 自己不会重开登录服务）。关掉就只剩手动扫码。
+    "auto_relogin": True,
 })
-
-
-def get_config_path():
-    return CONFIG_FILE_PATH
 
 
 def _merge(base, patch):
@@ -224,8 +238,8 @@ def validate_config(cfg):
             raise ValueError("permission_grants的QQ号或allow字段无效")
         if row.get("scope") not in ("all", "private") and not re.fullmatch(r"group:\d+", str(row.get("scope", ""))):
             raise ValueError("permission_grants范围无效")
-        if row.get("user_id") == "*" and not str(row.get("scope", "")).startswith("group:"):
-            raise ValueError("全体成员授权只能限定到具体群")
+        if row.get("user_id") == "*" and row.get("scope") == "private":
+            raise ValueError("全体成员授权不能限定到私聊范围")
         if row.get("kind") not in ("tool", "skill") or not isinstance(row.get("name"), str) or not row["name"]:
             raise ValueError("permission_grants能力字段无效")
         for field in ("expires_at", "updated_at"):
@@ -558,7 +572,17 @@ def save_config(cfg):
 
 
 def is_configured():
-    return bool(load_config()["vlm"].get("api_key", "").strip())
+    vlm = load_config()["vlm"]
+    if str(vlm.get("api_key") or "").strip():
+        return True
+    # 顶层留空时，默认模型条目的独立 Key 也算已配置（可填逗号分隔的多个）。
+    try:
+        for model in get_vlm_models():
+            if model.get("is_default"):
+                return bool(str(model.get("api_key") or "").strip())
+    except Exception:
+        pass
+    return False
 
 
 def get_vlm_models(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

@@ -374,7 +374,7 @@ class MediaReferenceTests(Fixture):
         self.assertEqual(result['path'], str(workspace_for(self.scope) / 'artifact.txt'))
 
     def test_group_owner_has_full_tools_and_nonowner_is_still_denied(self):
-        config.save_config({'channels': {'napcat': {'owner_ids': ['123'], 'allow_owner_tools': True}}})
+        config.save_config({'channels': {'napcat': {'owner_ids': ['123']}}})
         manager = SkillManager(self.root / 'skills')
         manager.register_new_skill('image_gen.py', 'def execute(context): return {"ok": True, "output": "edited"}', activate=True)
 
@@ -402,18 +402,21 @@ class MediaReferenceTests(Fixture):
         scope = 'qq:group:88:user:123'
         from main import MiniBotApp
         event = {'message_type': 'group', 'group_id': 88, 'user_id': 123}
+        # identity() 的第五个值只决定文件台账，不再承担权限判定。
         self.assertTrue(MiniBotApp.identity(event)[4])
-        self.assertFalse(MiniBotApp.identity(dict(event, user_id=456))[4])
-        harness.run('修改引用的图片', scope=scope, session_id=scope, channel='qq_group', allow_tools=MiniBotApp.identity(event)[4])
+        self.assertTrue(MiniBotApp.identity(dict(event, user_id=456))[4])
+        harness.run('修改引用的图片', scope=scope, session_id=scope, channel='qq_group', allow_tools=True)
         tool_results = [json.loads(m['content']) for m in self.memory.get_history(scope)[0] if m['role'] == 'tool']
         self.assertTrue(tool_results[0]['ok'])
         self.assertTrue(harness._dispatch_tool('write', {'file_path': 'owner.txt', 'content': 'x'}, scope=scope)['ok'])
         self.assertFalse(harness._dispatch_tool('write', {'file_path': 'other.txt', 'content': 'x'}, scope='qq:group:88:user:456')['ok'])
         self.assertFalse(harness._dispatch_tool('execute_skill', {'skill_name': 'image_gen'}, scope='qq:group:88:user:456')['ok'])
-        config.save_config({'channels': {'napcat': {'allow_owner_tools': False}}})
-        self.assertFalse(MiniBotApp.identity(event)[4])
-        self.assertFalse(harness._dispatch_tool('write', {'file_path': 'revoked.txt', 'content': 'x'}, scope=scope)['ok'])
-        self.assertFalse(harness._dispatch_tool('execute_skill', {'skill_name': 'image_gen'}, scope=scope)['ok'])
+        # 撤销授权表里的主人条目也削不掉 owner_ids 赋予的身份。
+        from core.qq_authority import manage_permissions, tool_access
+        from core.harness import HARNESS_TOOLS
+        manage_permissions(scope, {'action': 'revoke', 'user_id': '123', 'tools': ['write']},
+                           {t['function']['name'] for t in HARNESS_TOOLS})
+        self.assertTrue(tool_access(scope, 'write'))
 
     def test_fabricated_media_reply_is_not_reported_as_success(self):
         class Brain:

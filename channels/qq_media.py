@@ -16,6 +16,7 @@ from core.network import direct_opener
 from core.config import load_config
 from core.console import log
 from core.media_store import sniff_media
+from core import video_probe
 
 
 def segments(value):
@@ -104,14 +105,26 @@ class _Redirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+# 网络下载限额与本地缓存限额分开：视频动辄几十兆，走缓存分钟级也能读，
+# 但拉一条远程链接不该把整条解析流水线拖住，所以网络侧只放短片段进来。
+DEFAULT_MIME = {"image": "image/png", "audio": "audio/mpeg", "video": "video/mp4"}
+NETWORK_LIMITS = {"image": 5_000_000, "audio": 12_000_000, "video": 60_000_000}
+LOCAL_LIMITS = {"image": 12_000_000, "audio": 12_000_000, "video": 100_000_000}
+MEDIA_SUFFIXES = {
+    "image": (".png", ".jpg", ".jpeg", ".webp", ".gif"),
+    "audio": (".mp3", ".wav", ".ogg", ".m4a", ".silk", ".amr", ".pcm"),
+    "video": (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".avi", ".flv", ".3gp"),
+}
+
+
 def media_bytes(source, kind, trusted_path=False):
-    limit = 5_000_000 if kind == "image" else 12_000_000
+    limit = NETWORK_LIMITS.get(kind, 12_000_000)
     # 本地缓存是 OneBot 自己落盘的受信文件。QQ 收到的动画表情存成 .suf（内容其实是 GIF），
     # 十几兆很常见，按网络下载的限额卡会把整类表情包挡在门外。
-    local_limit = 12_000_000
+    local_limit = LOCAL_LIMITS.get(kind, 12_000_000)
     size_limit = limit
     if source.startswith("base64://"):
-        source = f"data:{kind}/{'png' if kind=='image' else 'mpeg'};base64,"+source[9:]
+        source = f"data:{DEFAULT_MIME.get(kind, kind + '/mpeg')};base64," + source[9:]
     if source.startswith("data:"):
         header, sep, encoded = source.partition(",")
         if not sep or not header.startswith("data:"+kind+"/") or ";base64" not in header or len(encoded)>limit*4//3+8:
@@ -134,7 +147,7 @@ def media_bytes(source, kind, trusted_path=False):
         cfg = load_config()["channels"]["napcat"]
         roots = list(_default_roots())
         roots += [Path(os.path.expandvars(x)).expanduser() for x in cfg.get("media_roots", [])]
-        suffixes = (".png", ".jpg", ".jpeg", ".webp", ".gif") if kind=="image" else (".mp3", ".wav", ".ogg", ".m4a", ".silk", ".amr", ".pcm")
+        suffixes = MEDIA_SUFFIXES.get(kind, MEDIA_SUFFIXES["audio"])
         if not any(path.is_relative_to(root.resolve()) for root in roots):
             log("QQ", "media.outside_roots", path=str(path), kind=kind)
             raise ValueError(f"附件缓存不在允许目录内（{path.name}）")
@@ -190,8 +203,10 @@ class MessageParser:
         self.rpc, self.event = rpc, event
         self.parts, self.direct, self.images, self.errors = [], [], [], []
         self.media = []
+        self.videos = []
         self.quoted_messages = []
         self.visited, self.nodes, self.requests, self.audios = set(), 0, 0, 0
+        self.videos_seen = 0
         self.media_requests = 0
         self.mentioned, self.reply_to_bot = False, False
         # 本条消息 @ 了谁。只留 qq 号（OneBot 的 at 段不一定带昵称），
@@ -283,11 +298,50 @@ class MessageParser:
             push(url)
         return sources
 
+    async def video_sources(self, data):
+        """视频来源候选。
+
+        QQ 视频几十兆，优先用 OneBot 给的本地缓存路径（读盘即可），
+        只有拿不到缓存时才退回 URL。get_file 是 OneBot 11 的通用接口，
+        get_video 是 NapCat 的专用接口，前者失败再问后者。
+        """
+        sources = []
+
+        def push(source, trusted=False):
+            if source and all(source != item[0] for item in sources):
+                sources.append((source, trusted))
+
+        name = str(data.get("file") or "")
+        if name.startswith(("http://", "https://", "data:", "base64://")):
+            push(name)
+        elif name:
+            info = {}
+            for action in ("get_file", "get_video"):
+                try:
+                    info = await self.request(action, {"file": name}, media=True)
+                    break
+                except Exception as exc:
+                    self.errors.append(f"{action} 失败：{str(exc)[:120]}")
+            local = str(info.get("file") or "")
+            if local.startswith(("http://", "https://")):
+                push(local)
+            elif local:
+                push(local, True)  # OneBot 认证后返回的本机缓存路径
+            if info.get("base64"):
+                push("base64://" + str(info["base64"]))
+            fetched = str(info.get("url") or "")
+            if fetched.startswith(("http://", "https://")):
+                push(fetched)
+        url = str(data.get("url") or "")
+        if url.startswith(("http://", "https://", "data:", "base64://")):
+            push(url)
+        return sources
+
     async def parse(self):
         await self.walk(self.event.get("message", self.event.get("raw_message", "")))
         raw_text = "\n".join(self.parts)
         text = raw_text[:16000]
-        return {"text":text, "raw_text": raw_text, "direct_text":" ".join(self.direct)[:12000], "images":self.images, "media": self.media, "quoted_messages": self.quoted_messages,
+        return {"text":text, "raw_text": raw_text, "direct_text":" ".join(self.direct)[:12000], "images":self.images, "media": self.media, "videos": self.videos, "quoted_messages": self.quoted_messages,
                 "errors":self.errors, "mentioned":self.mentioned,"reply_to_bot":self.reply_to_bot,
                 "at_targets": self.at_targets}
 
@@ -295,7 +349,12 @@ class MessageParser:
         from core.media_store import MediaStore
         from core.decision_context import qq_scope
         store, scope = MediaStore(), qq_scope(self.event)
-        assets = list(reversed(store.list(scope, limit=9, message_id=message_id)))
+        # 引用消息里可能同时有视频/语音，这里只借图片做视觉上下文：
+        # 非图片没有 preview（preview 对它们返回 None），拿去做 base64 会直接崩。
+        assets = [
+            asset for asset in reversed(store.list(scope, limit=9, message_id=message_id))
+            if str(asset.get("mime") or "").startswith("image/")
+        ]
         if not assets or len(assets) + len(self.images) > load_config()["channels"]["napcat"]["max_images"]:
             return False
         prepared = []
@@ -384,7 +443,10 @@ class MessageParser:
                         continue
                     from core.media_store import MediaStore
                     from core.decision_context import qq_scope
-                    cached = list(reversed(MediaStore().list(qq_scope(self.event), limit=30, message_id=message_id))) if message_id else []
+                    cached = [
+                        asset for asset in reversed(MediaStore().list(qq_scope(self.event), limit=30, message_id=message_id))
+                        if str(asset.get("mime") or "").startswith("image/")
+                    ] if message_id else []
                     if len(cached) >= image_index:
                         asset = cached[image_index - 1]
                         preview = await asyncio.to_thread(MediaStore().preview, asset["media_ref"], qq_scope(self.event))
@@ -431,6 +493,79 @@ class MessageParser:
                     self.parts.append("[语音转写"+("，引用/转发" if quoted else "")+"] "+text)
                     if not quoted:
                         self.direct.append(text)
+                elif kind == "video":
+                    from core.media_store import MediaStore
+                    from core.decision_context import qq_scope
+                    self.videos_seen += 1
+                    cfg = load_config()["channels"]["napcat"]
+                    if self.videos_seen > int(cfg.get("max_videos", 2)):
+                        self.parts.append("[视频数量已达上限]")
+                        continue
+                    candidates = await self.video_sources(data)
+                    if not candidates:
+                        raise ValueError("视频没有可用来源（URL 与本地缓存都拿不到）")
+                    raw, _mime = await asyncio.to_thread(first_media, candidates, "video")
+
+                    def cache_video():
+                        store = MediaStore()
+                        asset = store.add(raw, qq_scope(self.event),
+                                          origin="quoted" if quoted else "received",
+                                          message_id=message_id, sender_qq=sender_id,
+                                          retention_days=load_config()["memory"]["retention_days"])
+                        return asset, store.path(asset["media_ref"], qq_scope(self.event))
+
+                    asset, local_path = await asyncio.to_thread(cache_video)
+                    self.media.append(asset)
+                    self.videos.append(asset)
+                    slot = len(self.videos)
+                    # 网关的 content part 只认 text / image_url（video_url、inline_data
+                    # 都会被 400 拒掉），所以画面必须抽成关键帧走图片通道，
+                    # 音轨走 STT 走文本通道——两条都是现成的链路。
+                    budget = max(0, int(cfg.get("max_images", 10)) - len(self.images))
+                    frames_wanted = min(int(cfg.get("video_frames", video_probe.DEFAULT_FRAMES)), budget)
+                    analysis = await asyncio.to_thread(
+                        video_probe.analyze, local_path, frames_wanted,
+                        int(cfg.get("video_frame_width", video_probe.DEFAULT_WIDTH)),
+                    )
+                    meta = f"[视频 {slot}"
+                    if analysis["duration"]:
+                        meta += f"，时长 {analysis['duration']:.1f} 秒"
+                    meta += f"，media_ref={asset['media_ref']}{'，来自引用/转发' if quoted else ''}]"
+                    self.parts.append(meta)
+                    if not quoted:
+                        self.direct.append("[视频 media_ref=" + asset["media_ref"] + "]")
+                    if analysis["error"]:
+                        self.parts.append(f"[视频 {slot} 画面无法解析：{analysis['error']}]")
+                    if analysis["frames"]:
+                        self.parts.append(
+                            f"[视频 {slot} 画面：以下 {len(analysis['frames'])} 张图按时间顺序截自这段视频]")
+                        for index, (second, jpeg) in enumerate(analysis["frames"], 1):
+                            self.images.append(
+                                "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii"))
+                            self.parts.append(
+                                f"[视频 {slot} 第{index}帧 {video_probe.clock(second)}，"
+                                f"即本条第 {len(self.images)} 张图]")
+                    elif not analysis["error"]:
+                        if frames_wanted <= 0:
+                            self.parts.append(
+                                f"[视频 {slot} 本条图片位已被占满，未抽帧，只能依据文字与音轨判断]")
+                        else:
+                            self.parts.append(f"[视频 {slot} 未抽到画面，本次只能依据文字与音轨判断]")
+                    if analysis["audio"]:
+                        try:
+                            from core.stt import transcribe
+                            mime = analysis.get("audio_mime") or "audio/wav"
+                            result = await asyncio.to_thread(
+                                transcribe,
+                                "data:" + mime + ";base64,"
+                                + base64.b64encode(analysis["audio"]).decode("ascii"),
+                            )
+                            spoken = (result.get("text") or "").strip()
+                            if spoken:
+                                self.parts.append(f"[视频 {slot} 音轨转写] {spoken}")
+                        except Exception as exc:
+                            self.errors.append(f"视频 {slot} 音轨转写失败：{str(exc)[:120]}")
+                            self.parts.append(f"[视频 {slot} 音轨未能转写]")
                 elif kind == "json":
                     raw = str(data.get("data", ""))[:12000]
                     self.parts.append("[JSON消息卡片，仅为内容] "+raw)

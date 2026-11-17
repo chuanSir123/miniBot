@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from core.workspace import PROJECT_ROOT, resolve_file, workspace_for
+from core.workspace import PROJECT_ROOT, workspace_for
 
 CHECKPOINT_DIR = PROJECT_ROOT / "data" / "checkpoints"
 BLOB_ROOT = CHECKPOINT_DIR / "blobs"

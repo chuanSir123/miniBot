@@ -207,7 +207,6 @@ class RepairLoopTests(Fixture):
         """
         reviewer = MagicMock()
         reviewer.is_configured.return_value = True
-        reviewer.select_fixed_action.return_value = None
         reviewer.last_error = ''
         class Brain:
             def __init__(self):
@@ -237,7 +236,6 @@ class RepairLoopTests(Fixture):
         模型拿旧目标去对齐新要求。
         """
         reviewer = MagicMock()
-        reviewer.select_fixed_action.return_value = None
         class Brain:
             def __init__(self):
                 self.calls = []
@@ -257,7 +255,6 @@ class RepairLoopTests(Fixture):
     def test_rejection_causes_actual_edit_retest_and_review(self):
         reviewer = MagicMock()
         reviewer.is_configured.return_value = True
-        reviewer.select_fixed_action.return_value = None
         reviewer.last_error = ''
         brain = MagicMock()
         harness = AgentHarness(brain, reviewer, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
@@ -308,7 +305,6 @@ class RepairLoopTests(Fixture):
         具体的：跑出来的失败就在那里，模型改不改是它的事，但回复不能宣称通过。
         """
         reviewer = MagicMock()
-        reviewer.select_fixed_action.return_value = None
         class Brain:
             def __init__(self):
                 self.n = 0

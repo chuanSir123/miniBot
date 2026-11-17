@@ -2,7 +2,8 @@
 
 链路分四段：
   收集  —— 本地目录扫描 + 群聊静默采集（保留原图，动图不会退化成首帧）
-  打标  —— 优先读图片自带元数据/文件名；拿不到再调 VLM 看图出标签
+  打标  —— 优先读图片自带元数据/文件名；拿不到再让 VLM 自由写出「这张图适合什么语境」。
+            送模型前动图统一取首帧、超限的压到 1024px JPEG（原图入库不动）
   汇总  —— meme_tags 表维护「每个标签下有几张图、被发过几次」
   打分  —— Jev 给每个标签打独立的分，取排名前三，图分 = 这三个标签的加权匹配度
 
@@ -22,6 +23,7 @@
 import base64
 import contextlib
 import hashlib
+import io
 import json
 import os
 import queue
@@ -53,8 +55,13 @@ MIME_EXT = {
 # 采集入库上限。表情包极少超过这个体积，超了多半是聊天里发的大图。
 # 但 QQ 的动画表情动辄十几兆（几百帧 GIF），卡太紧会把它们全拒收。
 MAX_STORED_BYTES = 12_000_000
-# 打标上限：base64 之后体积会涨 1/3，太大只会拖慢队列。
+# 送进 VLM 前的压缩阈值。不是弃打阈值：超过就先压成首帧 JPEG 再发。
+# 网关的请求体上限约 8MB（base64 会涨 1/3），超了直接 413/400 且要白等十几秒，
+# 所以宁可本地压到几十 KB。实测 222 帧 GIF 10.3MB → 22KB，标签照样准。
 MAX_TAGGED_BYTES = 5_000_000
+# 长边上限：1024 够模型看清配字和表情，再大只是烧 token。
+VLM_MAX_SIDE = 1024
+VLM_JPEG_QUALITY = 88
 MAX_TAGS_PER_MEME = 8
 # 判「同一张图」的画面容忍度：64 位 dHash 的汉明距离上限。
 # 取 6 是经验值——重编码、改尺寸一般落在 0~4 位，不同表情基本在 15 位以上。
@@ -100,18 +107,12 @@ EMOTION_KEYWORDS: Dict[str, List[str]] = {
     "shocked": ["吃惊", "震惊", "吓到", "真的吗", "天哪", "目瞪口呆", "震惊"],
 }
 
-# 给 VLM 的受控词表。故意收得窄：标签一散，汇总表就没法拿给 Jev 选，
-# 几百个近义词标签等于没有标签。允许它补 1 个词表外的词描述具体画面。
-SUGGESTED_TAGS: Sequence[str] = (
-    "开心", "大笑", "比心", "点赞", "鼓掌", "打call", "卖萌", "撒娇", "可爱", "害羞",
-    "疑惑", "无语", "震惊", "生气", "傲娇", "委屈", "难过", "哭泣", "叹气", "累了",
-    "睡觉", "吃饭", "加油", "摸鱼", "告辞", "谢谢", "拒绝", "赞同", "摇头", "盯",
-    "猫", "狗", "抱抱", "摸摸", "贴贴", "打滚", "探头", "偷看", "吃瓜", "哈欠",
-    "早安", "晚安", "打招呼", "再见", "打扰了", "求求", "凶", "白眼", "流汗", "捂脸",
-)
-
-TAG_VOCAB = "、".join(SUGGESTED_TAGS)
-
+# 打标不再给受控词表。词表会把每张图压成「开心/可爱/疑惑」这类万能词，
+# 而 Jev 是拿标签当语义描述去打分的：词越泛，越分不清「下班了」和「抢到票了」，
+# 选出来的图必然错配。放开之后标签几乎与图一一对应，给标签打分就等于给这张图的
+# 语境打分，排前三的标签能直接定位到具体图，不再是从泛情绪桶里随机抽一张。
+# 因此提示词只约束「写什么维度、别写成什么」，不约束「能写哪些词」。
+#
 # 报文类兜底文案（模型/网络故障）原样送出，不配表情——配了像是在报错上贴笑脸。
 # 「附件发送失败」同理：那条本身就是坏消息，后面跟张表情更像嘲讽。
 FAILURE_PREFIXES = (
@@ -120,28 +121,35 @@ FAILURE_PREFIXES = (
 )
 
 TAG_INSTRUCTION = (
-    "你是表情包图库的标注员。看这张图，先判断它是不是表情包，再决定输出。\n"
+    "你是表情包图库的语义标注员。看这张图，先判断它是不是表情包，再决定输出。\n"
     "只输出一个 JSON 数组，不要解释、不要 markdown、不要代码块。\n"
     "规则：\n"
     "0. 先判断这张图是不是「表情包」：表情包是用于聊天表达情绪/语气/笑点的图片，"
     "通常是卡通/动漫/截图配文字、动物拟人、夸张表情、梗图等。"
     "如果它只是普通照片、风景图、文档截图、代码截图、新闻图、商品图、头像等"
     "不适合当聊天表情发送的图，直接输出空数组 []，不要打任何标签。\n"
-    "1. 如果是表情包，输出 3 到 6 个中文短标签，必须优先从这些常用标签里挑最贴切的："
-    f"{TAG_VOCAB}；\n"
-    "2. 标签要概括「什么情绪／什么语气／适合什么场合」，是 2 到 4 个字的短词，"
-    "绝对不要照抄图上的整句文字，不要把一句话当成标签；\n"
-    "3. 如果图上文字只是补充笑点，把它浓缩成一个 2 到 4 字的关键词（如「绷不住」「下次还敢」），"
-    "不要保留完整句子；\n"
-    "4. 不要输出英文、数字、标点堆砌、乱码、模型报错（如 Loss:NaN）这类内容；\n"
-    "5. 不要描述画风、配色、构图；同一张图不要给意思重复的标签。\n"
-    '示例（是表情包）：["卖萌","比心","贴贴"]\n'
+    "1. 标签描述的是「这张图替发图的人表达什么、适合在什么聊天语境下发出去」，"
+    "不是图上画了什么、写了什么。用你自己的话写，没有词表、没有固定选项，"
+    "完全由你判断该用什么词，只要它准确刻画这张图的语义。\n"
+    "2. 不要做文字识别：不要照抄、缩写或浓缩图上的文字，也不要把配文拆成关键词。"
+    "图上文字只是理解笑点和态度的线索，标签要写理解之后的言外之意。\n"
+    "3. 不要写「开心」「可爱」「难过」「疑惑」「无语」这类放之四海皆准的大类情绪词，"
+    "也不要给不同图套同一批词。要具体到能区分语境："
+    "「下班瘫成一张饼」和「抢到票狂喜」都是高兴，但适用的对话完全不同，"
+    "都写成「高兴」就等于没写。梗图要写出这个梗本身的意思，不要只写「搞笑」。\n"
+    "4. 只输出 1 到 2 个标签：第一个写这张图最核心的语义，"
+    "能用一个短语说清就只给一个；确有必要补充适用场合或语气时才给第二个，"
+    "不要为了凑数硬编出别的含义。每个是 2 到 12 个汉字的中文短语，两者意思不要重复。\n"
+    "5. 不要描述画风、配色、构图、角色长相；"
+    "不要输出英文、数字、标点堆砌、乱码、模型报错（如 Loss:NaN）这类内容。\n"
+    '示例（一只满脸麻木的猫，配字「老板说得对」）：["被点名只能附和","敢怒不敢言"]\n'
+    '示例（一张举手欢呼的图）：["抢到票狂喜"]\n'
     '示例（不是表情包，普通照片）：[]'
 )
 
 _TAG_NOISE = {"none", "null", "无", "标签", "tag", "tags", "json", "image", "meme", "png", "jpg", "gif", "webp"}
 # 脏数据特征：模型报错、纯英文/数字、带特殊符号堆砌、含问号感叹号等。
-# 标签应该是 2~6 个汉字的短词，出现这些特征的一律丢弃。
+# 标签应该是中文短语，出现这些特征的一律丢弃。
 _DIRTY_PATTERNS = (
     re.compile(r"loss", re.I),
     re.compile(r"nan", re.I),
@@ -157,7 +165,9 @@ def _clean_tag(raw) -> str:
     text = text.strip("[]{}()\"'`，,。.、；;：:!！?？ \t\r\n")
     text = re.sub(r"[\s%]+", "", text)
     text = text.strip("#＃")
-    if not 1 <= len(text) <= 12:
+    # 语义短语比旧的 2~4 字情绪词长，上限放到 16 留余量；
+    # 再长基本就是模型把整句话当标签了，仍然丢掉。
+    if not 1 <= len(text) <= 16:
         return ""
     if text.lower() in _TAG_NOISE:
         return ""
@@ -570,13 +580,14 @@ class MemeManager:
         return str(target)
 
     # ------------------------------------------------------------ 打标
-    def _ensure_tagger(self):
+    def _ensure_tagger(self, queue_pending: bool = True):
         if self._tag_thread and self._tag_thread.is_alive():
             return
         self._tag_stop.clear()
         self._tag_thread = threading.Thread(target=self._tag_loop, name="meme-tagger", daemon=True)
         self._tag_thread.start()
-        self._queue_pending()
+        if queue_pending:
+            self._queue_pending()
 
     def _queue_pending(self, limit: int = 20):
         """补扫历史未打标的图。设上限：大库首次启动不该一口气把 VLM 打满。"""
@@ -622,7 +633,9 @@ class MemeManager:
         tags = normalize_tags(embedded_tags(data) + filename_tags(target))
         source = "embedded" if tags else ""
         vlm_rejected = False
-        if not tags and auto_tag and data and len(data) <= MAX_TAGGED_BYTES:
+        # 体积不再当弃打条件：vlm_tags 会先压到几十 KB 再发，十几兆的动图也能打标。
+        # 这里只挡「入库上限以上」的异常文件（正常还进不来库）。
+        if not tags and auto_tag and data and len(data) <= MAX_STORED_BYTES:
             vlm_result = vlm_tags(data)
             if vlm_result is None:
                 # VLM 明确判断「不是表情包」，标记为 rejected 并从库里移除
@@ -861,22 +874,50 @@ class MemeManager:
             return set(self._recent.get(chat_key) or ())
 
     def _rank_tags(self, text: str, limit: int) -> List[str]:
-        """按「字面相关 > 发得少 > 图多」排序，字面命中只是粗筛，最终由 Jev 定。"""
+        """挑出这一轮交给 Jev 打分的标签：字面相关的必留，其余随机补满 limit。
+
+        标签总量超过 Jev 单轮可打分上限（63 × tag_max_rounds，默认 252）时，
+        以前是按「发得少 / 图多」排序后硬截断——名额被固定的一批标签长期占住，
+        排在后面的永远轮不到。标签放开成自由短语之后，每个情绪在库里会散成很多
+        近义措辞，硬截断等于让一半语义彻底没有机会被评估，抽出来的图自然跑偏。
+        改成超额随机抽样：每轮进候选的子集不同，跨对话把全库标签都轮到。
+
+        字面命中仍优先占位（整词 > 二元组），那不是运气而是这句话自己说到了这个
+        情绪；只有排在它们后面的普通标签才参与随机。
+        """
         summary = self.tag_summary()
         if not summary:
             return []
+        limit = max(1, int(limit))
         lowered = (text or "").lower()
-
-        def score(item):
+        buckets: Dict[int, List[str]] = {2: [], 1: [], 0: []}
+        for item in summary:
             tag = str(item["tag"])
-            hit = 2 if tag and tag.lower() in lowered else 0
-            if not hit and len(tag) >= 2:
-                # 用二元组而不是单字：单字命中太廉价（「开心」会被「小心」拉到前排），
-                # 排序一乱，喂给 Jev 的第一批选项就不对了。
-                hit = 1 if any(tag[i:i + 2] in lowered for i in range(len(tag) - 1)) else 0
-            return (-hit, int(item["used"] or 0), -int(item["count"] or 0))
+            if not tag:
+                continue
+            if tag.lower() in lowered:
+                buckets[2].append(tag)
+            elif len(tag) >= 2 and any(tag[i:i + 2] in lowered for i in range(len(tag) - 1)):
+                # 用二元组而不是单字：单字命中太廉价（「开心」会被「小心」拉到前排）。
+                buckets[1].append(tag)
+            else:
+                buckets[0].append(tag)
 
-        return [str(item["tag"]) for item in sorted(summary, key=score)][:limit]
+        total = sum(len(pool) for pool in buckets.values())
+        if total <= limit:
+            return [tag for level in (2, 1, 0) for tag in buckets[level]]
+
+        picked: List[str] = []
+        for level in (2, 1, 0):
+            need = limit - len(picked)
+            if need <= 0:
+                break
+            pool = buckets[level]
+            if len(pool) <= need:
+                picked.extend(pool)
+            else:
+                picked.extend(random.sample(pool, need))
+        return picked
 
     @staticmethod
     def _primary_rank(tags: Sequence[str], tag: str) -> int:
@@ -962,19 +1003,30 @@ class MemeManager:
         chat_key（群号 / 私聊用户号）用于会话级避让：该会话最近发过的图这轮不再入选，
         避免「赞同」这种只有一张图的标签每次都发同一张。
 
-        决策只有一轮：Jev 给全库标签各自打分，取排名前三的标签，然后按「图自己的
-        标签匹配度」取第一张。发不发只由 Jev 的 none 判定，不再卡分数门槛——
-        门槛会让"三个标签都只是中等贴切"这种正常情况整轮沉默，线上表现就是几乎不发。
+        决策分两段：choice 粗排把相关标签挑进候选（一次 255 个），再让 noul 精判
+        这几个候选并回答"要不要发"，最后按「图自己的标签匹配度」取第一张。
+        发不发只由 Jev 的 none 判定，不再卡分数门槛——门槛会让"三个标签都只是
+        中等贴切"这种正常情况整轮沉默，线上表现就是几乎不发。
         """
         cfg = load_config().get("meme", {})
         summary = self.tag_summary()
         if not summary:
             return None
         cooldown = self._cooldown_paths(chat_key) | set(exclude_paths or ())
-        # 一次请求最多问 64 个 question（含 none），即一次能给 63 个标签打分。
-        # 标签多于这个数就分几批问：noul 是独立概率，跨批的分数可以直接比。
         rounds_cap = max(1, min(8, int(cfg.get("tag_max_rounds", 4))))
-        capacity = 63 * rounds_cap
+        coarse_mode = str(cfg.get("jev_coarse_mode") or "choice").lower()
+        if coarse_mode == "choice":
+            # 粗排一个 choice 装 255 个标签、一个请求装 4 个 choice → 1020 个/轮，
+            # 比 noul 直打（63 × tag_max_rounds）大一个量级。
+            from core.jev import MAX_CHOICE_OPTIONS
+
+            capacity = MAX_CHOICE_OPTIONS * max(1, min(4, int(cfg.get("jev_coarse_questions", 4))))
+        else:
+            # 退回 noul 直打：一次请求最多 64 个 question（含 none），即 63 个标签，
+            # 多于这个数就分几批问（noul 是独立概率，跨批的分数可以直接比）。
+            capacity = 63 * rounds_cap
+        # 超出容量时由 _rank_tags 随机抽样封顶，不能排序截断——
+        # 否则永远只有同一批标签被问到，其余语义等于不存在。
         tags = self._rank_tags((message or "") + " " + (reply or ""), capacity)
         if not tags:
             log("Meme", "skip", reason="no_tags")
@@ -983,10 +1035,7 @@ class MemeManager:
         pick = None
         if cfg.get("use_jev", True):
             try:
-                from core.jev import JevClient
-
-                pick = JevClient().rank_meme_tags(
-                    message=message, reply=reply, tags=tags, max_batches=rounds_cap)
+                pick = self._judge_by_jev(message, reply, tags, cfg, rounds_cap)
             except Exception as exc:
                 log("Meme", "jev.error", error=str(exc)[:160])
                 pick = None
@@ -1009,6 +1058,32 @@ class MemeManager:
         if not path:
             log("Meme", "skip", reason="tag_empty", tag=fallback_tag)
         return path
+
+    def _judge_by_jev(self, message: str, reply: str, tags: Sequence[str],
+                      cfg: Dict[str, object], rounds_cap: int):
+        """两段式判定：choice 粗排缩小候选，再让 noul 精判（含 none）。
+
+        粗排只需要「把可能相关的挑出来」，不承担"要不要发"的判断：它的概率是
+        批内归一化的，跨批比不了；而 noul 是独立概率，才能和 none 放在一起比。
+        粗排失败或关闭时退回 noul 直打，与旧行为一致。
+        """
+        from core.jev import JevClient
+
+        client = JevClient()
+        coarse_mode = str(cfg.get("jev_coarse_mode") or "choice").lower()
+        if coarse_mode == "choice" and len(tags) > 63:
+            shortlist = client.coarse_rank_tags(
+                message, reply, tags,
+                top_k=int(cfg.get("jev_coarse_top_k", 6)),
+                questions_per_call=int(cfg.get("jev_coarse_questions", 4)),
+            )
+            if shortlist:
+                log("Meme", "jev.shortlist", tags=len(tags), picked=len(shortlist))
+                # 候选已经缩到几十个以内，一次 noul 请求就能问完。
+                return client.rank_meme_tags(
+                    message=message, reply=reply, tags=shortlist, max_batches=1)
+        return client.rank_meme_tags(
+            message=message, reply=reply, tags=tags, max_batches=rounds_cap)
 
     def _pick_by_tags(self, top_tags: Sequence[str], scores: Dict[str, float],
                       exclude_paths: Sequence[str]) -> Optional[str]:
@@ -1064,12 +1139,40 @@ class MemeManager:
             score=round(float(best["score"]), 3), tags=best["tags"])
         return self._take(best, used_tag)
 
-    def retag_all(self):
-        """清空标签重新打一遍（换词表或模型后手动调用）。"""
+    def retag_all(self) -> int:
+        """清空标签并把整库一次性排进打标队列（换打标提示词或模型后手动调用）。
+
+        旧实现只补 20 张，几百张图要反复调好几轮；这里一次排完，后台线程串行消费。
+        返回入队张数，调用方想等打完可以 join 队列。
+        """
+        collected_dir = self.meme_dir / "collected"
+        collected = {p.stem: p for p in collected_dir.iterdir() if p.is_file()} if collected_dir.is_dir() else {}
         with self._lock, self._db() as db:
             db.execute("UPDATE memes SET tags = '[]', tag_source = '', tagged_at = NULL")
+            # 历史脏路径（重复的 data/workspace/main 前缀、搬迁前的绝对路径）读不到字节，
+            # 清空标签后就再也打不回来；按 file_hash 指回 collected 里的真实文件。
+            stored = db.execute(
+                "SELECT file_hash, file_path FROM memes WHERE file_path IS NOT NULL"
+            ).fetchall()
+            for row in stored:
+                if Path(_abs(row["file_path"])).is_file():
+                    continue
+                hit = collected.get(row["file_hash"])
+                if hit:
+                    db.execute("UPDATE memes SET file_path = ? WHERE file_hash = ?",
+                               (_rel(hit), row["file_hash"]))
+            pending = db.execute(
+                "SELECT file_hash, file_path FROM memes WHERE tagged_at IS NULL AND file_path IS NOT NULL"
+            ).fetchall()
         self.rebuild_tag_summary()
-        self._queue_pending()
+        self._ensure_tagger(queue_pending=False)
+        for row in pending:
+            try:
+                self._tag_queue.put((row["file_hash"], _abs(row["file_path"])), timeout=5)
+            except queue.Full:
+                log("Meme", "tag.queue_full", hash=str(row["file_hash"])[:8])
+                break
+        return len(pending)
 
     def stats(self) -> Dict[str, object]:
         with self._lock, self._db() as db:
@@ -1082,6 +1185,100 @@ class MemeManager:
         return {"total": total, "pending": pending, "tagged": tagged, "tags": tags, "by_source": by_source}
 
 
+# 打标模型独立于主对话 VLM：便宜的 flash 就够用，主对话换模型不该把打标一起带走。
+# 这套网关单 key 限 30 次/分钟、并发 2；打标线程虽然串行，key 池仍要按 key 各自计窗，
+# 免得换提示词全量重打时前半程把某个 key 打爆、后半程全是 429。
+_TAG_KEY_WINDOW = 60.0
+_TAG_KEY_LIMIT = 25
+_tag_key_lock = threading.Lock()
+_tag_key_index = 0
+_tag_key_hits: Dict[str, deque] = {}
+
+
+def _tag_vlm_config() -> Tuple[str, str, List[str]]:
+    """取打标用的 (endpoint, model, api_keys)；没配 meme 段就回退主 VLM 配置。"""
+    cfg = load_config()
+    meme = cfg.get("meme") or {}
+    vlm = cfg.get("vlm") or {}
+    model = str(meme.get("vlm_model") or vlm.get("model") or "gpt-4o")
+    base = str(meme.get("vlm_base_url") or vlm.get("base_url") or "").rstrip("/")
+    keys = [str(k).strip() for k in (meme.get("vlm_api_keys") or []) if str(k).strip()]
+    if not keys:
+        single = str(vlm.get("api_key") or "").strip()
+        keys = [single] if single else []
+    endpoint = base if base.endswith("/chat/completions") else (base + "/chat/completions" if base else "")
+    return endpoint, model, keys
+
+
+def _next_tag_key(keys: List[str]) -> str:
+    """轮询取一个 60s 窗口内没超额的 key；全满就等窗口滚过去再取。"""
+    global _tag_key_index
+
+    with _tag_key_lock:
+        now = time.monotonic()
+        oldest = now
+        for _ in range(len(keys)):
+            key = keys[_tag_key_index % len(keys)]
+            _tag_key_index += 1
+            hits = _tag_key_hits.setdefault(key, deque())
+            while hits and now - hits[0] > _TAG_KEY_WINDOW:
+                hits.popleft()
+            if hits:
+                oldest = min(oldest, hits[0])
+            if len(hits) < _TAG_KEY_LIMIT:
+                hits.append(now)
+                return key
+        wait = max(0.1, _TAG_KEY_WINDOW - (now - oldest))
+    time.sleep(min(wait, _TAG_KEY_WINDOW))
+    return _next_tag_key(keys)
+
+
+def _vlm_payload_bytes(data: bytes) -> Tuple[bytes, str]:
+    """准备送进 VLM 的字节，返回 (bytes, mime)。原文件不动，只影响请求体。
+
+    三种情况要重编码：
+      - 动图（GIF/多帧 WebP）：取首帧。表情包首帧就代表它的语义，整包发只是把
+        几十上百帧的字节全塞进 base64，模型看到的还是第一帧。
+      - 超过 MAX_TAGGED_BYTES：网关请求体上限约 8MB，超了 413/400 白等十几秒。
+      - 长边超过 VLM_MAX_SIDE：再大模型也不会看更细，纯烧 token。
+    其余情况原样返回，不重编码——重编码会掉画质，能省则省。
+    """
+    kind, mime = sniff_media(data)
+    if kind != "image":
+        return data, mime
+    try:
+        from PIL import Image
+    except ImportError:
+        return data, mime
+    if not (len(data) > MAX_TAGGED_BYTES):
+        # 体积够小也要先看一眼是不是多帧/超大，但不用真解码出图。
+        try:
+            with Image.open(io.BytesIO(data)) as probe:
+                if getattr(probe, "n_frames", 1) == 1 and max(probe.size) <= VLM_MAX_SIDE:
+                    return data, mime
+        except Exception:
+            return data, mime
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if getattr(image, "n_frames", 1) > 1:
+                image.seek(0)
+            frame = image.convert("RGBA") if image.mode in ("P", "RGBA", "LA") else image.convert("RGB")
+            frame.thumbnail((VLM_MAX_SIDE, VLM_MAX_SIDE), Image.LANCZOS)
+            if frame.mode == "RGBA":
+                # 透明底直接转 RGB 会变黑块，铺白底更接近它在聊天里的样子。
+                canvas = Image.new("RGB", frame.size, (255, 255, 255))
+                canvas.paste(frame, mask=frame.split()[-1])
+                frame = canvas
+            output = io.BytesIO()
+            frame.save(output, "JPEG", quality=VLM_JPEG_QUALITY, optimize=True)
+            shrunk = output.getvalue()
+    except Exception as exc:
+        log("Meme", "vlm.shrink_error", error=str(exc)[:120])
+        return data, mime
+    log("Meme", "vlm.shrink", src_kb=round(len(data) / 1024), dst_kb=round(len(shrunk) / 1024))
+    return shrunk, "image/jpeg"
+
+
 def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
     """让 VLM 看图出标签。
 
@@ -1092,20 +1289,21 @@ def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
     kind, mime = sniff_media(image_bytes)
     if kind != "image":
         return []
-    cfg = load_config().get("vlm", {})
-    key = (cfg.get("api_key") or "").strip()
-    if not key:
+    endpoint, model, keys = _tag_vlm_config()
+    if not endpoint or not keys:
         return []
-    base = (cfg.get("base_url") or "").rstrip("/")
-    if not base:
-        return []
-    endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
-    model = cfg.get("model") or "gpt-4o"
-    data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode("ascii")
+    # 动图取首帧、超大/超尺寸压到 1024px：原图入库不动，只有这份送模型的字节变了。
+    payload_bytes, mime = _vlm_payload_bytes(image_bytes)
+    data_url = f"data:{mime};base64," + base64.b64encode(payload_bytes).decode("ascii")
     payload = {
         "model": model,
-        "temperature": 0.2,
-        "max_tokens": 200,
+        # 不给词表之后要留一点发散度，温度太低模型会反复退回那几个最常见的情绪词。
+        "temperature": 0.6,
+        "max_tokens": 600,
+        # gemini-3-8-flash 在这套网关默认先烧约 300 个 reasoning token，
+        # 不显式关思考，正文 JSON 会被截在半截，标签全变成「例行视」这种碎片。
+        "reasoning_effort": "none",
+        "enable_thinking": False,
         "stream": False,
         "messages": [{
             "role": "user",
@@ -1119,19 +1317,30 @@ def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
 
     from core.netpool import open_request
 
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                 "User-Agent": "MiniBot-Meme/2.0"},
-        method="POST",
-    )
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     started = time.monotonic()
-    try:
-        with open_request(request, timeout=30) as response:
-            body = json.loads(response.read(256 * 1024).decode("utf-8", "replace"))
-    except Exception as exc:
-        log("Meme", "vlm.error", error=str(exc)[:160])
+    body = None
+    for attempt in range(2):
+        key = _next_tag_key(keys)
+        request = urllib.request.Request(
+            endpoint,
+            data=encoded,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                     "User-Agent": "MiniBot-Meme/2.0"},
+            method="POST",
+        )
+        try:
+            with open_request(request, timeout=45) as response:
+                body = json.loads(response.read(256 * 1024).decode("utf-8", "replace"))
+            break
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            if attempt == 0 and status in (429, 500, 502, 503, 504):
+                log("Meme", "vlm.retry", status=status)
+                continue
+            log("Meme", "vlm.error", error=str(exc)[:160])
+            return []
+    if body is None:
         return []
     choices = body.get("choices") or []
     text = ""
@@ -1152,10 +1361,11 @@ def vlm_tags(image_bytes: bytes) -> Optional[List[str]]:
                 return tags
         except ValueError:
             pass
-    # 兜底：从文本里提取中文短词
+    # 兜底：模型没按数组格式回时，从文本里捞中文短语。
+    # 上限跟 _clean_tag 对齐，别把「被点名只能附和」这类语义短语切成两截碎片。
     tags = normalize_tags(text)
     if not tags:
-        tags = normalize_tags(re.findall(r"[\u4e00-\u9fa5]{2,6}", text))
+        tags = normalize_tags(re.findall(r"[\u4e00-\u9fa5]{2,12}", text))
     log("Meme", "vlm.tags", elapsed_ms=round((time.monotonic() - started) * 1000), tags=tags[:6])
     return tags
 

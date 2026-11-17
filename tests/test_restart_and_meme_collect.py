@@ -105,7 +105,7 @@ class RestartToolTests(Fixture):
 
     def setUp(self):
         super().setUp()
-        config.save_config({"channels": {"napcat": {"owner_ids": ["123"], "allow_owner_tools": True}}})
+        config.save_config({"channels": {"napcat": {"owner_ids": ["123"]}}})
         self.names = {t["function"]["name"] for t in HARNESS_TOOLS}
 
     def harness(self):

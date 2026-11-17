@@ -10,13 +10,8 @@ from unittest.mock import MagicMock, patch
 
 from test_core import Fixture
 
-from core.decision_context import (BRIEF_TASK_KEYS, build_decision_context,
-                                   lite_context)
 from core.harness import AgentHarness
 from core.jev import JevClient
-
-HEAVY = ("recent_media", "conversation_summary", "recent_chat", "recent_conversation",
-         "memory", "goals", "pending_reminders")
 
 
 def bloated_task_state():
@@ -32,38 +27,6 @@ def bloated_task_state():
                        for _ in range(50)],
         "artifacts": ["a"] * 40,
     }
-
-
-class LiteContextTests(Fixture):
-    def test_lite_drops_heavy_branches_but_keeps_identity(self):
-        self.memory.save_task_state("local:pet", bloated_task_state())
-        full = build_decision_context(self.memory, "local:pet", "local")
-        lite = build_decision_context(self.memory, "local:pet", "local", lite=True)
-        for key in HEAVY:
-            self.assertNotIn(key, lite)
-        # 身份与权限是判定授权的前提，任何档位都不能丢。
-        for key in ("owner_ids", "permissions", "sender" if "sender" in full else "session_id"):
-            self.assertIn(key, lite)
-        self.assertLess(len(json.dumps(lite, ensure_ascii=False)),
-                        len(json.dumps(full, ensure_ascii=False)))
-
-    def test_lite_task_state_keeps_outcome_not_diff(self):
-        self.memory.save_task_state("local:pet", bloated_task_state())
-        lite = build_decision_context(self.memory, "local:pet", "local", lite=True)
-        state = lite["task_state"]
-        self.assertEqual(set(state), set(BRIEF_TASK_KEYS) & set(bloated_task_state()))
-        self.assertNotIn("file_changes", state)
-        self.assertNotIn("last_tools", state)
-
-    def test_lite_context_of_dict_is_derived_without_requery(self):
-        full = {"session_id": "s", "recent_media": [1], "memory": "m",
-                "task_state": {"original_goal": "g", "file_changes": [1]}}
-        lite = lite_context(full)
-        self.assertNotIn("recent_media", lite)
-        self.assertNotIn("memory", lite)
-        self.assertEqual(lite["task_state"], {"original_goal": "g"})
-        # 必须返回新对象，不能把调用方的完整 context 就地改掉。
-        self.assertIn("recent_media", full)
 
 
 class HarnessHelpersTests(unittest.TestCase):
@@ -132,15 +95,16 @@ class NoOpeningContractTests(unittest.TestCase):
     def test_harness_keeps_no_judgement_calls(self):
         """进入 harness 之后不再有任何判定调用。
 
-        交付是否完成由程序的确定性门禁按本轮真实改动核对；Jev 只在进入 harness
-        之前做两件事：判断这句话是继续还是新任务，以及能不能用预设动作直接满足。
-        放行判定与技能路由都已经拆掉，保留断言是为了防止它们被重新加回来。
+        交付是否完成由程序的确定性门禁按本轮真实改动核对；Jev 在进入 harness
+        之前只做一件事：判断这句话是继续还是新任务（固定动作/预设参数这条捷径已
+        整体移除，见 core/harness.py 里 run() 的注释）。放行判定与技能路由也已经
+        拆掉，保留断言是为了防止它们被重新加回来。
         """
         for gone in ("plan_verification", "evaluate_task_completion", "classify_progress_delivery",
                      "final_review", "route_request"):
             self.assertFalse(hasattr(JevClient, gone), gone)
         self.assertTrue(hasattr(JevClient, "classify_steering_intent"))
-        self.assertTrue(hasattr(JevClient, "select_fixed_action"))
+        self.assertFalse(hasattr(JevClient, "select_fixed_action"))
         for gone in ("_valid_plan", "_visual_evidence", "_gap_feedback", "_program_checks"):
             self.assertFalse(hasattr(AgentHarness, gone), gone)
 

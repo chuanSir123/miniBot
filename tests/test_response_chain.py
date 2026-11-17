@@ -33,7 +33,6 @@ class ResponseChainTests(Fixture):
     def jev(self):
         jev = MagicMock()
         jev.is_configured.return_value = True
-        jev.select_fixed_action.return_value = None
         jev.final_review.return_value = {'accepted': True, 'gap': 'none', 'confidence': 0.99}
         jev.last_error = ''
         return jev
@@ -51,65 +50,14 @@ class ResponseChainTests(Fixture):
         jev.final_review.assert_not_called()
         self.assertEqual(brain.stream_chat_and_tools.call_count, 1)
 
-    def test_noarg_shortcut_uses_execution_gate_and_records_tool_evidence(self):
-        jev = self.jev()
-        jev.select_fixed_action.return_value = 'list_skills'
-        class Brain:
-            calls = 0
-            def stream_chat_and_tools(inner, messages, tools=None):
-                inner.calls += 1
-                result = next(m for m in messages if m['role'] == 'tool')
-                self.assertTrue(json.loads(result['content'])['ok'])
-                yield 'text_delta', '这是技能列表。'
-                return '', [], {}
-        brain = Brain()
-        harness = AgentHarness(brain, jev, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        with patch.object(harness, '_dispatch_tool', wraps=harness._dispatch_tool) as dispatch:
-            harness.run('请列出全部技能')
-        self.assertEqual(brain.calls, 1)
-        self.assertEqual(dispatch.call_args.args[:2], ('list_skills', {}))
-        self.assertEqual(self.memory.get_task_state('local:pet')['executed_steps'], 1)
-
-    def test_non_allowlisted_jev_choice_never_executes(self):
-        jev = self.jev()
-        jev.select_fixed_action.return_value = 'bash'
-        class Brain:
-            def stream_chat_and_tools(inner, *args, **kwargs):
-                yield 'text_delta', '你好。'
-                return '', [], {}
-        harness = AgentHarness(Brain(), jev, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        with patch.object(harness, '_dispatch_tool') as dispatch:
-            harness.run('你好')
-        dispatch.assert_not_called()
-
-    def test_selective_classifier_no_request_for_parameterized_or_chat(self):
-        jev = JevClient()
-        with patch.object(jev, 'decide_raw', return_value={'answers': {'noarg_tool': {'choice': 'vlm', 'confidence': 0.99}}}) as decide:
-            self.assertIsNone(jev.select_fixed_action('读取文件 data/test.txt'))
-            self.assertIsNone(jev.select_fixed_action('今天心情不错'))
-        self.assertEqual(decide.call_count, 2)
-
-    def test_low_confidence_or_failure_falls_back(self):
-        jev = JevClient()
-        with patch.object(jev, 'decide_raw', return_value={'answers': {'noarg_tool': {'choice': 'list_skills', 'confidence': .8}}}):
-            self.assertIsNone(jev.select_fixed_action('列出全部技能'))
-        with patch.object(jev, 'decide_raw', side_effect=TimeoutError):
-            self.assertIsNone(jev.select_fixed_action('列出全部技能'))
-
     def test_state_puts_invariant_fields_first_for_prefix_reuse(self):
-        """state 是每个 question 的共享前缀，常量必须排在前面。
+        """state 是每个 question 的共享前缀，稳定字段必须排在前面。
 
         服务端把 state 拼在每个 question 之前（报错原文：the state and its media
         once, then every question），前缀从第 N 个字符分叉，后面的 KV 就全废。
-        fixed_options 每次调用逐字节相同，user 必然不同，顺序反了等于从不命中。
+        current_or_last_task 在一轮任务里基本不动，新来的这句话必然不同，顺序反了
+        等于从不命中。
         """
-        jev = JevClient()
-        with patch.object(jev, 'decide_raw', return_value={'answers': {'noarg_tool': {'choice': 'vlm', 'confidence': .99}}}) as decide:
-            jev.select_fixed_action('发最后一张图', context={'recent_media': [{'media_ref': 'm1'}]})
-        state = json.loads(decide.call_args.args[0])
-        self.assertEqual(list(state['current']), ['fixed_options', 'user'])
-
-    def test_steering_intent_state_puts_current_prompt_last(self):
         jev = JevClient()
         # 走 decide()，未配置 key 会在发请求前直接返回空，所以两个都要打桩。
         with patch.object(jev, 'is_configured', return_value=True), \
@@ -118,24 +66,6 @@ class ResponseChainTests(Fixture):
         state = json.loads(decide.call_args.args[0])
         self.assertEqual(list(state['current']), ['current_or_last_task', 'recent_messages', 'user_input'])
 
-    def test_fixed_arguments_are_server_owned_and_still_pass_execution_gate(self):
-        jev = self.jev()
-        jev.select_fixed_action.return_value = 'recent_media'
-        class Brain:
-            def stream_chat_and_tools(inner, *args, **kwargs):
-                yield 'text_delta', '没有缓存的图片。'
-                return '', [], {}
-        harness = AgentHarness(Brain(), jev, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        with patch.object(harness, '_dispatch_tool', wraps=harness._dispatch_tool) as dispatch:
-            harness.run('查看最近的图片')
-        self.assertEqual(dispatch.call_args.args[:2], ('list_media', {'limit': 9}))
-
-    def test_fixed_action_parameters_cannot_be_mutated_by_caller(self):
-        from core.fast_actions import resolve_fixed_action
-        action = resolve_fixed_action('recent_media')
-        action['arguments']['limit'] = 1000
-        self.assertEqual(resolve_fixed_action('recent_media')['arguments'], {'limit': 9})
-        self.assertIsNone(resolve_fixed_action({'tool': 'write'}))
 
     def test_powershell_http_defaults_bypass_system_proxy(self):
         import os

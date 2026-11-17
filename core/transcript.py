@@ -18,10 +18,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.text_budget import estimate_text_tokens
 
@@ -118,20 +117,6 @@ def user_utterance_text(content: str) -> str:
 # ---------------------------------------------------------------------------
 # 条目 → 模型消息
 # ---------------------------------------------------------------------------
-
-
-def entry_text(entry: Dict[str, Any]) -> str:
-    """条目里能参与估算/序列化的文本部分。"""
-    content = entry.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
-    return ""
 
 
 def estimate_entry_tokens(entry: Dict[str, Any]) -> int:

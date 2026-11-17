@@ -6,7 +6,6 @@ Provides:
 3. Workspace and Session REST APIs + Server-Sent Events (SSE) streaming for real-time tool/text trace.
 """
 import base64
-import concurrent.futures
 import json
 import os
 import subprocess
@@ -22,18 +21,16 @@ import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
 
 from core.config import load_config, save_config
-from core.console import log
 from core.network import urlopen
 from core.workspace import (
     create_workspace,
     list_workspace_files,
     list_workspaces,
     read_workspace_file,
-    workspace_for,
 )
 
 if sys.platform == "win32":
@@ -1841,6 +1838,9 @@ class ConfigServerHandler(BaseHTTPRequestHandler):
                         break
                 api_key = found_key or saved.get("api_key", "")
             model = req_data.get("model") or saved.get("model", "gpt-4o")
+            # 连通性测试用当前生效的 Key（粘滞策略：一直用同一个，429 才切下一个）。
+            from core.brain import current_api_key
+            api_key = current_api_key(api_key)
 
             if not api_key:
                 self._set_headers(200)

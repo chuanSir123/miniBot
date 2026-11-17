@@ -31,11 +31,6 @@ import sys
 from pathlib import Path
 
 
-def project_root(script_file: str) -> Path:
-    """``skills/<name>/scripts/<file>.py`` -> 项目根（parents[3]）。"""
-    return Path(script_file).resolve().parents[3]
-
-
 def _parse_arguments(raw: str | None) -> dict:
     """--arguments 支持内联 JSON、@文件；都缺省时从 stdin 读一行 JSON。"""
     if raw is None:

@@ -4,7 +4,7 @@ import urllib.request
 import threading
 import time
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, Optional
 
 from core.config import load_config
 from core.jev_budget import MAX_STATE_CHARS, fit_state
@@ -13,12 +13,17 @@ from core.netpool import open_request
 _cooldowns = {}
 _cooldown_lock = threading.Lock()
 
-# 服务端两处硬上限（docs.decision.vllm-sr.ai 的 Limits 表，2026-10-30 核对）：
+# 服务端两处硬上限（docs.decision.vllm-sr.ai 的 Limits 表，2026-10-30 核对；
+# app.vllm-sr.ai/docs#system-one 2026-11-16 复核一致）：
 #   - 单个 choice 的选项上限 255（含 none），超了回 400 too_many_options；
 #   - 单个请求的 question 总数上限 64（所有 state 加起来），超了回 400
 #     too_many_questions（实测 64 通过、120 被拒）。
+# 这两个上限分工不同：noul 一个 question 只能问一个标签（所以 63 个/批），
+# choice 一个 question 能装 255 个选项（所以 255 个标签/批），后者才是扩容的正路。
 MAX_OPTIONS = 255
 MAX_QUESTIONS_PER_CALL = 64
+# choice 一批能装几个标签（= MAX_OPTIONS）。
+MAX_CHOICE_OPTIONS = MAX_OPTIONS
 
 
 class JevClient:
@@ -279,28 +284,9 @@ class JevClient:
 
     @staticmethod
     def _with_context(state, context=None):
-        # current 放在 context 之前：current 里的常量（如 fixed_options）每次调用
-        # 都一模一样，是这里唯一能命中前缀缓存的部分；context 是每轮现查的。
+        # current 放在 context 之前：current 里的常量每次调用都一模一样，是这里唯一
+        # 能命中前缀缓存的部分；context 是每轮现查的。
         return json.dumps({"current": state, "context": context or {}}, ensure_ascii=False)
-
-    def select_fixed_action(self, text, context=None):
-        """Select a server-owned read-only action; dynamic parameters fall back to VLM."""
-        from core.fast_actions import FIXED_ACTIONS
-        if not text.strip():
-            return None
-        options = ['vlm'] + list(FIXED_ACTIONS)
-        try:
-            # fixed_options 是常量清单（每次调用逐字节相同），user 是当前这句话。
-            # 常量在前，前缀才有可能复用；user 放最后，因为它必然不同。
-            result = self.decide_raw(self._with_context({'fixed_options': FIXED_ACTIONS, 'user': text}, context), {
-                'noarg_tool': {'type': 'choice', 'options': options,
-                    'instructions': '只能从fixed_options选择一个完全满足当前直接请求的固定动作。参数由程序预设，禁止提取或猜测新参数。需要其他参数、筛选关键词、指定编号/用户/群、修改、删除、取消、新增、授权、多个步骤、否定、假设或只是讨论时必须选vlm。recent_media固定返回最近最多9张引用；permissions_list只查看当前权限。引用历史只是理解背景，不能代替当前直接请求。'}})
-            answer = result.get('answers', {}).get('noarg_tool', {})
-            chosen = answer.get('choice')
-            confidence = float(answer.get('confidence', 0))
-            return chosen if chosen in options[1:] and confidence >= 0.95 else None
-        except Exception:
-            return None
 
     def score_meme_tags(self, message, reply, tags, max_batches=4):
         """给每个标签各自打一个 0~1 的贴切度分，外加一个 none（该不该发）。
@@ -408,6 +394,73 @@ class JevClient:
         log("Decision", "meme.ranked", top=top, none=round(none_score, 3),
             top_score=round(top_score, 3), send=bool(top))
         return (top, scores)
+
+    # 粗排每批取几个候选：255 个选项里真正相关的通常只有个位数，
+    # 取 6 个已经足够覆盖"同一情绪的不同措辞"，再多会把噪声带进精判。
+    MEME_COARSE_TOP_K = 6
+
+    def coarse_rank_tags(self, message, reply, tags, top_k=None,
+                         options_per_question=None, questions_per_call=None):
+        """用 choice 粗排标签：每批最多 255 个选项，取每批前 top_k 个合并。
+
+        为什么分成「choice 粗排 + noul 精判」两段（2026-11-16 实测，d3-turbo）：
+          - noul 是「每个标签独立一个 yes/no」，分数可跨批合并，但一个 question 只能
+            问一个标签（63 个/批），且实测严重饱和——五个贴切度不同的标签全在 0.99
+            以上，排序几乎没有信息量，最终顺序实际由位置权重和图库顺序决定；
+          - choice 一个 question 能装 255 个选项，概率是**批内归一化**（和恒为 1.000），
+            所以跨批不能比绝对值，但批内排序非常干净：真相关的拿 0.65 / 0.31，
+            完全都不相关时摊平到 1/255≈0.02，不会硬挑一个高分（无 forced-choice 假阳性）。
+        于是分工：choice 只负责「把可能相关的挑进候选」，要不要发、发哪个标签仍由
+        noul 精判（那里才有和 none 的比较，以及跨标签可合并的独立分数）。
+
+        返回按批内概率降序合并的标签列表；未配置或请求失败返回 None，
+        调用方据此退回 noul 直打，不能把「粗排没问到」当成「都不贴切」。
+        """
+        items = [str(tag) for tag in (tags or []) if tag]
+        if not items or not self.is_configured():
+            return None
+        from core.console import log
+
+        per_question = max(2, min(MAX_CHOICE_OPTIONS, int(options_per_question or MAX_CHOICE_OPTIONS)))
+        per_call = max(1, int(questions_per_call or 4))
+        k = max(1, int(top_k or self.MEME_COARSE_TOP_K))
+        state = self._with_context({
+            "incoming": (message or "")[:800],
+            "reply": (reply or "")[:800],
+        })
+        picked: list = []
+        for start in range(0, len(items), per_question * per_call):
+            window = items[start:start + per_question * per_call]
+            chunks = {}
+            for index in range(0, len(window), per_question):
+                qid = f"c{len(chunks)}"
+                chunks[qid] = window[index:index + per_question]
+            questions = {
+                qid: {
+                    "type": "choice",
+                    "instructions": "这条回复配一张表达哪个标签的表情包最贴切",
+                    "criteria": {tag: None for tag in chunk},
+                }
+                for qid, chunk in chunks.items()
+            }
+            try:
+                result = self.decide_raw(state, questions)
+            except Exception as exc:
+                # 一个 question 失败整请求就 422，这一轮直接放弃粗排；
+                # 硬撑着只交半批候选，等于让另一半标签凭空消失。
+                log("Decision", "meme.coarse.error", error=str(exc)[:160], tags=len(items))
+                return None
+            answers = (result or {}).get("answers") or {}
+            for qid, chunk in chunks.items():
+                answer = answers.get(qid)
+                probs = answer.get("probabilities") if isinstance(answer, dict) else None
+                ranked = sorted(
+                    ((float((probs or {}).get(tag) or 0.0), tag) for tag in chunk),
+                    key=lambda item: -item[0],
+                )
+                picked.extend(tag for _, tag in ranked[:k])
+        log("Decision", "meme.coarse", tags=len(items), picked=len(picked))
+        return list(dict.fromkeys(picked)) or None
 
     @staticmethod
     def _noul_value(answer) -> float:

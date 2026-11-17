@@ -115,6 +115,7 @@ class NapCatChannel:
         )
         self.policy = policy
         self._parse_slots = None
+        self._media_slots = None
         self._ws = None
         self._loop = None
         self._thread = None
@@ -234,6 +235,11 @@ class NapCatChannel:
                                 waiter.set_result(data)
                         elif data.get("post_type") == "message":
                             if len(self._jobs) >= 32:
+                                # 之前这里是静默 continue：突发时消息就这么消失了，
+                                # 事后从日志里完全看不出"没回"是因为被丢掉。
+                                log("QQ", "dropped", reason="并发任务已满(32)",
+                                    user_id=str(data.get("user_id", "")),
+                                    group_id=data.get("group_id"))
                                 continue
                             task = asyncio.create_task(self._handle_onebot_event(data))
                             self._jobs.add(task)
@@ -268,9 +274,9 @@ class NapCatChannel:
         owner_ids = {str(x) for x in cfg.get("owner_ids", [])}
         users = owner_ids | {str(x) for x in cfg.get("allowed_user_ids", [])}
         is_owner = uid in owner_ids
-        from core.qq_authority import matching_grants
+        from core.qq_authority import grant_allowed
         actor_scope = f"qq:group:{event.get('group_id')}:user:{uid}" if event.get("message_type") == "group" else f"qq:private:{uid}"
-        delegated = any(row["allow"] for row in matching_grants(actor_scope))
+        delegated = grant_allowed(actor_scope)
         if event.get("message_type") == "private":
             return cfg.get("private_allow_all", True) or uid in users or delegated
         if event.get("message_type") == "group":
@@ -407,21 +413,35 @@ class NapCatChannel:
 
         from channels.qq_media import MessageParser
         if self._parse_slots is None:
-            self._parse_slots = asyncio.Semaphore(2)
+            # 外层是"这条消息在通道里占多少流水线宽度"，它同时兜着后面的 Jev 回复
+            # 门控（最长 35s 的 HTTP）。原来只有 2，等于全群同时最多 2 条消息能过
+            # 门：一条慢请求把后面所有群消息堵在门外，排队时间全部算进首响。
+            self._parse_slots = asyncio.Semaphore(8)
+        if self._media_slots is None:
+            # 内层才是真正的解析（下载图片/语音并转写），这一步吃网络和 CPU，
+            # 宽度仍需压在 2。
+            self._media_slots = asyncio.Semaphore(2)
 
         async with self._parse_slots:
-            parsed = await asyncio.wait_for(MessageParser(self.request, event).parse(), timeout=100)
+            # 媒体解析单独一层：它吃网络和 CPU，宽度压在 2；而外面那层 8 是给
+            # 门控留的，解析完之后立刻从内层放出去，不再占着解析的名额。
+            async with self._media_slots:
+                parsed = await asyncio.wait_for(MessageParser(self.request, event).parse(), timeout=100)
             event = dict(event)
             event["_parsed"] = parsed
             text = parsed.get("raw_text", parsed["text"]) or ("请查看这些图片。" if parsed["images"] else "")
-            log("QQ", "parsed", text_chars=len(text), images=len(parsed["images"]), errors=parsed["errors"])
+            log("QQ", "parsed", text_chars=len(text), images=len(parsed["images"]),
+                videos=len(parsed.get("videos") or []), errors=parsed["errors"])
             if not text:
                 log("QQ", "ignored", reason="无可解析内容")
                 return
 
             # Include non-replied messages in subsequent reply decisions, too.
+            # 这里落库是同步 sqlite 写（含 FTS，实测单条 80~160ms）。让它留在事件
+            # 循环线程上会冻结整条 WS 收发；扔进 to_thread 只是把等待挪走，仍然是
+            # **等写完才继续**，Web 端/桌宠看到的实时顺序一点没变。
             if self.policy and hasattr(self.policy, "observe"):
-                self.policy.observe(parsed.get("raw_text", text), event)
+                await asyncio.to_thread(self.policy.observe, parsed.get("raw_text", text), event)
 
             # 静默表情包收集（群聊 + 私聊）。私聊里发的图往往就是主人/群友的表情包，
             # 之前只在群聊生效，私聊图片只进了媒体库、没进表情包库。
@@ -440,6 +460,9 @@ class NapCatChannel:
                     limit = int(meme_cfg.get("max_collect_per_message", 9))
                     for asset in parsed["media"][:limit]:
                         # 只收这条消息自己带的图，引用/转发里那些是别人的图，重复入库没意义。
+                        # 视频/语音也不是表情，别丢进表情包库。
+                        if not str(asset.get("mime") or "").startswith("image/"):
+                            continue
                         if current_id:
                             if str(asset.get("message_id") or "") != current_id:
                                 continue
@@ -744,7 +767,12 @@ class NapCatChannel:
                     await self._send(action, target, "附件发送失败，请检查文件是否可访问，以及 NapCat 是否支持该媒体格式。")
                 elif self.policy and hasattr(self.policy, "observe"):
                     sent_event = dict(event, _sent_media=[part["_media"]] if part.get("_media") else [])
-                    self.policy.observe("[已发送" + {"image": "图片", "record": "语音", "video": "视频"}[part["type"]] + "]", sent_event, role="assistant")
+                    await asyncio.to_thread(
+                        self.policy.observe,
+                        "[已发送" + {"image": "图片", "record": "语音", "video": "视频"}[part["type"]] + "]",
+                        sent_event,
+                        role="assistant",
+                    )
         return all_delivered
 
     async def _send_text_reply(self, event, text_reply: str):
@@ -792,7 +820,7 @@ class NapCatChannel:
             delivered = await self._send(action, target, segment)
             all_delivered = bool(delivered) and all_delivered
             if delivered and self.policy and hasattr(self.policy, "observe"):
-                self.policy.observe(segment, event, role="assistant")
+                await asyncio.to_thread(self.policy.observe, segment, event, role="assistant")
             log("QQ", "reply.sent_segment", user_id=uid, segment=i + 1, ok=delivered)
         return all_delivered
 

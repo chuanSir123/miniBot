@@ -38,7 +38,6 @@ def main():
     parser.add_argument('--repeats', type=int, default=2)
     parser.add_argument('--output', default='data/response-chain-benchmark.json')
     parser.add_argument('--cache-only', action='store_true')
-    parser.add_argument('--hybrid-only', action='store_true')
     parser.add_argument('--timeout', type=int, default=30)
     args = parser.parse_args()
     import core.brain as brain_module
@@ -72,26 +71,13 @@ def main():
         return
     for repeat in range(args.repeats):
         for case, prompt in cases:
-            for mode in (('hybrid',) if args.hybrid_only else ('direct', 'jev_route', 'jev_noarg')):
+            # 固定动作(hybrid)/旧Jev路由(jev_route/jev_noarg)都已从主链路移除，
+            # 只保留"直接给模型"这一条基线；历史数据留在 data/response-chain-benchmark.json。
+            for mode in ('direct',):
                 start = time.monotonic()
                 route, jev_sec = None, 0
-                if mode != 'direct':
-                    t = time.monotonic()
-                    if mode == 'hybrid':
-                        route = jev.select_fixed_action(prompt, context={})
-                    elif mode == 'jev_route':
-                        route = jev.route_request(prompt, [], context={})
-                    else:
-                        route = jev.decide(json.dumps({'user': prompt}, ensure_ascii=False), {
-                            'route': {'type': 'choice', 'instructions': '仅明确请求列出已安装技能时选择list_skills；其他请求选vlm，禁止猜参数。',
-                                      'options': ['list_skills', 'vlm']}}).get('route', 'vlm')
-                    jev_sec = time.monotonic() - t
                 messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
-                if mode in ('jev_noarg', 'hybrid') and route == 'list_skills':
-                    result = {'elapsed_sec': 0, 'first_text_sec': None, 'text': '', 'calls': [{
-                        'id': 'benchmark', 'type': 'function', 'function': {'name': 'list_skills', 'arguments': '{}'}}], 'usage': {}, 'error': None}
-                else:
-                    result = model(brain, messages)
+                result = model(brain, messages)
                 calls = result['calls']
                 final = None
                 if calls and not result['error']:
@@ -111,7 +97,7 @@ def main():
                 rows.append(row)
                 Path(args.output).write_text(json.dumps({'model': brain.model, 'rows': rows}, ensure_ascii=False, indent=2), encoding='utf-8')
                 print(json.dumps({k: v for k, v in row.items() if k not in ('first', 'final')}, ensure_ascii=False), flush=True)
-    for mode in (('hybrid',) if args.hybrid_only else ('direct', 'jev_route', 'jev_noarg')):
+    for mode in ('direct',):
         subset = [r for r in rows if r['mode'] == mode]
         print(mode, 'median_sec', round(statistics.median(r['total_sec'] for r in subset), 3),
               'tool_match', sum(r['tool_match'] for r in subset), '/', len(subset))

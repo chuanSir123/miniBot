@@ -419,9 +419,3 @@ def transcribe_bytes(raw, local_cfg=None):
             return run("cpu", _cpu_compute(local_cfg))
         raise
 
-
-def reset_cache():
-    with _model_lock:
-        _models.clear()
-    with _state_lock:
-        _gpu_cache.update(at=0.0, value=None)

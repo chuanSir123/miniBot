@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -158,6 +160,7 @@ class ModelWireTests(Fixture):
         super().setUp()
         self.payloads = []
         self.mode = "valid"
+        self.statuses = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -347,6 +350,78 @@ class ModelWireTests(Fixture):
             )["intervene"],
             0.9,
         )
+
+    def test_any_http_error_retries_next_model(self):
+        brain = VLMBrain()
+        attempted = []
+
+        def chat_once(_messages, model_override=None):
+            attempted.append(model_override)
+            if model_override is None:
+                return "HTTP 402", 402
+            return "backup reply", None
+
+        with patch.object(brain, "_fallback_candidates", return_value=["backup"]), patch.object(
+            brain, "_chat_once", side_effect=chat_once
+        ):
+            reply = brain.chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(reply, "backup reply")
+        self.assertEqual(attempted, [None, "backup"])
+        for code in (400, 401, 402, 403, 404, 429, 500, 599):
+            self.assertEqual(VLMBrain._fallback_status(f"HTTP {code}: failed"), code)
+        self.assertIsNone(VLMBrain._fallback_status("network timeout"))
+
+    def test_streaming_http_402_retries_next_model_before_emitting(self):
+        brain = VLMBrain()
+        attempted = []
+
+        def stream_once(_messages, model_override=None, **_kwargs):
+            attempted.append(model_override)
+            if model_override is None:
+                yield "error", "【VLM 报错】HTTP 402: unavailable"
+                return ("", [], {})
+            yield "text_delta", "backup reply"
+            return ("backup reply", [], {})
+
+        with patch.object(brain, "_fallback_candidates", return_value=["backup"]), patch.object(
+            brain, "_stream_once", side_effect=stream_once
+        ):
+            events, result = self.consume(
+                brain.stream_chat_and_tools(
+                    [{"role": "user", "content": "hi"}], allow_fallback=True
+                )
+            )
+
+        self.assertEqual(attempted, [None, "backup"])
+        self.assertEqual(events, [("text_delta", "backup reply")])
+        self.assertEqual(result, ("backup reply", [], {}))
+
+    def test_streaming_error_after_output_does_not_retry_model(self):
+        brain = VLMBrain()
+        attempted = []
+
+        def stream_once(_messages, model_override=None, **_kwargs):
+            attempted.append(model_override)
+            yield "text_delta", "partial reply"
+            yield "error", "【VLM 报错】HTTP 402: unavailable"
+            return ("partial reply", [], {})
+
+        with patch.object(brain, "_fallback_candidates", return_value=["backup"]), patch.object(
+            brain, "_stream_once", side_effect=stream_once
+        ):
+            events, result = self.consume(
+                brain.stream_chat_and_tools(
+                    [{"role": "user", "content": "hi"}], allow_fallback=True
+                )
+            )
+
+        self.assertEqual(attempted, [None])
+        self.assertEqual(events, [
+            ("text_delta", "partial reply"),
+            ("error", "【VLM 报错】HTTP 402: unavailable"),
+        ])
+        self.assertEqual(result, ("partial reply", [], {}))
 
     def test_systemone_full_endpoint_and_raw_metadata(self):
         base = f"http://127.0.0.1:{self.server.server_port}/v1/systemone"
@@ -887,6 +962,47 @@ class NapCatRestartHandoffTests(Fixture):
         manager.stop()
         self.assertFalse(manager._owner_state.exists())
 
+    def test_quick_login_account_comes_back_unless_the_ticket_was_cleared(self):
+        """接管时也要修配置：否则重启要扫码，关掉重开却免扫码。"""
+        manager = self._manager()
+        cfg_dir = manager.napcat_dir / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        webui = cfg_dir / "webui.json"
+        webui.write_text(json.dumps({"autoLoginAccount": ""}), encoding="utf-8")
+        (cfg_dir / "onebot11_178108758.json").write_text("{}", encoding="utf-8")
+
+        manager._ensure_config()
+        self.assertEqual(
+            json.loads(webui.read_text(encoding="utf-8"))["autoLoginAccount"],
+            "178108758",
+        )
+
+        # 票据已被判定失效、还没扫码登回来：保持空，别写回去再撞一次快速登录
+        webui.write_text(json.dumps({"autoLoginAccount": ""}), encoding="utf-8")
+        manager._mark_ticket_invalid(True)
+        manager._ensure_config()
+        self.assertEqual(
+            json.loads(webui.read_text(encoding="utf-8"))["autoLoginAccount"], ""
+        )
+
+    def test_qr_login_restores_the_account_and_clears_the_marker(self):
+        manager = self._manager()
+        cfg_dir = manager.napcat_dir / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        webui = cfg_dir / "webui.json"
+        webui.write_text(json.dumps({"autoLoginAccount": ""}), encoding="utf-8")
+        (cfg_dir / "onebot11_178108758.json").write_text("{}", encoding="utf-8")
+        manager._mark_ticket_invalid(True)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(manager._restore_autologin())
+        self.assertEqual(
+            json.loads(webui.read_text(encoding="utf-8"))["autoLoginAccount"],
+            "178108758",
+        )
+        self.assertFalse(manager._ticket_invalid())
+        self.assertFalse(manager._force_qr)
+
 
 class NapCatBootstrapTests(Fixture):
     def prepare(self):
@@ -950,6 +1066,194 @@ class NapCatBootstrapTests(Fixture):
         self.assertEqual(
             options["additional_headers"]["Authorization"], "Bearer fixture"
         )
+
+
+class NapCatReloginTests(Fixture):
+    """QQ 掉线后要自己把二维码重新请出来：NapCat 在多进程被禁掉时不会自救。"""
+
+    def _manager(self):
+        manager = NapCatManager(self.root / "napcat")
+        manager.napcat_dir.mkdir(parents=True, exist_ok=True)
+        return manager
+
+    def test_offline_log_line_wakes_watchdog_and_qr_prints_without_prefix(self):
+        manager = self._manager()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            manager._emit_line(
+                "[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。"
+            )
+            manager._emit_line("█▀▀▄  ▄▀█▄▄▀▀▄▀▄▄███▄▄█")
+        self.assertTrue(manager._offline_event.is_set())
+        printed = buffer.getvalue()
+        # 方块码是给手机扫的：加了 log 前缀会把静默区挤歪。
+        self.assertNotIn("[NapCat] █", printed)
+        self.assertIn("█▀▀▄", printed)
+
+    def test_offline_reason_prefers_login_error_first_line(self):
+        reason = NapCatManager._offline_reason(
+            {
+                "loginPhase": "offline",
+                "loginError": "[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。\n登录服务重启失败：重启功能未初始化",
+            }
+        )
+        self.assertEqual(reason, "[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。")
+        self.assertEqual(
+            NapCatManager._offline_reason({"loginPhase": "offline"}),
+            "账号已离线，登录态失效",
+        )
+
+    def test_drop_first_relaunches_quietly_then_asks_for_a_qrcode(self):
+        """掉线先干净重拉一次（免扫码），重拉后还掉线才把二维码请出来。"""
+        manager = self._manager()
+        state = {
+            "isLogin": False,
+            "loginPhase": "offline",
+            "qrcodeurl": "",
+            "loginError": "[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。",
+        }
+        relaunches = []
+        refreshed = []
+
+        def fake_relaunch(force_qr=False):
+            relaunches.append(force_qr)
+
+        def fake_refresh():
+            refreshed.append(1)
+            state.update(
+                {
+                    "loginPhase": "waiting_qrcode",
+                    "qrcodeurl": "https://txz.qq.com/p?k=FRESH",
+                    "loginError": "",
+                }
+            )
+            return "https://txz.qq.com/p?k=FRESH"
+
+        manager.login_state = lambda: dict(state)
+        manager._relaunch_for_login = fake_relaunch
+        manager.refresh_qrcode = fake_refresh
+        buffer = io.StringIO()
+        with patch.multiple(
+            "channels.napcat_manager",
+            LOGIN_POLL_SEC=0.01,
+            LOGIN_WATCH_GRACE_SEC=0,
+            QR_MIN_INTERVAL_SEC=0,
+            QR_ANNOUNCE_MIN_GAP_SEC=0,
+            RELAUNCH_SETTLE_SEC=0,
+        ), contextlib.redirect_stdout(buffer):
+            manager._login_stop = threading.Event()
+            manager._start_login_watch()
+            deadline = time.monotonic() + 3
+            while not refreshed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            manager._stop_login_watch()
+            manager._offline_event.set()
+            manager._login_thread.join(2)
+        # 第一次是“保留票据的干净重拉”，不是直接把二维码甩给用户
+        self.assertEqual(relaunches, [False])
+        self.assertEqual(len(refreshed), 1)
+        printed = buffer.getvalue()
+        self.assertIn("QQ 登录状态异常", printed)
+        self.assertIn("https://txz.qq.com/p?k=FRESH", printed)
+        self.assertIn("qrcode.png", printed)
+        self.assertIn("6099/webui", printed)
+
+    def test_repeated_qr_failure_escalates_to_a_full_relaunch(self):
+        manager = self._manager()
+        manager.login_state = lambda: {
+            "isLogin": False,
+            "loginPhase": "offline",
+            "qrcodeurl": "",
+            "loginError": "登录服务重启失败：重启功能未初始化",
+        }
+        manager.refresh_qrcode = lambda: ""
+        relaxed = []
+        manager._relaunch_for_login = lambda force_qr=False: relaxed.append(force_qr)
+        with patch.multiple(
+            "channels.napcat_manager",
+            LOGIN_POLL_SEC=0.01,
+            LOGIN_WATCH_GRACE_SEC=0,
+            QR_MIN_INTERVAL_SEC=0,
+            QR_ANNOUNCE_MIN_GAP_SEC=0,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            manager._login_stop = threading.Event()
+            manager._start_login_watch()
+            deadline = time.monotonic() + 3
+            while not relaxed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            manager._stop_login_watch()
+            manager._offline_event.set()
+            manager._login_thread.join(2)
+        self.assertEqual(len(relaxed), 1)
+        # 第一次重拉必须保留快速登录：掉线多半只是网络/被顶号，票据还好着，
+        # 先清票据等于把一次抖动升级成必须扫码。
+        self.assertEqual(relaxed, [False])
+
+    def test_relaunch_only_clears_the_ticket_when_asked_to(self):
+        manager = self._manager()
+        calls = []
+        manager._recycle = lambda: calls.append("recycle")
+        manager._launch = lambda: calls.append("launch") or True
+        manager._clear_autologin = lambda: calls.append("clear") or True
+        with contextlib.redirect_stdout(io.StringIO()):
+            manager._relaunch_for_login()
+            manager._relaunch_for_login(force_qr=True)
+        self.assertEqual(calls, ["recycle", "launch", "clear", "recycle", "launch"])
+
+    def test_late_crash_is_not_blamed_on_the_login_ticket(self):
+        """跑了一阵子再崩只是运行期崩溃，不能算成“票据失效”去扫一次码。"""
+        manager = self._manager()
+
+        class Dead:
+            def poll(self):
+                return 1
+
+        manager.process = Dead()
+        manager._quick_login_at = time.monotonic() - 600  # 十分钟前登录成功
+        manager._recycle = lambda: None
+        manager._launch = lambda: True
+        with contextlib.redirect_stdout(io.StringIO()):
+            manager._recover_after_exit()
+        self.assertEqual(manager._quick_crashes, 0)
+        self.assertFalse(manager._force_qr)
+
+    def test_immediate_crash_inside_the_window_counts_once(self):
+        manager = self._manager()
+
+        class Dead:
+            def poll(self):
+                return 1
+
+        manager.process = Dead()
+        manager._quick_login_at = time.monotonic()  # 刚快速登录成功就退出
+        manager._recycle = lambda: None
+        manager._launch = lambda: True
+        with contextlib.redirect_stdout(io.StringIO()):
+            manager._recover_after_exit()
+        self.assertEqual(manager._quick_crashes, 1)
+        # 只崩一次不改扫码：实测这种崩溃是偶发的。
+        self.assertFalse(manager._force_qr)
+
+    def test_logged_in_state_never_touches_the_login_service(self):
+        manager = self._manager()
+        refreshed = []
+        manager.login_state = lambda: {"isLogin": True, "qrcodeurl": ""}
+        manager.refresh_qrcode = lambda: refreshed.append(1) or ""
+        with patch.multiple(
+            "channels.napcat_manager",
+            LOGIN_POLL_SEC=0.01,
+            LOGIN_WATCH_GRACE_SEC=0,
+            QR_MIN_INTERVAL_SEC=0,
+            QR_ANNOUNCE_MIN_GAP_SEC=0,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            manager._login_stop = threading.Event()
+            manager._start_login_watch()
+            time.sleep(0.15)
+            manager._stop_login_watch()
+            manager._offline_event.set()
+            manager._login_thread.join(2)
+        self.assertEqual(refreshed, [])
 
     def test_websockets14_does_not_receive_unsupported_proxy_option(self):
         def old_connect(uri, *, additional_headers=None, **kwargs):

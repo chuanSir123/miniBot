@@ -102,29 +102,6 @@ class DecisionContextTests(Fixture):
         self.assertIn('已发送', texts)
         self.assertNotIn('未发送', texts)
 
-    def test_fixed_action_gets_lite_context_only(self):
-        """固定动作只问"这句话能不能被预设参数满足"：媒体清单、会话摘要都没信息量。"""
-        jev = MagicMock()
-        jev.is_configured.return_value = True
-        jev.select_fixed_action.return_value = None
-        jev.last_error = ''
-
-        class Brain:
-            def stream_chat_and_tools(self, *a, **k):
-                yield 'text_delta', '完成'
-                return '完成', [], {}
-
-        harness = AgentHarness(Brain(), jev, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
-        scope = 'qq:group:88:user:123'
-        harness.run('继续', session_id=scope, scope=scope, allow_tools=False, decision_context=self.context())
-        lite = jev.select_fixed_action.call_args.kwargs['context']
-        for key in ('recent_conversation', 'memory'):
-            self.assertNotIn(key, lite)
-        # 媒体只保留定位需要的字段，最多五条。
-        self.assertLessEqual(len(lite.get('recent_media') or []), 5)
-        self.assertEqual(lite['sender']['user_id'], '123')
-        self.assertFalse(lite['local_tools_allowed'])
-
     def test_local_proactive_decision_contains_local_history_and_preferences(self):
         # 桌宠对话真实落在 main:pet（main 空间）；主动决策必须读这一份，
         # 否则提醒只知道桌面活动，不知道主人刚在聊什么。
@@ -141,8 +118,10 @@ class DecisionContextTests(Fixture):
 
     def test_jev_serializes_context_instead_of_flattening_or_truncating_json(self):
         client = JevClient(api_key='fake')
-        with patch.object(client, 'decide_raw', return_value={'answers': {'noarg_tool': {}}}) as decide:
-            client.select_fixed_action('发图片', context=self.context())
+        with patch.object(client, 'is_configured', return_value=True), \
+                patch.object(client, 'decide_raw',
+                             return_value={'answers': {'intent_type': {'choice': 'chat'}}}) as decide:
+            client.classify_steering_intent('发图片', context=self.context())
             state = json.loads(decide.call_args.args[0])
             self.assertEqual(state['context']['sender']['nickname'], '昵称')
 

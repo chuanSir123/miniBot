@@ -13,7 +13,6 @@ class CancelTests(Fixture):
     def _harness(self, brain):
         jev = MagicMock()
         jev.is_configured.return_value = True
-        jev.select_fixed_action.return_value = None
         jev.final_review.return_value = {'accepted': True, 'gap': 'none', 'confidence': 0.99}
         return AgentHarness(brain, jev, self.memory, FakePerception(), SkillManager(self.root / 'skills'))
 

@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple
 from core.console import log
 import json
 import os
@@ -277,10 +277,15 @@ INTERNAL_TOOL_DEFS = [
 HARNESS_TOOLS += [
     _tool("read_chat_history", "读取当前群/私聊的原始聊天记录，包括未触发回复的消息；摘要中的旧消息可用此工具回查，不跨会话读取。",
           {"before_id": {"type": "integer"}, "limit": {"type": "integer"}}),
-    _tool("manage_permissions", "结合当前主人回复、引用消息和历史理解授权/撤销意图。例如引用某人申请联网权限后主人回复‘可以’‘给他开一下’，应据引用的真实发送者QQ和所申请能力执行授权，无需固定关键词。仅当前实际发言人是配置主人时能grant/revoke；引用主人、群友自称主人不授予身份。目标QQ可从引用消息结构化发送者信息、@或明确历史记录获取，不凭昵称猜测。主人只是讨论/拒绝申请时不授权，目标/能力不明确时询问。群内默认当前群，私聊默认private；只有明确跨群/全局要求才填all。工具用tools，全部工具填tools=['*']；skills 仍可填（技能是 Markdown 指令，会转成 bash 工具权限）；duration_minutes=0长期。",
+    _tool("manage_permissions", "结合当前主人回复、引用消息和历史理解授权/撤销意图。例如引用某人申请联网权限后主人回复‘可以’‘给他开一下’，应据引用的真实发送者QQ和所申请能力执行授权，无需固定关键词。仅当前实际发言人是配置主人时能grant/revoke；引用主人、群友自称主人不授予身份；action=list 查询授权所有人可用。目标QQ可从引用消息结构化发送者信息、@或明确历史记录获取，不凭昵称猜测。默认不授权，主人只授予明确提到的单个能力：工具写 tools，技能写 skills（按技能名，可填目录名如 image-gen，不要转成 bash）；全部工具用tools=['*']，全部技能用skills=['*']。要开放给所有人时用 user_id='*' 加 chat_scope='all'，限定某个群全体用 group:群号；群内默认当前群，私聊默认private。duration_minutes=0长期。授权若返回 needs_confirmation，必须把 dependencies 逐条念给主人听（依赖不会被自动授权），等主人明确同意后再带 confirm=true 和 confirm_token 原样重试一次；没有主人同意绝不自作主张确认。",
           {"action": {"type": "string", "enum": ["grant", "revoke", "list"]},
-           "user_id": {"type": "string", "description": "目标QQ号；只有主人明确要求本群全体成员时才使用*，并限定具体群"}, "chat_scope": {"type": "string"},
-           "tools": {"type": "array"}, "skills": {"type": "array"}, "duration_minutes": {"type": "number"}}, ["action"]),
+           "user_id": {"type": "string", "description": "目标QQ号；主人明确要求开放给所有人时填*"},
+           "chat_scope": {"type": "string", "description": "private、group:群号或all；全员授权用all"},
+           "tools": {"type": "array", "description": "工具名数组，单个权限只填一个名字；全部工具用['*']"},
+           "skills": {"type": "array", "description": "技能名数组，单个技能只填一个名字；全部技能用['*']"},
+           "duration_minutes": {"type": "number"},
+           "confirm": {"type": "boolean", "description": "主人已明确同意依赖后填true"},
+           "confirm_token": {"type": "string", "description": "needs_confirmation 返回的令牌，配合 confirm=true 使用"}}, ["action"]),
     _tool("list_media", "查询当前会话近期媒体引用（图片/视频/音频）及来源。修改上一张/刚才的图时先查询；优先选当前上传或引用消息的媒体，不要猜测media_ref。不会返回Base64。",
           {"limit": {"type": "integer"}, "message_id": {"type": "string"}}),
     _tool("get_media", "解析当前会话的 media_ref：返回元数据与本机文件路径 file_path。技能脚本需要图片/音频数据时，先用本工具取 file_path，再作为文件参数传给脚本；图片额外返回预览。不返回 Base64 文本，避免大段数据进入上下文；编辑图片时复用同一个 media_ref。",
@@ -892,7 +897,7 @@ class AgentHarness:
         self._local.actor = kwargs.get("actor") or ""
         started = time.monotonic()
         self._local.started_at = started
-        self._local.timings = {"route_ms": 0, "model_ms": 0, "tool_ms": 0, "review_ms": 0,
+        self._local.timings = {"model_ms": 0, "tool_ms": 0, "review_ms": 0,
                                "model_calls": 0, "review_calls": 0}
         log("Harness", "start", session=session)
         # 轮次文件台账：技能/命令直接写盘的 mp4、gif、图片不经过 write，
@@ -935,6 +940,15 @@ class AgentHarness:
             self._local.review_feedback = None
             self._local.actor = ""
             # 清掉本线程的取消信号，避免同一 worker 线程的下一个任务误判为"已取消"。
+            # 换新 Event 之前必须把旧的 set() 掉：每次 bash 都会起一个线程阻塞在
+            # old.wait() 上（见 _execute_tool 的 _watch_cancel），直接换新等于把它们
+            # 永久挂住，常驻进程里线程数会随 bash 调用次数一路涨上去。
+            previous_cancel = getattr(self._local, "cancel", None)
+            if previous_cancel is not None:
+                try:
+                    previous_cancel.set()
+                except Exception:
+                    pass
             self._local.cancel = __import__("threading").Event()
             try:
                 state = self.memory.get_task_state(session)
@@ -985,7 +999,7 @@ class AgentHarness:
 
         cfg = load_config()
         if not hasattr(self._local, "timings") or not self._local.timings:
-            self._local.timings = {"route_ms": 0, "model_ms": 0, "tool_ms": 0, "review_ms": 0, "model_calls": 0, "review_calls": 0}
+            self._local.timings = {"model_ms": 0, "tool_ms": 0, "review_ms": 0, "model_calls": 0, "review_calls": 0}
         if not hasattr(self._local, "cancel"):
             self._local.cancel = __import__("threading").Event()
         self._local.status = on_status_change
@@ -998,10 +1012,6 @@ class AgentHarness:
         actor = getattr(self._local, "actor", "") or actor
         decision_context = dict(decision_context, channel=channel,
                                 local_tools_allowed=bool(tool_access(scope, "bash", actor=actor) and not readonly), readonly=readonly)
-        # 固定动作与技能路由共用这份精简上下文：完整版 9.5KB 里 5.2KB 是媒体
-        # 清单和会话摘要，"这句话能不能用预设动作直接满足"读不到它们。
-        from core.decision_context import lite_context
-        lite_ctx = lite_context(decision_context)
         previous_checkpoint = self.memory.get_task_state(session_id) or decision_context.get("task_state") or decision_context.get("continuation_checkpoint") or {}
         unfinished = bool(previous_checkpoint.get('original_goal') and previous_checkpoint.get('status') not in ('complete','completed'))
         continuing = False
@@ -1281,23 +1291,11 @@ class AgentHarness:
             blocked, notice = guard_repeated_call(
                 name, args, signature, repeat_calls, scope, len(trace))
             return blocked, notice
-        # 固定动作是进入执行前的快捷入口，不参与任何执行期判定：只问"这句话
-        # 能不能被预设参数完整满足"（发最后一张图之类），满足就省一次模型往返。
-        route_started = time.monotonic()
-        fast_tool = None
-        from core.fast_actions import resolve_fixed_action
-        if (cfg["runtime"].get("jev_noarg_enabled", True) and not readonly
-                and self.jev and self.jev.is_configured()
-                and hasattr(self.jev, "select_fixed_action")):
-            # 固定动作只问"这句话能不能被预设参数完整满足"，加上最近几张图的 ref
-            # 就够（"发最后一张图"靠它），不需要整份 9.5KB 上下文。
-            media = [m for m in (decision_context.get("recent_media") or [])[:5] if isinstance(m, dict)]
-            fast_tool = self.jev.select_fixed_action(user_prompt, context=dict(lite_ctx, recent_media=[
-                {k: m[k] for k in ("media_ref", "mime", "label", "sender_qq") if m.get(k)} for m in media]))
-            if not resolve_fixed_action(fast_tool):
-                fast_tool = None
-        self._local.timings["route_ms"] = round((time.monotonic() - route_started) * 1000)
-        log("Harness", "route", session=session_id, route=fast_tool or "vlm", policy="selective")
+        # 原来的"固定动作"入口（Jev 从 4 个预设里选 action_id，程序映射成写死参数的
+        # tool_call）已整体移除：它只覆盖 list_skills / list_reminders / list_media /
+        # manage_permissions(list) 这类零参工具，却要为每条非只读消息多付一次 Jev
+        # HTTP（0.5~2s）。它省的是"模型先输出一次 tool_call"的那一轮往返，收益抵不过
+        # 这个成本；需要模型提参的工具本来也进不了表。所有请求一律交给模型规划。
         available_tools = [
             t for t in HARNESS_TOOLS if t["function"]["name"] in permitted
         ]
@@ -1400,10 +1398,9 @@ class AgentHarness:
                 append(stamped_entry({"role": "assistant", "content": reply}))
                 return reply
             image = None
-            is_fast = fast_tool is not None
             log(
                 "Harness",
-                "fast_tool.start" if is_fast else "model.start",
+                "model.start",
                 session=session_id,
                 step=turn + 1,
                 messages=len(messages),
@@ -1413,42 +1410,33 @@ class AgentHarness:
                 system_fp=system_fp,
                 tail_chars=len(str(messages[-1].get("content"))) if messages else 0,
             )
-            if is_fast:
-                def selected_call():
-                    if False:
-                        yield
-                    fixed = resolve_fixed_action(fast_tool)
-                    return "", [{"id": "fast_" + __import__("uuid").uuid4().hex, "type": "function",
-                                 "function": {"name": fixed['tool'], "arguments": json.dumps(fixed['arguments'], ensure_ascii=False)}}], {}
-                generator = selected_call()
-            else:
-                cancel_event = getattr(self._local, "cancel", None)
+            cancel_event = getattr(self._local, "cancel", None)
 
-                def open_stream():
-                    """兼容不接受 cancel_event / allow_fallback 的 Brain 实现。"""
-                    attempts = (
-                        {
-                            "model_override": model_override,
-                            "cancel_event": cancel_event,
-                            "allow_fallback": allow_model_fallback,
-                        },
-                        {"model_override": model_override, "cancel_event": cancel_event},
-                        {"model_override": model_override},
-                        {},
-                    )
-                    last_error = None
-                    for extra in attempts:
-                        try:
-                            return self.brain.stream_chat_and_tools(
-                                messages, tools=tools or None, **extra
-                            )
-                        except TypeError as err:
-                            last_error = err
-                            if "unexpected keyword" not in str(err) and "argument" not in str(err):
-                                raise
-                    raise last_error
+            def open_stream():
+                """兼容不接受 cancel_event / allow_fallback 的 Brain 实现。"""
+                attempts = (
+                    {
+                        "model_override": model_override,
+                        "cancel_event": cancel_event,
+                        "allow_fallback": allow_model_fallback,
+                    },
+                    {"model_override": model_override, "cancel_event": cancel_event},
+                    {"model_override": model_override},
+                    {},
+                )
+                last_error = None
+                for extra in attempts:
+                    try:
+                        return self.brain.stream_chat_and_tools(
+                            messages, tools=tools or None, **extra
+                        )
+                    except TypeError as err:
+                        last_error = err
+                        if "unexpected keyword" not in str(err) and "argument" not in str(err):
+                            raise
+                raise last_error
 
-                generator = open_stream()
+            generator = open_stream()
             text = []
             reasoning_chunks = []
             reasoning_done_flag = False
@@ -1567,14 +1555,12 @@ class AgentHarness:
             if interrupted_for_steering:
                 # 引导已经写进历史，回主循环重新请求一次模型，由它按新方向生成。
                 continue
-            fast_tool = None
             model_elapsed_ms = round((time.monotonic() - model_started) * 1000)
-            if not is_fast:
-                self._local.timings["model_ms"] += model_elapsed_ms
-                self._local.timings["model_calls"] += 1
+            self._local.timings["model_ms"] += model_elapsed_ms
+            self._local.timings["model_calls"] += 1
             log(
                 "Harness",
-                "fast_tool.end" if is_fast else "model.end",
+                "model.end",
                 session=session_id,
                 error=stream_error,
                 elapsed_ms=model_elapsed_ms,
@@ -2002,7 +1988,6 @@ class AgentHarness:
         actor="",
     ):
         from core.config import load_config, save_config
-        from core.process import run_bounded
         from core.skill_manager import validate_args
 
         if permitted is None:

@@ -52,11 +52,6 @@ def _trim_strings(node, limit, skip_keys=()):
     return changed
 
 
-def trim_long_strings(node, limit, skip_keys=()):
-    """公开版：递归截断结构里的超长字符串，返回是否改动。"""
-    return _trim_strings(node, limit, skip_keys)
-
-
 def _drop_file_diffs(wire):
     """file_changes.diff 是整份改动，Jev 只需要知道"哪个文件改了多少行"。"""
     state = wire.get("context", {}).get("task_state") or {}

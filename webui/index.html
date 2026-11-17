@@ -1534,7 +1534,7 @@
                 </div>
               </div>
               <div class="form-group">
-                <label>VLM API Key</label>
+                <label>VLM API Key <span style="font-weight: 400; color: #888888; font-size: 11px;">多个用英文逗号分隔；固定用同一个，429 后自动切下一个</span></label>
                 <input type="password" id="vlm_api_key" placeholder="留空则保持现有 Key">
               </div>
               <div class="grid-2">
@@ -1777,10 +1777,6 @@
                 </div>
               </div>
               <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-                <div class="checkbox-group">
-                  <input type="checkbox" id="napcat_allow_owner_tools">
-                  <label for="napcat_allow_owner_tools">允许主人调用全部本机工具与技能</label>
-                </div>
                 <div class="checkbox-group">
                   <input type="checkbox" id="napcat_smart_reply">
                   <label for="napcat_smart_reply">开启群聊快脑智能门控</label>
@@ -4990,7 +4986,7 @@
         // VLM
         document.getElementById('vlm_base_url').value = cfg.vlm?.base_url || '';
         document.getElementById('vlm_model').value = cfg.vlm?.model || '';
-        document.getElementById('vlm_api_key').placeholder = cfg.vlm?.api_key_configured ? '（已配置，留空则保留）' : '填入 API Key';
+        document.getElementById('vlm_api_key').placeholder = cfg.vlm?.api_key_configured ? '（已配置，留空则保留；多个 Key 用英文逗号分隔）' : '填入 API Key（多个用英文逗号分隔）';
         document.getElementById('vlm_context_window').value = cfg.vlm?.context_window || 128000;
         document.getElementById('vlm_max_tokens').value = cfg.vlm?.max_tokens || 4096;
         document.getElementById('vlm_enable_thinking').checked = Boolean(cfg.vlm?.enable_thinking);
@@ -5041,7 +5037,7 @@
         // Persona
         document.getElementById('persona_name').value = cfg.persona?.name || '';
         document.getElementById('persona_aliases').value = (cfg.persona?.aliases || []).join(', ');
-        document.getElementById('persona_prompt').value = cfg.persona?.prompt ?? cfg.persona?.system_prompt ?? '';
+        document.getElementById('persona_prompt').value = cfg.persona?.prompt ?? '';
 
         // Channels
         const nap = cfg.channels?.napcat || {};
@@ -5050,7 +5046,6 @@
         document.getElementById('napcat_owner_ids').value = (nap.owner_ids || []).join(', ');
         document.getElementById('napcat_allowed_groups').value = (nap.allowed_group_ids || []).join(', ');
         document.getElementById('napcat_blacklist').value = (nap.blacklisted_user_ids || []).join(', ');
-        document.getElementById('napcat_allow_owner_tools').checked = Boolean(nap.allow_owner_tools);
         document.getElementById('napcat_smart_reply').checked = Boolean(nap.group_smart_reply ?? nap.smart_reply ?? true);
 
         const pet = cfg.channels?.pet || {};
@@ -5130,7 +5125,6 @@
             owner_ids: document.getElementById('napcat_owner_ids').value.split(',').map(s => s.trim()).filter(Boolean),
             allowed_group_ids: document.getElementById('napcat_allowed_groups').value.split(',').map(s => s.trim()).filter(Boolean),
             blacklisted_user_ids: document.getElementById('napcat_blacklist').value.split(',').map(s => s.trim()).filter(Boolean),
-            allow_owner_tools: document.getElementById('napcat_allow_owner_tools').checked,
             group_smart_reply: document.getElementById('napcat_smart_reply').checked
           }
         }
@@ -5496,7 +5490,7 @@
                 <input type="text" placeholder="留空则继承全局 Base URL" value="${baseUrlVal}" oninput="updateModelField(${i}, 'base_url', this.value)">
               </div>
               <div class="form-group" style="margin-bottom: 8px;">
-                <label style="font-size: 12px;">独立 API Key (可选)</label>
+                <label style="font-size: 12px;">独立 API Key (可选，多个用逗号分隔，429 自动切换)</label>
                 <input type="password" placeholder="${keyPlaceholder}" oninput="updateModelField(${i}, 'api_key', this.value)">
               </div>
             </div>

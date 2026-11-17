@@ -8,16 +8,12 @@ Design principles:
 - Strict guardrail: Proposals require user review; plans are never rewritten behind the user's back.
 """
 
-import hashlib
 import json
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
-
-from core.memory import DB_PATH, keywords
 
 GOAL_STATUSES = ("active", "paused", "done", "cancelled")
 STEP_STATUSES = ("pending", "in_progress", "done", "blocked", "skipped")

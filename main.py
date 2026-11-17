@@ -148,8 +148,9 @@ class MiniBotApp:
             # Pet 固定使用 main 空间
             return "main", "main:pet", "pet", "", True
         uid = str(event["user_id"])
-        from core.qq_authority import owner_tools_allowed
-        tools = owner_tools_allowed(uid)
+        # 权限由 _execute_tool 里的 tool_access 按 actor 判定，入口不再设总开关；
+        # 这个值只影响本轮文件变更台账是否记录。
+        tools = True
         cfg_napcat = load_config()["channels"]["napcat"]
         is_owner = uid in {str(x) for x in cfg_napcat.get("owner_ids", [])}
         if event["message_type"] == "group":
@@ -390,41 +391,52 @@ class MiniBotApp:
         task_state = self.memory.get_task_state(session) or {}
         task_state["is_running"] = is_running
 
-        # 第一层 Jev 意图判断：通过第一层 Jev 判断是 chat 还是引导等
-        # 提示词要说明是否和上次任务相关并且是否要修正或引导上次任务
+        # 第一层 Jev 意图判断：**只在"上一条任务还在跑"时才有意义**。
+        # 空闲时上面两个分支的落点完全相同（都入队本会话），这次 HTTP 换来的是
+        # 0.5~2s 的白等；而"空闲但留着未完成检查点、这句话是在继续"的情形，
+        # harness.run 自己会再判一次（见 harness.run 里的 continuing），
+        # 这里重复问一遍只是把同一件事问两次。
         jev = getattr(self, "jev", None)
-        if jev and hasattr(jev, "classify_steering_intent"):
-            intent = jev.classify_steering_intent(text, task_state=task_state)
+        if is_running and jev and hasattr(jev, "classify_steering_intent"):
+            try:
+                intent = jev.classify_steering_intent(text, task_state=task_state)
+            except Exception:
+                intent = "independent_task"
         else:
-            intent = "independent_task"  # No semantic guess or live injection when Jev is unavailable.
+            # 空闲（或 Jev 不可用）不做语义猜测：一律按独立任务入队。
+            intent = "independent_task"
 
-        # 1. 引导类型：用于引导上一次任务的就要执行引导
-        if intent == "steering":
-            if is_running:
-                # 任务正在执行中：直接插入引导进行方向修正！
-                ok = self.harness.inject_steering(session, text)
-                future = concurrent.futures.Future()
-                if ok:
-                    # 只报一句「已进入引导」。原文带换行＋引号会被 split_chat_text
-                    # 切成两条气泡，而 harness 那边生效时还会再回显一次，三条就齐了。
-                    reply = "🎯 [实时引导] 收到，已插进当前任务，往新方向调整。"
-                else:
-                    reply = "引导注入失败，请稍后重试。"
-                future.set_result(reply)
-                if channel == "pet" and self.pet_widget:
-                    self.pet_widget.stream_say_safe(reply)
-                return future
+        # 1. 引导类型：任务正在跑才谈得上"插进当前任务"
+        if intent == "steering" and is_running:
+            # 任务正在执行中：直接插入引导进行方向修正！
+            ok = self.harness.inject_steering(session, text)
+            future = concurrent.futures.Future()
+            if ok:
+                # 只报一句「已进入引导」。原文带换行＋引号会被 split_chat_text
+                # 切成两条气泡，而 harness 那边生效时还会再回显一次，三条就齐了。
+                reply = "🎯 [实时引导] 收到，已插进当前任务，往新方向调整。"
             else:
-                # 上次任务刚结束或待命：作为对上一次任务的引导和修改继续执行
-                dispatch_session = session
+                reply = "引导注入失败，请稍后重试。"
+            future.set_result(reply)
+            if channel == "pet" and self.pet_widget:
+                self.pet_widget.stream_say_safe(reply)
+            return future
+
+        # 2. 非引导：默认排在正在跑的任务**后面**（同一会话一次只跑一件事）。
+        #    并发跑两份 harness 会让两个线程同时写同一份历史、同一份 task_state：
+        #    后进来的那句把 original_goal 覆盖掉，正在跑的长任务就丢了目标，
+        #    历史里两轮消息还会交错。Dispatcher 的按会话串行本来就是为此存在的。
+        #    busy_policy=async 保留旧的"另开会话并发跑"行为（群聊人多时想立刻回应
+        #    可以切过去），代价就是上面那段竞态。
+        busy_policy = str(load_config()["runtime"].get("busy_policy", "queue")).lower()
+        if is_running and busy_policy == "async":
+            import uuid
+            dispatch_session = f"{session}:async:{uuid.uuid4().hex[:6]}"
         else:
-            # 2. 其他类型：应该是异步，支持并发
+            dispatch_session = session
             if is_running:
-                # 若主会话正在忙碌执行长任务，为了不阻塞并支持并发，分配一个独立异步并发会话
-                import uuid
-                dispatch_session = f"{session}:async:{uuid.uuid4().hex[:6]}"
-            else:
-                dispatch_session = session
+                # 排队期间没有任何进度可播，先回一句让用户知道没丢。
+                self._ack_busy(channel, target, session)
 
         images = input_images if input_images is not None else (event or {}).get("_parsed", {}).get("images", [])
 
@@ -876,6 +888,29 @@ class MiniBotApp:
             print("[Notification]", exc)
             return False
 
+    def _ack_busy(self, channel, target, session):
+        """任务在跑时先回一句「排队中」，避免用户以为消息被吞了。
+
+        只对 QQ 渠道说（pet/web 那边有流式状态，插一句反而打断）。
+        同一会话 20 秒内只提示一次：连续追加几条消息不该连刷几遍。
+        """
+        if channel not in ("qq_private", "qq_group"):
+            return
+        now = time.monotonic()
+        marks = getattr(self, "_busy_ack_at", None)
+        if not isinstance(marks, dict):
+            marks = {}
+            self._busy_ack_at = marks
+        if now - float(marks.get(session) or 0) < 20:
+            return
+        marks[session] = now
+        import threading
+        threading.Thread(
+            target=self._notify_qq,
+            args=(channel, target, "⏳ 上一个任务还在跑，这条我排在它后面，跑完立刻回你。", session),
+            daemon=True,
+        ).start()
+
     def _record_in_assistant(self, role, text, source=""):
         """把一条渠道消息归档进 Web main 空间置顶的「助理」会话。"""
         try:
@@ -1324,14 +1359,19 @@ class MiniBotApp:
 
         cfg = self.cfg["channels"]["napcat"]
         if cfg.get("auto_launch", True):
-            if onebot_listening(cfg["ws_url"]):
-                # 上一次运行的 NapCat / 外部实例还在监听：接管它，绝不再拉一个 QQ。
-                self.napcat_mgr = NapCatManager()
-                if not self.napcat_mgr.adopt():
-                    self.napcat_mgr = None
+            manager = NapCatManager()
+            # 先看有没有上一次留下、仍在运行的 NapCat —— 判断依据必须是“记录的进程
+            # 还活着”，不是“3001 是否在监听”。重启交接过来的实例可能正处在重连、
+            # 等扫码的间隙里（端口短暂不监听），按端口判断会把它连同 QQ 一起杀掉
+            # 重来：轻则白丢一次登录态，重则票据失效被迫扫码。
+            if manager.adopt():
+                self.napcat_mgr = manager
+            elif onebot_listening(cfg["ws_url"]):
+                # 端口在监听、但记录不是我们的：外部自建 NapCat，只连不管。
+                self.napcat_mgr = None
             else:
-                self.napcat_mgr = NapCatManager()
-                if not self.napcat_mgr.start(cfg.get("qq_number", "")):
+                self.napcat_mgr = manager
+                if not manager.start(cfg.get("qq_number", "")):
                     raise RuntimeError("NapCat启动失败，请检查安装或使用外部NapCat")
         self.napcat_channel = NapCatChannel(
             cfg["ws_url"], cfg["access_token"], self.submit_query, self._observe_qq, self.qq_policy

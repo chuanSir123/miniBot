@@ -6,7 +6,6 @@ such as write and edit, allowing diff-style dynamic line counters
 (+X, -Y) and live code snippet previews before the tool call completes.
 """
 import re
-from pathlib import Path
 from typing import Dict, Any
 
 

@@ -80,7 +80,7 @@ class SkillLifecycleTests(Fixture):
 
     def test_remote_nonowner_cannot_save_or_activate(self):
         harness = self.harness()
-        config.save_config({'channels': {'napcat': {'owner_ids': ['123'], 'allow_owner_tools': True}}})
+        config.save_config({'channels': {'napcat': {'owner_ids': ['123']}}})
         result = harness._dispatch_tool('activate_skill', {'skill_name': 'anything'},
                                         scope='qq:private:456', session_id='qq:private:456')
         self.assertFalse(result['ok'])

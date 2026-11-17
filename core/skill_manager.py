@@ -12,7 +12,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from core.config import load_config, save_config
+from core.config import load_config
 from core.process import run_bounded
 from core import agent_skills
 

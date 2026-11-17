@@ -20,16 +20,150 @@ from core.console import log
 # 流读取线程的结束哨兵（标识对象，避免与真实数据行混淆）。
 _STREAM_EOF = object()
 
-# 这些状态码属于"模型本身或它前面的网关坏了"，换一个模型往往立刻可用：
-# 404 模型下线/名字写错、5xx 是上游崩溃或网关断开、429 是当前模型过载。
-# 400/401/403/413/422 是请求体或凭证的问题，换模型只会原样再失败一次。
-_FALLBACK_HTTP_STATUS = frozenset(
-    {404, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
-)
+# HTTP 请求只要不是 200，就尝试下一个配置模型；即使是鉴权/计费/请求错误，
+# 不同模型可能走不同服务端配置。流式请求仍只允许在尚未输出内容时切换。
 
 # 模型刚失败过的冷却时间：主模型 404 时，接下来这段时间直接走备用模型，
 # 不必每轮都先撞一次墙。可用 runtime.model_fallback_cooldown_sec 覆盖。
 _DEFAULT_FALLBACK_COOLDOWN_SEC = 120.0
+
+# API Key 池：vlm.api_key 和任一模型条目的 api_key 都允许用英文逗号填多个。
+# 策略是「粘滞」而不是轮流：一直用当前 Key，直到它 429（配额耗尽）才切下一个。
+# 上游前缀缓存按 Key / 账号分区，每次轮换 Key 会让同一份前缀落到不同分区，
+# 命中率直接归零，所以正常情况下绝不能换。
+# 状态按「Key 池」元组分别保存，进程内全局共享并加锁：QQ / 桌宠 / Web 并发
+# 请求看到的是同一个当前 Key，多个并发 429 也只会推进一次。
+_key_pool_lock = threading.Lock()
+_key_pool_state: Dict[Tuple[str, ...], str] = {}
+
+
+def split_api_keys(raw: Any) -> List[str]:
+    """把 'k1,k2, k3' 拆成 ['k1', 'k2', 'k3']；空值返回空列表。"""
+    if not raw:
+        return []
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def _key_fp(key: str) -> str:
+    """日志里只记指纹，不把 Key 明文写出去。"""
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+
+
+def current_api_key(raw: Any) -> str:
+    """取当前应使用的 Key；除非 429 触发 advance，否则永远返回同一个。"""
+    keys = split_api_keys(raw)
+    if not keys:
+        return ""
+    pool = tuple(keys)
+    with _key_pool_lock:
+        current = _key_pool_state.get(pool)
+        if current not in keys:
+            # 首次见到这个池，或配置热重载换了池：尽量沿用仍在池里的旧 Key，
+            # 避免改配置就把前缀缓存清空。
+            current = keys[0]
+            _key_pool_state[pool] = current
+            log("VLM", "key.select", pool=len(keys), slot=1, key_fp=_key_fp(current))
+        return current
+
+
+def advance_api_key(raw: Any, failed_key: str) -> str:
+    """当前 Key 429 后切到池里下一个；并发 429 只推进一次，用完环绕回第一个。"""
+    keys = split_api_keys(raw)
+    if len(keys) <= 1:
+        return failed_key
+    pool = tuple(keys)
+    with _key_pool_lock:
+        current = _key_pool_state.get(pool) or keys[0]
+        if current != failed_key:
+            # 别的请求已经切过了，本次重试直接用新 Key，不再重复推进。
+            return current
+        index = keys.index(current)
+        nxt = keys[(index + 1) % len(keys)]
+        _key_pool_state[pool] = nxt
+    log("VLM", "key.switch", pool=len(keys), from_slot=index + 1,
+        to_slot=(index + 1) % len(keys) + 1, to_key_fp=_key_fp(nxt))
+    return nxt
+
+
+# ---------------------------------------------------------------------------
+# 工具调用配对修复
+# ---------------------------------------------------------------------------
+# 严格网关（coarena.ai / app.vllm-sr.ai）校验消息序列：assistant(tool_calls)
+# 之后必须紧跟每个 call 对应的 tool 结果，中间夹任何消息都直接 400
+# （"A tool message must follow the assistant message whose tool_calls it answers"）。
+# 表情补发走的是异步链路（选图一次 HTTP、可能几十秒），落库时正好插到
+# tool_call 与执行结果之间，把配对打断；脏数据一直留在库里，重启也修不好。
+# 这层投影放在请求出口：工具结果提前到所属 assistant 之后，孤立 tool 丢弃。
+# 对合法序列是等值映射（逐字节不变），所以不影响前缀缓存命中。
+_TOOL_PAIR_LOOKAHEAD = 6
+
+
+def repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """修复 assistant(tool_calls) 与 tool 结果的配对顺序。
+
+    - 夹在两者之间的消息（异步补写的图片 / 提示）后移到该组结果之后；
+    - 找不到所属 assistant 的 tool 消息丢弃（它出现在任何位置都非法）；
+    - 单趟、有界重排：遇到下一组 tool_calls 就停，不跨轮次搬消息。
+
+    配对齐全且紧邻时返回等值的新列表，元素内容与顺序逐字节不变。
+    """
+    if not messages:
+        return messages
+    out: List[Dict[str, Any]] = []
+    moved = dropped = unanswered = 0
+    index, total = 0, len(messages)
+    while index < total:
+        item = messages[index]
+        role = item.get("role")
+        if role == "tool":
+            # 前面没有 assistant(tool_calls)，这条结果无处可依。
+            dropped += 1
+            index += 1
+            continue
+        calls = item.get("tool_calls") if role == "assistant" else None
+        pending = [
+            str(call.get("id"))
+            for call in (calls or [])
+            if isinstance(call, dict) and call.get("id")
+        ]
+        if not pending:
+            out.append(item)
+            index += 1
+            continue
+        answers: List[Dict[str, Any]] = []
+        deferred: List[Dict[str, Any]] = []
+        cursor = index + 1
+        while cursor < total and pending and cursor - index <= _TOOL_PAIR_LOOKAHEAD:
+            nxt = messages[cursor]
+            nxt_role = nxt.get("role")
+            if nxt_role == "tool":
+                call_id = str(nxt.get("tool_call_id") or "")
+                if call_id in pending:
+                    pending.remove(call_id)
+                    answers.append(nxt)
+                else:
+                    dropped += 1
+                cursor += 1
+                continue
+            if nxt_role == "assistant" and nxt.get("tool_calls"):
+                break  # 下一组调用：不能把它的结果搬到这里
+            deferred.append(nxt)
+            cursor += 1
+        out.append(item)
+        if answers:
+            out.extend(answers)
+            out.extend(deferred)
+            moved += len(deferred)
+        else:
+            # 一条结果都没找到：保持原顺序，不制造跨轮次重排。
+            out.extend(deferred)
+        unanswered += len(pending)
+        index = cursor
+    if moved or dropped:
+        log("VLM", "messages.repair", moved=moved, dropped=dropped,
+            unanswered=unanswered, total=total)
+    return out
+
 
 # 判断"内容是不是已经说到句子结尾了"。上游半开/被 RST 时我们拿不到
 # finish_reason，只能靠这个兜底：末尾是标点、右括号、颜文字、emoji 视为说完了；
@@ -82,7 +216,18 @@ class VLMBrain:
         self._cooldown_lock = threading.Lock()
 
     def is_configured(self) -> bool:
-        return bool((self._overrides[1] or load_config()["vlm"]["api_key"]).strip())
+        # 显式传入的 Key、顶层 vlm.api_key、默认模型条目的独立 Key 都算数。
+        # 与 _settings(None) 的解析保持一致：否则只在模型条目里配 Key 时会被
+        # 误判成「未配置」，请求直接被挡在 _stream_once 门口。
+        if split_api_keys(self._overrides[1]):
+            return True
+        if split_api_keys(load_config()["vlm"].get("api_key")):
+            return True
+        try:
+            from core.config import resolve_vlm_model_config
+            return bool(split_api_keys(resolve_vlm_model_config().get("api_key")))
+        except Exception:
+            return False
 
     def _settings(self, model_override=None):
         from core.config import resolve_vlm_model_config
@@ -104,23 +249,29 @@ class VLMBrain:
                 m_cfg.get("model") or model or cfg["model"],
                 merged_cfg,
             )
+        # 没指定模型时也要命中「设为默认」的那条 models 配置：否则 QQ / 桌宠
+        # 这类不带 model_override 的请求会永远读顶层 vlm.*，is_default 形同虚设。
+        # 构造时显式传入的 base_url/api_key/model 优先级最高，避免配置覆盖掉
+        # 测试与工具脚本手工指定的地址。
+        m_cfg = resolve_vlm_model_config()
+        merged_cfg = {**cfg, **m_cfg}
         return (
-            (base or cfg["base_url"]).rstrip("/"),
-            key or cfg["api_key"],
-            model or cfg["model"],
-            cfg,
+            (base or m_cfg.get("base_url") or cfg["base_url"]).rstrip("/"),
+            key or m_cfg.get("api_key") or cfg["api_key"],
+            model or m_cfg.get("model") or cfg["model"],
+            merged_cfg,
         )
 
     # ---------- 主模型不可用时的备用模型回退 ----------
 
     @staticmethod
     def _fallback_status(message) -> Optional[int]:
-        """从错误文本里取 HTTP 状态码；只有"换模型可能救得回来"的才返回。"""
-        match = re.search(r"HTTP\s*(\d{3})", str(message or ""))
+        """任意非 200 HTTP 状态都允许尝试下一个模型；非 HTTP 错误不回退。"""
+        match = re.search(r"HTTP\s*(\d{3})", str(message or ""), re.IGNORECASE)
         if not match:
             return None
         code = int(match.group(1))
-        return code if code in _FALLBACK_HTTP_STATUS else None
+        return code if code != 200 else None
 
     @staticmethod
     def _model_label(model_override=None) -> str:
@@ -387,7 +538,21 @@ class VLMBrain:
                         }
                     )
                 last_msg["content"] = content_list
-        return formatted
+        # 发请求前的最后一道出口：只保留 OpenAI 兼容网关认得的字段。
+        # 历史消息里有 get_history 注入的 _id、实时引导的 is_steering、meta 等
+        # 内部标记；宽松网关会忽略，严格网关（app.vllm-sr.ai）会直接 400
+        # "request JSON contains a non-canonical field"。
+        wire_fields = frozenset({
+            "role", "content", "name", "tool_calls", "tool_call_id",
+            "reasoning_content",
+        })
+        wire = [
+            {k: v for k, v in item.items() if k in wire_fields}
+            for item in formatted
+        ]
+        # 配对修复放在字段投影之后：判断只用到 role / tool_calls / tool_call_id，
+        # 投影后已经齐全；两条网关约束（字段白名单 + 配对）都在同一个出口兜住。
+        return repair_tool_pairs(wire)
 
     @staticmethod
     def _fingerprint(value) -> str:
@@ -445,7 +610,9 @@ class VLMBrain:
     ) -> Tuple[str, Optional[int]]:
         """单次非流式请求，返回 (文本, HTTP 状态码)。成功时状态码为 None。"""
         settings = self._settings(model_override=model_override)
-        base_url, api_key, _, _ = settings
+        base_url, raw_key, model, cfg = settings
+        api_key = current_api_key(raw_key)
+        settings = (base_url, api_key, model, cfg)
         endpoint = (
             f"{base_url}/chat/completions"
             if not base_url.endswith("/chat/completions")
@@ -454,26 +621,46 @@ class VLMBrain:
         payload = self._build_payload(
             formatted_messages, stream=False, settings=settings
         )
+        # ensure_ascii=False：默认值会把每个中文字符转成 \uXXXX（6 字节 → 实际 3 字节）。
+        # 人设 + 历史全是中文时请求体能小 17%~40%，而上传耗时直接计入 TTFT
+        # （实测 243KB 的 50k 上下文，请求体每小 40KB 约省 0.3s）。
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-        req = urllib.request.Request(
-            endpoint,
-            # ensure_ascii=False：默认值会把每个中文字符转成 \uXXXX（6 字节 → 实际 3 字节）。
-            # 人设 + 历史全是中文时请求体能小 17%~40%，而上传耗时直接计入 TTFT
-            # （实测 243KB 的 50k 上下文，请求体每小 40KB 约省 0.3s）。
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "MiniBot-VLM/2.0",
-            },
-            method="POST",
-        )
+        def make_request(key):
+            return urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "MiniBot-VLM/2.0",
+                },
+                method="POST",
+            )
+
+        req = make_request(api_key)
+        timeout = load_config()["runtime"]["request_timeout_sec"]
+        key_attempts = len(split_api_keys(raw_key)) or 1
 
         try:
-            with _open_request(
-                req, timeout=load_config()["runtime"]["request_timeout_sec"]
-            ) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
+            # 429 = 当前 Key 配额用完：切到池里下一个 Key 立刻重发本次请求。
+            # 只在响应头阶段重试（还没吐任何内容），不会让用户看到半截回复。
+            for key_try in range(key_attempts):
+                try:
+                    with _open_request(req, timeout=timeout) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code != 429:
+                        raise
+                    api_key = advance_api_key(raw_key, api_key)
+                    if key_try == key_attempts - 1:
+                        raise  # 交给外层读错误体，不提前 close
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                    req = make_request(api_key)
             if "usage" in resp_json:
                 self.last_usage = resp_json["usage"]
                 report = self._cache_report(
@@ -488,7 +675,8 @@ class VLMBrain:
             return "", None
         except urllib.error.HTTPError as e:
             err = e.read(2048).decode("utf-8", errors="ignore")
-            err = err.replace(api_key, "[redacted]")
+            for secret in split_api_keys(raw_key):
+                err = err.replace(secret, "[redacted]")
             print(f"[VLM] HTTP Error {e.code}: {err}")
             return f"【VLM 报错】HTTP {e.code}: {err[:80]}", e.code
         except Exception as e:
@@ -516,7 +704,7 @@ class VLMBrain:
         text = ""
         for index, attempt in enumerate(attempts):
             text, status = self._chat_once(formatted_messages, attempt)
-            if status not in _FALLBACK_HTTP_STATUS or index == len(attempts) - 1:
+            if status is None or index == len(attempts) - 1:
                 return text
             self._mark_model_failed(attempt)
             log(
@@ -622,7 +810,9 @@ class VLMBrain:
             return ("【提示】未配置 VLM API Key。", [], {})
 
         settings = self._settings(model_override=model_override)
-        base_url, api_key, _, _ = settings
+        base_url, raw_key, model, cfg = settings
+        api_key = current_api_key(raw_key)
+        settings = (base_url, api_key, model, cfg)
         endpoint = (
             f"{base_url}/chat/completions"
             if not base_url.endswith("/chat/completions")
@@ -638,16 +828,22 @@ class VLMBrain:
         head_fp = self._fingerprint(formatted_messages[0] if formatted_messages else None)
         cache_logged = False
 
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "MiniBot-Harness/2.0",
-            },
-            method="POST",
-        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def make_stream_request(key):
+            return urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "MiniBot-Harness/2.0",
+                },
+                method="POST",
+            )
+
+        req = make_stream_request(api_key)
+        key_attempts = len(split_api_keys(raw_key)) or 1
 
         full_content = []
         in_think_tag = False
@@ -708,9 +904,31 @@ class VLMBrain:
                 elapsed_ms=round((time.monotonic() - started) * 1000),
                 received_bytes=received, **fields)
 
+        def redact(text):
+            """池里任何一个 Key 都不能出现在错误日志 / 回复里。"""
+            for secret in split_api_keys(raw_key):
+                text = text.replace(secret, "[redacted]")
+            return text
 
         try:
-            resp = _open_request(req, timeout=timeout)
+            # 429 = 当前 Key 配额用完：切到池里下一个 Key 立刻重发本次请求。
+            # 只在等响应头阶段重试；一旦流已经开始吐内容就不能重来，否则用户
+            # 会看到两段重复回复。
+            for key_try in range(key_attempts):
+                try:
+                    resp = _open_request(req, timeout=timeout)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code != 429:
+                        raise
+                    api_key = advance_api_key(raw_key, api_key)
+                    if key_try == key_attempts - 1:
+                        raise  # 交给外层读错误体，不提前 close
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                    req = make_stream_request(api_key)
             stage = "等待首行流数据"
             # 连接建立完成后重新起算等待首行的时间。
             arrival[0] = time.monotonic()
@@ -1013,11 +1231,15 @@ class VLMBrain:
 
         except urllib.error.HTTPError as e:
             failed = True
+            if e.code == 429 and saw_delta:
+                # 429 发生在流已开始之后：不能重发（会重复输出），但要把当前
+                # Key 换掉，让下一次请求直接用新 Key。
+                advance_api_key(raw_key, api_key)
             diagnostic("request.error", exception_type=type(e).__name__, http_status=e.code,
                        cf_ray=e.headers.get("cf-ray") if e.headers else None)
             detail = e.read(4096).decode("utf-8", errors="replace")
             message = f"HTTP {e.code}: " + self._api_error_message(detail)
-            message = message.replace(api_key, "[redacted]")
+            message = redact(message)
             log("VLM", "response.error_detail", request_id=request_id, http_status=e.code, detail=message)
             if e.code == 520:
                 message = (f"HTTP 520：网关或源站返回了无效响应，耗时 {time.monotonic() - started:.1f} 秒；"
@@ -1035,7 +1257,7 @@ class VLMBrain:
                 failed = True
             else:
                 failed = True
-                message = str(e).replace(api_key, "[redacted]")
+                message = redact(str(e))
                 reason = getattr(e, "reason", e)
                 timed_out = isinstance(reason, TimeoutError)
                 diagnostic("request.error", exception_type=type(e).__name__,

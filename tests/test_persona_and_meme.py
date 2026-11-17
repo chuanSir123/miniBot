@@ -107,6 +107,87 @@ class MemeLibraryTests(Fixture):
         manager.rebuild_tag_summary()
         return path
 
+    def test_samples_tags_randomly_when_the_library_exceeds_jev_capacity(self):
+        """标签多于 Jev 单轮容量（63 × 4）时要随机抽样，不能按热度排序硬截断。
+
+        硬截断会让固定的一批标签永久霸占名额，剩下的语义一次都问不到。
+        """
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            with manager._db() as db:
+                for i in range(300):
+                    db.execute(
+                        "INSERT INTO meme_tags (tag, count, used, updated_at) VALUES (?,?,?,?)",
+                        (f"语义{i:03d}", 1, 0, 0.0))
+                db.execute(
+                    "INSERT INTO meme_tags (tag, count, used, updated_at) VALUES (?,?,?,?)",
+                    ("下班瘫成一张饼", 1, 0, 0.0))
+
+            runs = [manager._rank_tags("今天下班瘫成一张饼", 252) for _ in range(6)]
+
+        for tags in runs:
+            self.assertEqual(len(tags), 252)                     # 严格卡在单轮容量
+            self.assertEqual(tags[0], "下班瘫成一张饼")            # 字面命中永远占位
+        self.assertGreater(len({tuple(tags) for tags in runs}), 1)  # 每轮子集不同
+        self.assertGreater(len(set().union(*runs)), 252)           # 确实轮到别的标签
+
+    def test_judge_uses_choice_shortlist_before_noul(self):
+        """两段式：先 choice 粗排缩小候选，再只对候选做一次 noul 精判。"""
+        from core.jev import JevClient
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            calls = {}
+
+            def fake_coarse(self, message, reply, tags, **kwargs):
+                calls["coarse_in"] = list(tags)
+                calls["coarse_top_k"] = kwargs.get("top_k")
+                return ["候选A", "候选B"]
+
+            def fake_rank(self, message, reply, tags, top_k=None, max_batches=4):
+                calls["rank_in"] = list(tags)
+                calls["max_batches"] = max_batches
+                return (["候选A"], {"候选A": 0.9, "none": 0.1})
+
+            with patch.object(JevClient, "coarse_rank_tags", fake_coarse), \
+                    patch.object(JevClient, "rank_meme_tags", fake_rank):
+                pick = manager._judge_by_jev(
+                    "msg", "reply", [f"t{i}" for i in range(300)],
+                    {"jev_coarse_mode": "choice", "jev_coarse_top_k": 6,
+                     "jev_coarse_questions": 4}, 4)
+
+        self.assertEqual(len(calls["coarse_in"]), 300)          # 全量交给粗排
+        self.assertEqual(calls["coarse_top_k"], 6)
+        self.assertEqual(calls["rank_in"], ["候选A", "候选B"])   # 精判只看候选
+        self.assertEqual(calls["max_batches"], 1)               # 候选一批问完
+        self.assertEqual(pick[0], ["候选A"])
+
+    def test_judge_falls_back_to_full_noul_when_coarse_fails(self):
+        """粗排没问到 ≠ 都不贴切：失败必须退回全量 noul 直打。"""
+        from core.jev import JevClient
+        from core.meme import MemeManager
+
+        with patch.object(MemeManager, "_ensure_tagger", lambda self: None):
+            manager = self._manager()
+            calls = {}
+
+            def fake_rank(self, message, reply, tags, top_k=None, max_batches=4):
+                calls["size"] = len(tags)
+                calls["max_batches"] = max_batches
+                return (["t0"], {"t0": 0.9, "none": 0.1})
+
+            with patch.object(JevClient, "coarse_rank_tags", lambda *a, **k: None), \
+                    patch.object(JevClient, "rank_meme_tags", fake_rank):
+                manager._judge_by_jev(
+                    "msg", "reply", [f"t{i}" for i in range(300)],
+                    {"jev_coarse_mode": "choice"}, 4)
+
+        self.assertEqual(calls["size"], 300)                    # 全量直打
+        self.assertEqual(calls["max_batches"], 4)               # 仍然按 noul 批数上限
+
     def test_chat_key_from_scope_matches_the_channel_wording(self):
         """channel 记的是 group:123，工具层拿到的是 qq_group_123；对不上就永远找不到。"""
         from core.meme import chat_key_from_scope
@@ -682,6 +763,125 @@ class SelectMemeScoreTests(Fixture):
         client.score_meme_tags = lambda *a, **k: None
 
         self.assertIsNone(client.rank_meme_tags("在吗", "在的", ["卖萌"]))
+
+    def test_coarse_rank_takes_top_k_from_each_choice_batch(self):
+        """一个 choice 装 255 个选项，每批留 top_k，跨批合并。"""
+        client = self._client()
+        seen = []
+
+        def fake_decide(state, questions, images=None):
+            seen.append(questions)
+            answers = {}
+            for qid, question in questions.items():
+                options = list(question["criteria"])
+                answers[qid] = {
+                    "type": "choice",
+                    "choice": options[-1],
+                    # 只有最后一个选项高概率，其余平均，验证按概率而不是传入顺序取
+                    "probabilities": {tag: (0.9 if i == len(options) - 1 else 0.001)
+                                      for i, tag in enumerate(options)},
+                }
+            return {"answers": answers}
+
+        client.decide_raw = fake_decide
+        picked = client.coarse_rank_tags("在吗", "在的", [f"t{i:03d}" for i in range(300)], top_k=6)
+
+        self.assertEqual(len(seen), 1)                                  # 一个请求装下
+        self.assertEqual(sorted(len(q["criteria"]) for q in seen[0].values()), [45, 255])
+        self.assertEqual(len(picked), 12)                               # 两批各 6 个
+        self.assertEqual(picked[0], "t254")                             # 第一批的头名
+        self.assertEqual(picked[6], "t299")                             # 第二批（45 个）的头名
+
+    def test_coarse_rank_returns_none_when_the_request_fails(self):
+        """粗排失败必须是 None，让调用方退回 noul 直打，而不是交半批候选。"""
+        client = self._client()
+
+        def fake_decide(state, questions, images=None):
+            raise TimeoutError("network down")
+
+        client.decide_raw = fake_decide
+        self.assertIsNone(client.coarse_rank_tags("在吗", "在的", [f"t{i}" for i in range(300)]))
+
+    def test_coarse_rank_treats_missing_probabilities_as_zero(self):
+        """模型漏答某个选项时按 0 处理，不能抛异常把整轮打标拖垮。"""
+        client = self._client()
+        client.decide_raw = lambda state, questions, images=None: {
+            "answers": {"c0": {"type": "choice", "choice": "b",
+                               "probabilities": {"b": 0.8}}}}
+
+        picked = client.coarse_rank_tags("在吗", "在的", ["a", "b"], top_k=6)
+        self.assertEqual(picked, ["b", "a"])        # 漏答的按 0 分排在后面，仍然保留
+
+class VlmPayloadTests(unittest.TestCase):
+    """送 VLM 前的字节整形：动图取首帧、超尺寸缩小、小图不动。"""
+
+    @staticmethod
+    def _gif(frames=5, size=(400, 400)):
+        import io
+
+        from PIL import Image, ImageDraw
+
+        # 每帧画在不同位置：纯色帧会被 GIF 编码器当成同一个画面合并掉，测不出多帧。
+        images = []
+        for index in range(frames):
+            image = Image.new("RGB", size, (250, 250, 250))
+            ImageDraw.Draw(image).rectangle(
+                [10 + index * 60, 10, 80 + index * 60, 80], fill=(20, 120, 220))
+            images.append(image)
+        buffer = io.BytesIO()
+        images[0].save(buffer, "GIF", save_all=True, append_images=images[1:], loop=0)
+        return buffer.getvalue()
+
+    def test_multi_frame_gif_keeps_only_the_first_frame(self):
+        from core.meme import _vlm_payload_bytes
+
+        raw = self._gif()
+        payload, mime = _vlm_payload_bytes(raw)
+        # 动图一律取首帧转 JPEG，哪怕字节数没变小——发整包模型也只看到第一帧。
+        self.assertEqual(mime, "image/jpeg")
+        self.assertNotEqual(payload, raw)
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(payload)) as image:
+            self.assertEqual(getattr(image, "n_frames", 1), 1)
+            self.assertEqual(image.format, "JPEG")
+
+    def test_oversized_dimension_is_scaled_down(self):
+        import io
+
+        from PIL import Image
+
+        from core.meme import VLM_MAX_SIDE, _vlm_payload_bytes
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (2400, 1600), (200, 30, 30)).save(buffer, "PNG")
+        payload, mime = _vlm_payload_bytes(buffer.getvalue())
+        self.assertEqual(mime, "image/jpeg")
+        with Image.open(io.BytesIO(payload)) as image:
+            self.assertLessEqual(max(image.size), VLM_MAX_SIDE)
+
+    def test_small_static_image_is_passed_through_untouched(self):
+        import io
+
+        from PIL import Image
+
+        from core.meme import _vlm_payload_bytes
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (120, 120), (10, 10, 10)).save(buffer, "PNG")
+        raw = buffer.getvalue()
+        payload, mime = _vlm_payload_bytes(raw)
+        self.assertEqual(payload, raw)
+        self.assertEqual(mime, "image/png")
+
+    def test_non_image_bytes_are_passed_through(self):
+        from core.meme import _vlm_payload_bytes
+
+        raw = b"not an image at all"
+        self.assertEqual(_vlm_payload_bytes(raw), (raw, None))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,7 @@ class DirectNetworkTests(unittest.TestCase):
 class OutgoingMediaTests(Fixture):
     def setUp(self):
         super().setUp()
-        config.save_config({'channels': {'napcat': {'owner_ids': ['1'], 'allow_owner_tools': True}}})
+        config.save_config({'channels': {'napcat': {'owner_ids': ['1']}}})
         self.event = {'message_type': 'private', 'user_id': 1}
 
     def test_markdown_media_and_local_file_names_with_spaces(self):
@@ -93,8 +93,8 @@ class OutgoingMediaTests(Fixture):
         self.assertEqual(reply_parts(text, event)[0]['type'], 'image')
         fake = dict(event, user_id=9, sender={'nickname': '主人1'}, _parsed={'reply_to_bot': True})
         self.assertEqual(reply_parts(text, fake)[0]['type'], 'text')
-        config.save_config({'channels': {'napcat': {'allow_owner_tools': False}}})
-        self.assertEqual(reply_parts(text, event)[0]['type'], 'text')
+        # 不再有总开关：主人权限只由 owner_ids 决定，昵称与引用都改不了身份。
+        self.assertEqual(reply_parts(text, event)[0]['type'], 'image')
 
     def test_channel_emits_native_segments_and_reports_send_failure(self):
         channel = NapCatChannel()
